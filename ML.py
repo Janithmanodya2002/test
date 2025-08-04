@@ -10,6 +10,7 @@ import warnings
 import shutil
 import random
 import sys
+import io
 from multiprocessing import Pool, cpu_count
 
 import pyarrow
@@ -65,7 +66,7 @@ CONFIG = {
     "lookback_candles": 100,
     "swing_window": 5,
     "debug_no_ml": False,
-    "run_overfit_test_only": False,
+    "run_overfit_test_only": True,
 }
 
 # --- GPU Configuration ---
@@ -385,6 +386,7 @@ def validate_data(samples):
     logger.info("--- Data Validation ---")
     logger.info(f"Total Samples: {len(samples)}")
     logger.info(f"Label Balance: {wins} Wins ({win_pct:.2f}%) vs. {losses} Losses ({100-win_pct:.2f}%)")
+    logger.info(f"First 20 labels: {labels[:20]}")
     
     logger.info("Spot-checking 5 random samples (last 5 closing prices and label):")
     for i in range(5):
@@ -416,6 +418,10 @@ def _process_symbol_data(symbol_file):
         
         df = pd.read_parquet(symbol_file)
         
+        # Drop the non-numeric 'session' column if it exists
+        if 'session' in df.columns:
+            df.drop(columns=['session'], inplace=True)
+
         # First, clean the core OHLCV columns
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -599,7 +605,12 @@ def prepare_all_data():
     
     with Pool(processes=min(4, cpu_count())) as pool:
         results = pool.map(_process_symbol_data, data_files)
-    
+
+    logger.info("--- Samples Generated Per Symbol ---")
+    for symbol_file, samples in zip(data_files, results):
+        logger.info(f"{os.path.basename(symbol_file)} → {len(samples)} samples")
+    logger.info("------------------------------------")
+
     all_samples = [sample for result in results for sample in result]
     
     if not all_samples:
@@ -743,6 +754,15 @@ def train_model(model, train_loader, val_loader, epochs, model_path):
             torch.save(model.state_dict(), model_path)
             logger.info(f"Model saved to {model_path} (best validation loss: {best_val_loss:.4f})")
             
+    # Log in-sample logit range after training
+    model.eval()
+    all_logits = []
+    with torch.no_grad():
+        for seqs, _ in train_loader:
+            all_logits.extend(model(seqs.to(DEVICE)).cpu().numpy().flatten())
+    if all_logits:
+        logger.info(f"In-sample logits after training: min={min(all_logits):.4f}, max={max(all_logits):.4f}, avg={np.mean(all_logits):.4f}")
+
     return history
 
 def generate_model_report(history, report_dir):
@@ -793,6 +813,8 @@ Validation Accuracy: {history['val_acc'][best_epoch]:.2f}%
     with open(os.path.join(report_dir, 'model_summary.txt'), 'w') as f:
         f.write(summary)
         
+    logger.info("--- Model Training Summary ---")
+    logger.info("\n" + summary)
     logger.info(f"Model report saved in {report_dir}")
 
 
@@ -843,10 +865,22 @@ def run_ml_backtest(model, scaler, report_dir):
         trades_before_symbol = len(backtest_trades)
         
         df = pd.read_parquet(symbol_file)
-        df = add_technical_indicators(df)
+        if 'session' in df.columns:
+            df.drop(columns=['session'], inplace=True)
+
+        # First, clean the core OHLCV columns
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-        df.dropna(inplace=True)
+        df.dropna(subset=['open', 'high', 'low', 'close', 'volume'], inplace=True)
+        
+        # Now, calculate technical indicators on the cleaned data
+        df = add_technical_indicators(df)
+
+        # Final check for any NaNs or infs introduced by indicators
+        feature_cols = ['open', 'high', 'low', 'close', 'volume', 'return', 'ema_10', 'ema_50', 'rsi', 'atr']
+        df.dropna(subset=feature_cols, inplace=True)
+        df = df[np.isfinite(df[feature_cols]).all(axis=1)]
+
         klines = df.to_numpy()
 
         for i in range(CONFIG["lookback_candles"] + CONFIG["sequence_length"], len(klines) - 1):
@@ -888,7 +922,7 @@ def run_ml_backtest(model, scaler, report_dir):
                 
                 all_confidences.append(logit)
                 if confidences_logged < 5:
-                    logger.info(f"Sample logit for {symbol} @ index {i}: {logit:.3f}")
+                    logger.info(f"Sample logit for {symbol} @ index {i}: {logit:.3f} (data shape: {scaled_sequence.shape}, data sum: {scaled_sequence.sum():.2f})")
                     confidences_logged += 1
 
                 # A logit > 0 corresponds to a probability > 0.5
@@ -1013,15 +1047,32 @@ def full_run():
 def run_overfit_test():
     """Trains the model on a single batch to ensure it can overfit."""
     logger.info("--- Starting Single-Batch Overfit Test ---")
+    # Use quick_test settings to load data faster for the test
+    CONFIG["quick_test"] = True
     train_loader, _, _ = prepare_all_data()
     
+    if not train_loader:
+        logger.error("Data loader is empty. Cannot perform overfit test.")
+        return
+
     # Get a single batch
-    sequences, labels = next(iter(train_loader))
+    try:
+        sequences, labels = next(iter(train_loader))
+    except StopIteration:
+        logger.error("Could not get a batch from the data loader. Cannot perform overfit test.")
+        return
+        
     sequences, labels = sequences.to(DEVICE), labels.to(DEVICE)
     
-    model = TraderLSTM().to(DEVICE)
+    # Log batch details
+    pos_count = int(labels.sum())
+    neg_count = labels.size(0) - pos_count
+    logger.info(f"Overfit batch size: {sequences.shape}, Positives: {pos_count}, Negatives: {neg_count}")
+    
+    # Eliminate regularization and use high LR for the test
+    model = TraderLSTM(dropout=0.0).to(DEVICE)
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
+    optimizer = optim.Adam(model.parameters(), lr=1e-2) # High learning rate
 
     logger.info("Training on a single batch for 50 epochs...")
     for epoch in range(50):
@@ -1029,9 +1080,18 @@ def run_overfit_test():
         outputs = model(sequences)
         loss = criterion(outputs, labels)
         loss.backward()
+        
+        # Log gradient norm
+        total_norm = 0
+        for p in model.parameters():
+            if p.grad is not None:
+                total_norm += p.grad.detach().norm().item() ** 2
+        total_norm = total_norm ** 0.5
+        
         optimizer.step()
+        
         if (epoch + 1) % 5 == 0:
-            logger.info(f"Overfit Epoch [{epoch+1}/50], Loss: {loss.item():.4f}")
+            logger.info(f"Overfit Epoch [{epoch+1}/50], Loss: {loss.item():.4f}, Grad Norm: {total_norm:.4f}")
             
     logger.info("--- Overfit Test Complete ---")
     # A successful test will show the loss decreasing to near-zero.
@@ -1041,7 +1101,7 @@ def main():
     """Main orchestration function."""
     logger.info(f"Using device: {DEVICE}")
     
-    if CONFIG.get("run_overfit_test_only", False):
+    if CONFIG.get("run_overfit_test_only", True):
         run_overfit_test()
         return
 
