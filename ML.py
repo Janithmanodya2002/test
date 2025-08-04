@@ -1,854 +1,1074 @@
+# ml.py
+
 import os
-import pandas as pd
-import numpy as np
-import pytz
-from datetime import datetime
-import pyarrow as pa
-import pyarrow.parquet as pq
-from binance.client import Client as BinanceClient
 import glob
-import keys
+import time
+import json
+import datetime
+import logging
+import warnings
+import shutil
+import random
+import sys
+from multiprocessing import Pool, cpu_count
+
+import pyarrow
+import fastparquet
+import pandas as pd
+import pandas_ta as ta
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from tabulate import tabulate
+import matplotlib.pyplot as plt
+
+# --- Reproducibility ---
+def set_seeds(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seeds()
+
+# Ignore warnings for cleaner output
+warnings.filterwarnings('ignore')
+
+# --- Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-DATA_DIR = "data/raw"
-PROCESSED_DATA_DIR = "data/processed"
-MODELS_DIR = "models"
-SYMBOLS_FILE = "symbols.csv"
-SWING_WINDOW = 5
-LOOKBACK_CANDLES = 100 # From main.py config
-TRADE_EXPIRY_BARS = 96 # How many 15-min bars to wait for a result (1 day)
-
-# Timezone definitions for trading sessions (in UTC)
-SESSIONS = {
-    "Asia": (0, 8),
-    "London": (7, 15),
-    "New_York": (12, 20)
+# These will be loaded from configuration.csv, but we set defaults here.
+CONFIG = {
+    "quick_test": True,
+    "quick_test_symbols": 1,
+    "quick_test_data_fraction": 0.1,
+    "quick_test_epochs": 5,
+    "full_test_epochs": 100,
+    "sequence_length": 100,
+    "batch_size": 128,
+    "learning_rate": 0.001,
+    "weight_decay": 1e-5,
+    "model_path": "trader_model.pth",
+    "report_dir": "ml_report",
+    "data_dir": "data",
+    "leverage": 10,
+    "risk_per_trade": 1,
+    "starting_balance": 10000,
+    "lookback_candles": 100,
+    "swing_window": 5,
+    "debug_no_ml": False,
+    "run_overfit_test_only": False,
 }
 
-# --- Data Acquisition (Step 1) ---
+# --- GPU Configuration ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def fetch_historical(client, symbol, interval=BinanceClient.KLINE_INTERVAL_15MINUTE, total_limit=20000):
+# --- Functions copied from main.py for backtesting and reporting ---
+
+class TradeResult:
+    def __init__(self, symbol, side, entry_price, exit_price, entry_timestamp, exit_timestamp, status, pnl_usd, pnl_pct, drawdown, reason_for_entry, reason_for_exit, fib_levels):
+        self.symbol = symbol
+        self.side = side
+        self.entry_price = entry_price
+        self.exit_price = exit_price
+        self.entry_timestamp = entry_timestamp
+        self.exit_timestamp = exit_timestamp
+        self.status = status
+        self.pnl_usd = pnl_usd
+        self.pnl_pct = pnl_pct
+        self.drawdown = drawdown
+        self.reason_for_entry = reason_for_entry
+        self.reason_for_exit = reason_for_exit
+        self.fib_levels = fib_levels
+        self.balance = 0 # Will be populated during backtest
+
+def get_swing_points(klines, window=5):
     """
-    Fetches historical klines from Binance, handling pagination to get more data.
+    Identify swing points from kline data.
     """
-    all_klines = []
-    limit = 1000  # Max limit per request
+    highs = np.array([float(k[2]) for k in klines])
+    lows = np.array([float(k[3]) for k in klines])
     
-    while len(all_klines) < total_limit:
-        try:
-            # If we have klines, fetch from before the oldest one
-            end_time = all_klines[0][0] if all_klines else None
-            
-            klines = client.get_historical_klines(
-                symbol=symbol, 
-                interval=interval, 
-                limit=min(limit, total_limit - len(all_klines)),
-                end_str=end_time
-            )
-
-            # If no more klines are returned, break the loop
-            if not klines:
-                break
-
-            # Prepend new klines to maintain chronological order
-            all_klines = klines + all_klines
-            
-            print(f"  - Fetched {len(klines)} more candles for {symbol}. Total: {len(all_klines)}/{total_limit}")
-
-        except Exception as e:
-            print(f"Error fetching klines for {symbol}: {e}")
-            break # Exit on error
-
-    return all_klines
-
-
-def fetch_initial_data():
-    """
-    Fetches a large number of historical candles for each symbol
-    in symbols.csv and saves them.
-    """
-    print("Starting initial data acquisition...")
-    try:
-        symbols = pd.read_csv(SYMBOLS_FILE, header=None)[0].tolist()
-    except FileNotFoundError:
-        print(f"Error: {SYMBOLS_FILE} not found.")
-        return
-
-    client = BinanceClient(keys.api_mainnet, keys.secret_mainnet)
-    
-    for symbol in symbols:
-        print(f"Fetching data for {symbol}...")
-        klines = fetch_historical(client, symbol, total_limit=20000) # Fetch 20,000 candles
-
-        if klines:
-            # Save to a file named after the total number of candles
-            filename = f"initial_{len(klines)}.parquet"
-            process_and_save_kline_data(klines, symbol, filename)
-
-    print("\nInitial data acquisition complete.")
-
-
-# --- Data Loading and Initial Processing ---
-
-def get_session(timestamp):
-    """Determines the trading session(s) for a given timestamp."""
-    if isinstance(timestamp, pd.Series):
-        return timestamp.apply(lambda ts: _get_single_session(ts))
-    else:
-        return _get_single_session(timestamp)
-
-def _get_single_session(timestamp):
-    """Helper function to process a single timestamp."""
-    utc_time = pd.to_datetime(timestamp, unit='ms').tz_localize('UTC')
-    hour = utc_time.hour
-    active_sessions = [name for name, (start, end) in SESSIONS.items() if start <= hour <= end]
-    return ",".join(active_sessions) if active_sessions else "Inactive"
-
-def process_and_save_kline_data(klines, symbol, filename=None):
-    """Processes raw kline data and saves it to a Parquet file."""
-    if not klines:
-        print(f"No kline data to process for {symbol}.")
-        return
-    print(f"Processing and saving {len(klines)} candles for {symbol}...")
-    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-    for col in ['open', 'high', 'low', 'close', 'volume']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    df['session'] = get_session(df['timestamp'])
-    save_data_to_parquet(df, symbol, filename)
-
-def save_data_to_parquet(df, symbol, filename=None):
-    """Saves the DataFrame to a Parquet file."""
-    if df is None or df.empty:
-        return
-    symbol_dir = os.path.join(DATA_DIR, symbol)
-    os.makedirs(symbol_dir, exist_ok=True)
-    if filename:
-        file_path = os.path.join(symbol_dir, filename)
-    else:
-        file_date = pd.to_datetime(df['timestamp'].iloc[-1], unit='ms').strftime('%Y-%m-%d')
-        file_path = os.path.join(symbol_dir, f"{file_date}.parquet")
-    print(f"  - Saving data for {symbol} to {file_path}")
-    table = pa.Table.from_pandas(df)
-    pq.write_table(table, file_path)
-
-# --- Preprocessing and Labeling (Step 3) ---
-
-def load_raw_data_for_symbol(symbol):
-    """Loads all parquet files for a symbol and concatenates them."""
-    symbol_dir = os.path.join(DATA_DIR, symbol)
-    
-    # Find any file starting with 'initial_'
-    initial_files = glob.glob(os.path.join(symbol_dir, "initial_*.parquet"))
-    
-    if initial_files:
-        # If there are multiple, prefer the one with the most candles (largest file)
-        files = [max(initial_files, key=os.path.getsize)]
-    else:
-        # Fallback to any other parquet files if no 'initial_' file is found
-        files = glob.glob(os.path.join(symbol_dir, "*.parquet"))
-
-    if not files:
-        return None
-    df = pd.concat([pd.read_parquet(f) for f in files])
-    df.sort_values('timestamp', inplace=True)
-    df.drop_duplicates(subset=['timestamp'], keep='first', inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
-
-def get_swing_points_df(df, window=5):
-    """Identify swing points from a DataFrame."""
-    highs = df['high']
-    lows = df['low']
-
     swing_highs = []
     swing_lows = []
 
-    for i in range(window, len(df) - window):
-        # Swing High
-        is_swing_high = highs.iloc[i] > highs.iloc[i-window:i].max() and highs.iloc[i] > highs.iloc[i+1:i+window+1].max()
+    # This ensures we have enough data points on either side of the candle to be a swing point
+    for i in range(window, len(highs) - window):
+        is_swing_high = all(highs[i] >= highs[i-j] and highs[i] >= highs[i+j] for j in range(1, window + 1))
         if is_swing_high:
-            swing_highs.append({'timestamp': df['timestamp'].iloc[i], 'price': highs.iloc[i]})
+            swing_highs.append((klines[i][0], highs[i]))
 
-        # Swing Low
-        is_swing_low = lows.iloc[i] < lows.iloc[i-window:i].min() and lows.iloc[i] < lows.iloc[i+1:i+window+1].min()
+        is_swing_low = all(lows[i] <= lows[i-j] and lows[i] <= lows[i+j] for j in range(1, window + 1))
         if is_swing_low:
-            swing_lows.append({'timestamp': df['timestamp'].iloc[i], 'price': lows.iloc[i]})
+            swing_lows.append((klines[i][0], lows[i]))
+            
+    return swing_highs, swing_lows
 
-    return pd.DataFrame(swing_highs), pd.DataFrame(swing_lows)
-
-def get_trend_df(swing_highs, swing_lows):
-    """Determine the trend based on swing points DataFrames."""
+def get_trend(swing_highs, swing_lows):
+    """
+    Determine the trend based on swing points.
+    """
     if len(swing_highs) < 2 or len(swing_lows) < 2:
         return "undetermined"
-    if swing_highs['price'].iloc[-1] > swing_highs['price'].iloc[-2] and swing_lows['price'].iloc[-1] > swing_lows['price'].iloc[-2]:
+
+    last_high = swing_highs[-1][1]
+    prev_high = swing_highs[-2][1]
+    last_low = swing_lows[-1][1]
+    prev_low = swing_lows[-2][1]
+
+    if last_high > prev_high and last_low > prev_low:
         return "uptrend"
-    if swing_highs['price'].iloc[-1] < swing_highs['price'].iloc[-2] and swing_lows['price'].iloc[-1] < swing_lows['price'].iloc[-2]:
+    elif last_high < prev_high and last_low < prev_low:
         return "downtrend"
-    return "undetermined"
+    else:
+        return "undetermined"
 
 def get_fib_retracement(p1, p2, trend):
-    """Calculate Fibonacci retracement levels."""
+    """
+    Calculate Fibonacci retracement levels.
+    """
     price_range = abs(p1 - p2)
+    
     if trend == "downtrend":
-        golden_zone_start = p1 - (price_range * 0.5)
-        golden_zone_end = p1 - (price_range * 0.618)
+        # For downtrend, p1 is swing high, p2 is swing low
+        entry_price = p1 - (price_range * 0.618)
     else: # Uptrend
-        golden_zone_start = p1 + (price_range * 0.5)
-        golden_zone_end = p1 + (price_range * 0.618)
-    return (golden_zone_start + golden_zone_end) / 2
-
-def label_trade(df, entry_idx, sl_price, tp1_price, tp2_price, side):
-    """Labels a single trade based on future price action."""
-    future_candles = df.iloc[entry_idx + 1 : entry_idx + 1 + TRADE_EXPIRY_BARS]
-
-    tp1_hit = False
-    for _, candle in future_candles.iterrows():
-        if side == 'long':
-            if candle['low'] <= sl_price:
-                # If TP1 was hit before SL, it's a TP1 win. Otherwise, a loss.
-                return 1 if tp1_hit else 0
-            if candle['high'] >= tp2_price: return 2 # Win to TP2
-            if candle['high'] >= tp1_price:
-                tp1_hit = True # TP1 is hit, continue checking for TP2 or SL
-        elif side == 'short':
-            if candle['high'] >= sl_price:
-                return 1 if tp1_hit else 0 # Loss
-            if candle['low'] <= tp2_price: return 2 # Win to TP2
-            if candle['low'] <= tp1_price:
-                tp1_hit = True # TP1 is hit
-
-    # If loop finishes
-    if tp1_hit:
-        return 1 # Exited at TP1 (or expired after hitting TP1)
-    return -1 # Trade expired without result
-
-def find_and_label_setups(df):
-    """Finds all potential trade setups and labels them."""
-    labeled_setups = []
-
-    # Adding tqdm for a progress bar
-    for i in tqdm(range(LOOKBACK_CANDLES, len(df) - TRADE_EXPIRY_BARS), desc="Finding Setups"):
-        if df['session'].iloc[i] == 'Inactive':
-            continue
-
-        current_klines_df = df.iloc[i - LOOKBACK_CANDLES : i]
-        swing_highs, swing_lows = get_swing_points_df(current_klines_df, SWING_WINDOW)
-
-        if len(swing_highs) < 2 or len(swing_lows) < 2:
-            continue
-
-        trend = get_trend_df(swing_highs, swing_lows)
-        setup = None
-        if trend == 'downtrend':
-            last_swing_high_price = swing_highs.iloc[-1]['price']
-            last_swing_low_price = swing_lows.iloc[-1]['price']
-            # Ensure the last swing low is below the previous one for a confirmed downtrend setup
-            if last_swing_low_price >= swing_lows.iloc[-2]['price']: continue
-
-            entry_price = get_fib_retracement(last_swing_high_price, last_swing_low_price, trend)
-            sl = last_swing_high_price
-            tp1 = entry_price - (sl - entry_price)
-            tp2 = entry_price - (sl - entry_price) * 2
-
-            # Find the actual candle index where the entry was triggered
-            entry_candle_idx = -1
-            for k in range(i, min(i + TRADE_EXPIRY_BARS, len(df))):
-                 if df['high'].iloc[k] >= entry_price:
-                     entry_candle_idx = k
-                     break
-            if entry_candle_idx == -1: continue
-
-            label = label_trade(df, entry_candle_idx, sl, tp1, tp2, 'short')
-            if label != -1:
-                setup = {
-                    'timestamp': df['timestamp'].iloc[i], 'side': 'short', 
-                    'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'label': label,
-                    'swing_high_price': last_swing_high_price, 'swing_low_price': last_swing_low_price
-                }
-
-        elif trend == 'uptrend':
-            last_swing_high_price = swing_highs.iloc[-1]['price']
-            last_swing_low_price = swing_lows.iloc[-1]['price']
-            if last_swing_high_price <= swing_highs.iloc[-2]['price']: continue
-
-            entry_price = get_fib_retracement(last_swing_low_price, last_swing_high_price, trend)
-            sl = last_swing_low_price
-            tp1 = entry_price + (entry_price - sl)
-            tp2 = entry_price + (entry_price - sl) * 2
-
-            entry_candle_idx = -1
-            for k in range(i, min(i + TRADE_EXPIRY_BARS, len(df))):
-                 if df['low'].iloc[k] <= entry_price:
-                     entry_candle_idx = k
-                     break
-            if entry_candle_idx == -1: continue
-
-            label = label_trade(df, entry_candle_idx, sl, tp1, tp2, 'long')
-            if label != -1:
-                setup = {
-                    'timestamp': df['timestamp'].iloc[i], 'side': 'long',
-                    'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'label': label,
-                    'swing_high_price': last_swing_high_price, 'swing_low_price': last_swing_low_price
-                }
-
-        if setup:
-            labeled_setups.append(setup)
-
-    return pd.DataFrame(labeled_setups)
-
-from multiprocessing import Pool
-
-def process_symbol_for_labeling(symbol):
-    """Helper function to process and label setups for a single symbol."""
-    print(f"Processing {symbol}...")
-    df = load_raw_data_for_symbol(symbol)
-    if df is None or df.empty:
-        print(f"  - No raw data found for {symbol}. Skipping.")
-        return None
-
-    labeled_setups = find_and_label_setups(df)
-    if not labeled_setups.empty:
-        labeled_setups['symbol'] = symbol
-        print(f"  - Found and labeled {len(labeled_setups)} setups for {symbol}.")
-        return labeled_setups
-    else:
-        print(f"  - No valid setups found for {symbol}.")
-        return None
-
-def main_preprocess():
-    """Main function for preprocessing and labeling, using multiprocessing."""
-    print("Starting preprocessing and labeling...")
-    os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
-
-    try:
-        symbols = pd.read_csv(SYMBOLS_FILE, header=None)[0].tolist()
-    except FileNotFoundError:
-        print(f"Error: {SYMBOLS_FILE} not found.")
-        return
-
-    # Use multiprocessing.Pool to process symbols in parallel
-    with Pool() as pool:
-        results = pool.map(process_symbol_for_labeling, symbols)
-
-    # Filter out None results
-    all_labeled_data = [res for res in results if res is not None]
-
-    if all_labeled_data:
-        final_df = pd.concat(all_labeled_data, ignore_index=True)
-        save_path = os.path.join(PROCESSED_DATA_DIR, "labeled_trades.parquet")
-        final_df.to_parquet(save_path)
-        print(f"Preprocessing complete. Labeled data saved to {save_path}")
-    else:
-        print("No labeled data was generated.")
-
-# --- Feature Engineering (Step 3) ---
-
-def calculate_atr(df, period=14):
-    """Calculates the Average True Range (ATR)."""
-    high_low = df['high'] - df['low']
-    high_close = np.abs(df['high'] - df['close'].shift())
-    low_close = np.abs(df['low'] - df['close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
-    return atr
-
-def calculate_rsi(df, period=14):
-    """Calculates the Relative Strength Index (RSI)."""
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+        # For uptrend, p1 is swing low, p2 is swing high
+        entry_price = p1 + (price_range * 0.618)
     
-    # Avoid division by zero
-    rs = gain / loss
-    rs = rs.replace([np.inf, -np.inf], np.nan) # Handle infinities if loss is 0
+    return entry_price
 
-    rsi = 100 - (100 / (1 + rs))
-    
-    # When gain and loss are both 0, RSI is NaN. A neutral 50 is a common treatment.
-    rsi.fillna(50, inplace=True)
-    
-    return rsi
-
-def calculate_macd(df, fast_period=12, slow_period=26, signal_period=9):
-    """Calculates the Moving Average Convergence Divergence (MACD)."""
-    fast_ema = df['close'].ewm(span=fast_period, adjust=False).mean()
-    slow_ema = df['close'].ewm(span=slow_period, adjust=False).mean()
-    macd = fast_ema - slow_ema
-    signal = macd.ewm(span=signal_period, adjust=False).mean()
-    return macd, signal
-
-def calculate_adx(df, period=14):
-    """Calculates the Average Directional Index (ADX)."""
-    df['high_diff'] = df['high'].diff()
-    df['low_diff'] = df['low'].diff()
-    df['plus_dm'] = np.where((df['high_diff'] > df['low_diff']) & (df['high_diff'] > 0), df['high_diff'], 0)
-    df['minus_dm'] = np.where((df['low_diff'] > df['high_diff']) & (df['low_diff'] > 0), df['low_diff'], 0)
-
-    # ATR is needed for ADX calculation
-    high_low = df['high'] - df['low']
-    high_close = np.abs(df['high'] - df['close'].shift())
-    low_close = np.abs(df['low'] - df['close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
-
-    plus_di = 100 * (df['plus_dm'].ewm(alpha=1/period, adjust=False).mean() / atr)
-    minus_di = 100 * (df['minus_dm'].ewm(alpha=1/period, adjust=False).mean() / atr)
-
-    dx = 100 * (np.abs(plus_di - minus_di) / (plus_di + minus_di))
-    adx = dx.ewm(alpha=1/period, adjust=False).mean()
-
-    # Clean up temporary columns
-    df.drop(['high_diff', 'low_diff', 'plus_dm', 'minus_dm'], axis=1, inplace=True)
-    
-    return adx.fillna(0) # Return ADX, fill initial NaNs with 0
-
-def calculate_bollinger_bands(df, window=20, num_std_dev=2):
-    """Calculates Bollinger Bands."""
-    rolling_mean = df['close'].rolling(window=window).mean()
-    rolling_std = df['close'].rolling(window=window).std()
-    upper_band = rolling_mean + (rolling_std * num_std_dev)
-    lower_band = rolling_mean - (rolling_std * num_std_dev)
-    return upper_band, lower_band
-
-def calculate_ichimoku_cloud(df):
-    """Calculates Ichimoku Cloud components."""
-    # Tenkan-sen (Conversion Line)
-    tenkan_sen_high = df['high'].rolling(window=9).max()
-    tenkan_sen_low = df['low'].rolling(window=9).min()
-    tenkan_sen = (tenkan_sen_high + tenkan_sen_low) / 2
-
-    # Kijun-sen (Base Line)
-    kijun_sen_high = df['high'].rolling(window=26).max()
-    kijun_sen_low = df['low'].rolling(window=26).min()
-    kijun_sen = (kijun_sen_high + kijun_sen_low) / 2
-
-    # Senkou Span A (Leading Span A)
-    senkou_span_a = ((tenkan_sen + kijun_sen) / 2).shift(26)
-
-    # Senkou Span B (Leading Span B)
-    senkou_span_b_high = df['high'].rolling(window=52).max()
-    senkou_span_b_low = df['low'].rolling(window=52).min()
-    senkou_span_b = ((senkou_span_b_high + senkou_span_b_low) / 2).shift(26)
-
-    # Chikou Span (Lagging Span)
-    chikou_span = df['close'].shift(-26)
-
-    return tenkan_sen, kijun_sen, senkou_span_a, senkou_span_b, chikou_span
-
-def engineer_features():
-    """Loads labeled trades and engineers features for the ML model."""
-    print("Starting feature engineering...")
-    try:
-        labeled_df = pd.read_parquet(os.path.join(PROCESSED_DATA_DIR, "labeled_trades.parquet"))
-    except FileNotFoundError:
-        print("Error: labeled_trades.parquet not found. Please run main_preprocess() first.")
-        return
-
-    # Load all raw data into a dictionary for quick access
-    all_raw_data = {}
-    symbols = labeled_df['symbol'].unique()
-    for symbol in symbols:
-        df = load_raw_data_for_symbol(symbol)
-        if df is not None:
-            # Pre-calculate indicators for the whole series to speed up lookups
-            df['atr'] = calculate_atr(df)
-            df['rsi'] = calculate_rsi(df)
-            df['macd'], df['macd_signal'] = calculate_macd(df)
-            df['adx'] = calculate_adx(df) # New trend strength feature
-            df['bb_upper'], df['bb_lower'] = calculate_bollinger_bands(df)
-            df['tenkan_sen'], df['kijun_sen'], df['senkou_span_a'], df['senkou_span_b'], df['chikou_span'] = calculate_ichimoku_cloud(df)
-            
-            # New multi-period volatility features
-            for p in [20, 50, 100]:
-                df[f'volatility_{p}'] = df['close'].pct_change().rolling(window=p).std()
-            
-            df['liquidity_proxy'] = df['volume'].rolling(window=96).mean()
-            
-            # Create a datetime index for resampling
-            df.set_index(pd.to_datetime(df['timestamp'], unit='ms'), inplace=True)
-
-            # Higher-timeframe features (4-hour)
-            df_4h = df['close'].resample('4h').ohlc()
-            df_4h['rsi'] = calculate_rsi(df_4h)
-            df_4h['macd'], df_4h['macd_signal'] = calculate_macd(df_4h)
-            df_4h['macd_diff'] = df_4h['macd'] - df_4h['macd_signal']
-            
-            # Store both original and 4h data
-            all_raw_data[symbol] = {'15m': df, '4h': df_4h}
-
-    feature_list = []
-    for _, row in labeled_df.iterrows():
-        symbol = row['symbol']
-        timestamp = row['timestamp']
-
-        if symbol not in all_raw_data:
-            continue
-        
-        data_dict = all_raw_data[symbol]
-        raw_df_15m = data_dict['15m']
-        raw_df_4h = data_dict['4h']
-
-        # The index is now datetime
-        setup_timestamp_dt = pd.to_datetime(timestamp, unit='ms')
-
-        try:
-            # Find the exact setup candle in the raw data
-            setup_candle = raw_df_15m.loc[setup_timestamp_dt]
-            # Find the corresponding 4h candle
-            # Use asof to get the last available 4h data for the given 15m candle time
-            htf_candle = raw_df_4h.asof(setup_timestamp_dt)
-
-        except KeyError:
-            # This can happen if the labeled setup is too close to the edge of the raw data
-            continue
-
-        # --- Calculate Features ---
-        features = {}
-        
-        # Original data to keep for model analysis and execution
-        features['symbol'] = symbol
-        features['timestamp'] = timestamp
-        features['side'] = row['side']
-        features['entry_price'] = row['entry_price']
-        features['sl'] = row['sl']
-        features['tp1'] = row['tp1']
-        features['tp2'] = row['tp2']
-        features['label'] = row['label']
-
-        # Price & Strategy Features
-        swing_height = row['swing_high_price'] - row['swing_low_price']
-        if swing_height > 0:
-            if row['side'] == 'long':
-                features['golden_zone_ratio'] = (row['entry_price'] - row['swing_low_price']) / swing_height
-            else: # short
-                features['golden_zone_ratio'] = (row['swing_high_price'] - row['entry_price']) / swing_height
-            
-            features['sl_pct'] = abs(row['entry_price'] - row['sl']) / swing_height
-            features['tp1_pct'] = abs(row['tp1'] - row['entry_price']) / swing_height
-            features['tp2_pct'] = abs(row['tp2'] - row['entry_price']) / swing_height
-        else:
-            features['golden_zone_ratio'] = np.nan
-            features['sl_pct'] = np.nan
-            features['tp1_pct'] = np.nan
-            features['tp2_pct'] = np.nan
-
-        # Price Action Feature
-        candle_range = setup_candle['high'] - setup_candle['low']
-        candle_body = abs(setup_candle['open'] - setup_candle['close'])
-        features['body_to_range_ratio'] = candle_body / candle_range if candle_range > 0 else 0
-
-        # Session One-Hot Encoding
-        session_str = setup_candle['session']
-        features['is_asia'] = 1 if 'Asia' in session_str else 0
-        features['is_london'] = 1 if 'London' in session_str else 0
-        features['is_new_york'] = 1 if 'New_York' in session_str else 0
-        
-        # Market Context Features (from pre-calculated values)
-        features['atr'] = setup_candle['atr']
-        features['rsi'] = setup_candle['rsi']
-        features['macd_diff'] = setup_candle['macd'] - setup_candle['macd_signal']
-        features['adx'] = setup_candle['adx']
-        for p in [20, 50, 100]:
-            features[f'volatility_{p}'] = setup_candle[f'volatility_{p}']
-        
-        # Bollinger Bands
-        features['bb_upper'] = setup_candle['bb_upper']
-        features['bb_lower'] = setup_candle['bb_lower']
-
-        # Ichimoku Cloud
-        features['tenkan_sen'] = setup_candle['tenkan_sen']
-        features['kijun_sen'] = setup_candle['kijun_sen']
-        features['senkou_span_a'] = setup_candle['senkou_span_a']
-        features['senkou_span_b'] = setup_candle['senkou_span_b']
-        features['chikou_span'] = setup_candle['chikou_span']
-
-        # Higher-Timeframe Context
-        features['rsi_4h'] = htf_candle['rsi']
-        features['macd_diff_4h'] = htf_candle['macd_diff']
-
-        # Symbol-Level Features
-        features['liquidity_proxy'] = setup_candle['liquidity_proxy']
-
-        feature_list.append(features)
-
-    if not feature_list:
-        print("No features were generated.")
-        return
-
-    # Create and save the final feature DataFrame
-    features_df = pd.DataFrame(feature_list)
-    print(f"Generated {len(features_df)} total feature vectors before cleaning.")
-    
-    # Drop any rows that still have NaNs for any reason (e.g. from lookback periods)
-    features_df.dropna(inplace=True) 
-    print(f"Feature vectors remaining after final dropna: {len(features_df)}")
-
-    os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
-    save_path = os.path.join(PROCESSED_DATA_DIR, "features.parquet")
-    features_df.to_parquet(save_path)
-    print(f"Feature engineering complete. Features saved to {save_path}")
-    print(f"Generated {len(features_df)} feature vectors.")
-
-
-def generate_features_for_live_setup(klines_df, setup_info, feature_columns):
+def calculate_quantity(balance, risk_per_trade, sl_price, entry_price, leverage):
     """
-    Generates a feature vector for a single, live trade setup.
-    `klines_df` should be a DataFrame of recent klines.
-    `setup_info` is a dict with trade parameters.
-    `feature_columns` is the list of columns the model was trained on.
+    Calculate the order quantity for backtesting. Simplified from main.py.
     """
-    # Use a copy to avoid modifying the original DataFrame
-    df = klines_df.copy()
-
-    # --- Pre-calculate all indicators on the DataFrame ---
-    df['atr'] = calculate_atr(df)
-    df['rsi'] = calculate_rsi(df)
-    df['macd'], df['macd_signal'] = calculate_macd(df)
-    df['adx'] = calculate_adx(df)
-    df['bb_upper'], df['bb_lower'] = calculate_bollinger_bands(df)
-    df['tenkan_sen'], df['kijun_sen'], df['senkou_span_a'], df['senkou_span_b'], df['chikou_span'] = calculate_ichimoku_cloud(df)
-    for p in [20, 50, 100]:
-        df[f'volatility_{p}'] = df['close'].pct_change().rolling(window=p).std()
-    df['liquidity_proxy'] = df['volume'].rolling(window=96).mean()
-
-    # Create a datetime index for resampling
-    df.set_index(pd.to_datetime(df['timestamp'], unit='ms'), inplace=True)
-
-    # Higher-timeframe features (4-hour)
-    df_4h = df['close'].resample('4h').ohlc()
-    df_4h['rsi'] = calculate_rsi(df_4h)
-    df_4h['macd'], df_4h['macd_signal'] = calculate_macd(df_4h)
-    df_4h['macd_diff'] = df_4h['macd'] - df_4h['macd_signal']
+    risk_amount = balance * (risk_per_trade / 100)
+    sl_percentage = abs(entry_price - sl_price) / entry_price
+    if sl_percentage == 0:
+        return 0
     
-    # --- Get the correct candles for feature extraction ---
-    setup_candle_timestamp_dt = df.index[-1]
-    setup_candle = df.loc[setup_candle_timestamp_dt]
-    htf_candle = df_4h.asof(setup_candle_timestamp_dt)
-
-    # --- Calculate Features ---
-    features = {}
-
-    # Price & Strategy Features
-    swing_height = setup_info['swing_high_price'] - setup_info['swing_low_price']
-    if swing_height > 0:
-        if setup_info['side'] == 'long':
-            features['golden_zone_ratio'] = (setup_info['entry_price'] - setup_info['swing_low_price']) / swing_height
-        else: # short
-            features['golden_zone_ratio'] = (setup_info['swing_high_price'] - setup_info['entry_price']) / swing_height
-        
-        features['sl_pct'] = abs(setup_info['entry_price'] - setup_info['sl']) / swing_height
-        features['tp1_pct'] = abs(setup_info['tp1'] - setup_info['entry_price']) / swing_height
-        features['tp2_pct'] = abs(setup_info['tp2'] - setup_info['entry_price']) / swing_height
-    else:
-        # Assign np.nan to avoid division by zero and ensure consistent feature count
-        features['golden_zone_ratio'] = np.nan
-        features['sl_pct'] = np.nan
-        features['tp1_pct'] = np.nan
-        features['tp2_pct'] = np.nan
-
-    # Price Action Feature
-    candle_range = setup_candle['high'] - setup_candle['low']
-    candle_body = abs(setup_candle['open'] - setup_candle['close'])
-    features['body_to_range_ratio'] = candle_body / candle_range if candle_range > 0 else 0
-
-    # Session One-Hot Encoding
-    session_str = get_session(setup_candle['timestamp'])
-    features['is_asia'] = 1 if 'Asia' in session_str else 0
-    features['is_london'] = 1 if 'London' in session_str else 0
-    features['is_new_york'] = 1 if 'New_York' in session_str else 0
-
-    # Market Context Features
-    features['atr'] = setup_candle['atr']
-    features['rsi'] = setup_candle['rsi']
-    features['macd_diff'] = setup_candle['macd'] - setup_candle['macd_signal']
-    features['adx'] = setup_candle['adx']
-    for p in [20, 50, 100]:
-        features[f'volatility_{p}'] = setup_candle[f'volatility_{p}']
+    position_size = risk_amount / sl_percentage
+    quantity = position_size / entry_price
     
-    # Bollinger Bands
-    features['bb_upper'] = setup_candle['bb_upper']
-    features['bb_lower'] = setup_candle['bb_lower']
+    # In a real scenario, you'd adjust for lot size, but we'll ignore for this backtest
+    return quantity
 
-    # Ichimoku Cloud
-    features['tenkan_sen'] = setup_candle['tenkan_sen']
-    features['kijun_sen'] = setup_candle['kijun_sen']
-    features['senkou_span_a'] = setup_candle['senkou_span_a']
-    features['senkou_span_b'] = setup_candle['senkou_span_b']
-    features['chikou_span'] = setup_candle['chikou_span']
+def calculate_performance_metrics(backtest_trades, starting_balance):
+    """
+    Calculate performance metrics from a list of trades.
+    """
+    num_trades = len(backtest_trades)
+    if num_trades == 0:
+        return {
+            'total_trades': 0, 'winning_trades': 0, 'losing_trades': 0, 'win_rate': 0,
+            'average_win': 0, 'average_loss': 0, 'profit_factor': 0, 'max_drawdown': 0,
+            'net_pnl_usd': 0, 'net_pnl_pct': 0, 'expectancy': 0
+        }
 
-    # Higher-Timeframe Context
-    features['rsi_4h'] = htf_candle['rsi']
-    features['macd_diff_4h'] = htf_candle['macd_diff']
-
-    # Symbol-Level Features
-    features['liquidity_proxy'] = setup_candle['liquidity_proxy']
+    wins = sum(1 for trade in backtest_trades if trade.status == 'win')
+    losses = num_trades - wins
+    win_rate = (wins / num_trades) * 100 if num_trades > 0 else 0
     
-    # Side feature
-    features['side_long'] = 1 if setup_info['side'] == 'long' else 0
-
-    # Create a DataFrame with the correct column order and handle potential NaNs
-    feature_vector = pd.DataFrame([features])
-    feature_vector = feature_vector[feature_columns] # Ensure column order
-    feature_vector.fillna(0, inplace=True) # Fill any potential NaNs with 0 as a safe default
+    total_win_amount = sum(trade.pnl_usd for trade in backtest_trades if trade.status == 'win')
+    total_loss_amount = sum(trade.pnl_usd for trade in backtest_trades if trade.status == 'loss')
     
-    return feature_vector
-
-
-import joblib
-from tqdm.auto import tqdm
-
-import lightgbm as lgb
-from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.utils.class_weight import compute_class_weight
-
-
-# --- Model Training (Step 4) ---
-def train_model():
-    """Loads features, trains a model with hyperparameter tuning, and saves it."""
-    print("Starting model training...")
-    try:
-        features_df = pd.read_parquet(os.path.join(PROCESSED_DATA_DIR, "features.parquet"))
-    except FileNotFoundError:
-        print("Error: features.parquet not found. Please run engineer_features() first.")
-        return
-
-    if features_df.empty:
-        print("Feature set is empty. Cannot train model.")
-        return
-
-    # --- Data Preparation ---
-    feature_columns = [
-        # Original Features
-        'golden_zone_ratio', 'sl_pct', 'tp1_pct', 'tp2_pct',
-        'is_asia', 'is_london', 'is_new_york',
-        'atr', 'rsi', 'macd_diff', 'liquidity_proxy',
-        # New Features
-        'body_to_range_ratio',
-        'adx',
-        'volatility_20', 'volatility_50', 'volatility_100',
-        'rsi_4h', 'macd_diff_4h',
-        'bb_upper', 'bb_lower',
-        'tenkan_sen', 'kijun_sen', 'senkou_span_a', 'senkou_span_b', 'chikou_span'
-    ]
-    features_df['side_long'] = (features_df['side'] == 'long').astype(int)
-    feature_columns.append('side_long')
-
-    X = features_df[feature_columns]
-    y = features_df['label']
-
-    # --- Time-based Split ---
-    sorted_indices = features_df['timestamp'].argsort()
-    X = X.iloc[sorted_indices]
-    y = y.iloc[sorted_indices]
+    avg_win = total_win_amount / wins if wins > 0 else 0
+    avg_loss = total_loss_amount / losses if losses > 0 else 0
     
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+    profit_factor = total_win_amount / abs(total_loss_amount) if total_loss_amount != 0 else float('inf')
     
-    print(f"Training data shape: {X_train.shape}")
-    print(f"Testing data shape: {X_test.shape}")
+    net_pnl_usd = total_win_amount + total_loss_amount
+    net_pnl_pct = (net_pnl_usd / starting_balance) * 100
+    
+    expectancy = (win_rate/100 * avg_win) - ((losses/num_trades) * abs(avg_loss)) if num_trades > 0 else 0
 
-    # --- Handle Class Imbalance ---
-    class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
-    weights_dict = {i : class_weights[i] for i, w in enumerate(class_weights)}
-    print(f"Calculated class weights: {weights_dict}")
-    sample_weights = y_train.map(weights_dict)
+    # Drawdown calculation
+    balance_over_time = [starting_balance] + [trade.balance for trade in backtest_trades]
+    peak = balance_over_time[0]
+    max_drawdown = 0
+    for balance in balance_over_time:
+        if balance > peak:
+            peak = balance
+        drawdown = (peak - balance) / peak
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
 
-    # --- Model Training with User-Defined Parameters ---
-    # Parameters provided by the user
-    user_params = {
-        'subsample': 0.7, 
-        'reg_lambda': 0.5, 
-        'reg_alpha': 0.1, 
-        'num_leaves': 70, 
-        'n_estimators': 300, 
-        'max_depth': -1, 
-        'learning_rate': 0.1, 
-        'colsample_bytree': 0.9,
-        'objective': 'multiclass',
-        'num_class': 3,
-        'n_jobs': -1,
-        'random_state': 42 # for reproducibility
+    return {
+        'total_trades': num_trades, 'winning_trades': wins, 'losing_trades': losses,
+        'win_rate': win_rate, 'average_win': avg_win, 'average_loss': avg_loss,
+        'profit_factor': profit_factor, 'max_drawdown': max_drawdown * 100,
+        'net_pnl_usd': net_pnl_usd, 'net_pnl_pct': net_pnl_pct, 'expectancy': expectancy
     }
 
-    print(f"Training model with user-defined parameters: {user_params}")
-
-    # Initialize and train the LightGBM Classifier
-    best_model = lgb.LGBMClassifier(**user_params)
-    best_model.fit(X_train, y_train, sample_weight=sample_weights)
-
-    # --- Evaluation ---
-    print("\nModel Evaluation on Test Set:")
-    y_pred = best_model.predict(X_test)
-    
-    # Add labels parameter to handle cases where test data doesn't have all classes
-    print(classification_report(y_test, y_pred, target_names=['Loss (0)', 'TP1 Win (1)', 'TP2 Win (2)'], labels=[0, 1, 2], zero_division=0))
-    
-    print("Confusion Matrix:")
-    print(confusion_matrix(y_test, y_pred))
-
-    # --- Persistence ---
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    model_path = os.path.join(MODELS_DIR, "trading_model.joblib")
-    
-    # Save the best model and the feature columns together
-    joblib.dump({
-        'model': best_model,
-        'feature_columns': feature_columns
-    }, model_path)
-
-    print(f"\nModel and metadata saved to {model_path}")
-
-
-def run_pipeline():
+def analyze_strategy_behavior(backtest_trades):
     """
-    Runs the full data pipeline from acquisition to model training,
-    skipping steps if the data already exists.
+    Analyze the performance of the strategy based on different conditions.
     """
-    features_path = os.path.join(PROCESSED_DATA_DIR, "features.parquet")
-    labeled_path = os.path.join(PROCESSED_DATA_DIR, "labeled_trades.parquet")
+    # Performance by hour
+    hourly_performance = {}
+    for trade in backtest_trades:
+        hour = datetime.datetime.fromtimestamp(trade.entry_timestamp/1000).hour
+        if hour not in hourly_performance:
+            hourly_performance[hour] = {'wins': 0, 'losses': 0, 'total': 0}
+        hourly_performance[hour]['total'] += 1
+        if trade.status == 'win':
+            hourly_performance[hour]['wins'] += 1
+        else:
+            hourly_performance[hour]['losses'] += 1
+            
+    # Performance by trend
+    trend_performance = {'uptrend': {'wins': 0, 'losses': 0, 'total': 0}, 'downtrend': {'wins': 0, 'losses': 0, 'total': 0}}
+    for trade in backtest_trades:
+        if "uptrend" in trade.reason_for_entry:
+            trend_performance['uptrend']['total'] += 1
+            if trade.status == 'win':
+                trend_performance['uptrend']['wins'] += 1
+            else:
+                trend_performance['uptrend']['losses'] += 1
+        elif "downtrend" in trade.reason_for_entry:
+            trend_performance['downtrend']['total'] += 1
+            if trade.status == 'win':
+                trend_performance['downtrend']['wins'] += 1
+            else:
+                trend_performance['downtrend']['losses'] += 1
 
-    if os.path.exists(features_path):
-        print("--- Found existing features.parquet. Skipping to Step 4: Model Training ---")
-        train_model()
-    elif os.path.exists(labeled_path):
-        print("--- Found existing labeled_trades.parquet. Skipping to Step 3: Feature Engineering ---")
-        engineer_features()
-        print("\n--- Running Step 4: Model Training ---")
-        train_model()
-    else:
-        print("--- Running full pipeline from scratch ---")
-        print("--- Running Step 1: Data Acquisition ---")
-        fetch_initial_data()
+    return {
+        'hourly_performance': hourly_performance,
+        'trend_performance': trend_performance
+    }
+
+def generate_equity_curve(backtest_trades, starting_balance, save_path):
+    balance_over_time = [starting_balance] + [trade.balance for trade in backtest_trades]
+    plt.figure(figsize=(10, 6))
+    plt.plot(balance_over_time)
+    plt.title('Equity Curve')
+    plt.xlabel('Trade Number')
+    plt.ylabel('Balance (USD)')
+    plt.grid(True)
+    plt.savefig(save_path, bbox_inches='tight')
+    plt.close()
+
+def generate_drawdown_curve(backtest_trades, starting_balance, save_path):
+    balance_over_time = [starting_balance] + [trade.balance for trade in backtest_trades]
+    peak = balance_over_time[0]
+    drawdowns = []
+    for balance in balance_over_time:
+        if balance > peak:
+            peak = balance
+        drawdown = (peak - balance) / peak
+        drawdowns.append(drawdown * 100)
         
-        print("\n--- Running Step 2: Preprocessing and Labeling ---")
-        main_preprocess()
+    plt.figure(figsize=(10, 6))
+    plt.plot(drawdowns, color='red')
+    plt.title('Drawdown Curve')
+    plt.xlabel('Trade Number')
+    plt.ylabel('Drawdown (%)')
+    plt.grid(True)
+    plt.savefig(save_path, bbox_inches='tight')
+    plt.close()
 
-        print("\n--- Running Step 3: Feature Engineering ---")
-        engineer_features()
+def generate_win_loss_distribution(backtest_trades, save_path):
+    if not backtest_trades: return
+    wins = sum(1 for trade in backtest_trades if trade.status == 'win')
+    losses = len(backtest_trades) - wins
+    labels = 'Wins', 'Losses'
+    sizes = [wins, losses]
+    colors = ['#26A69A', '#EF5350']
+    
+    plt.figure(figsize=(8, 8))
+    plt.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+    plt.title('Win/Loss Distribution')
+    plt.axis('equal')
+    plt.savefig(save_path, bbox_inches='tight')
+    plt.close()
 
-        print("\n--- Running Step 4: Model Training ---")
-        train_model()
+def generate_returns_histogram(backtest_trades, save_path):
+    if not backtest_trades: return
+    returns = [trade.pnl_pct for trade in backtest_trades]
+    plt.figure(figsize=(10, 6))
+    plt.hist(returns, bins=50, color='blue', alpha=0.7)
+    plt.title('Trade Returns Histogram')
+    plt.xlabel('Return (%)')
+    plt.ylabel('Frequency')
+    plt.grid(True)
+    plt.savefig(save_path, bbox_inches='tight')
+    plt.close()
 
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description="Run the ML pipeline for the trading bot.")
-    parser.add_argument(
-        'step', 
-        nargs='?', 
-        default='all', 
-        choices=['fetch', 'label', 'features', 'train', 'all'],
-        help="The pipeline step to run: 'fetch', 'label', 'features', 'train', or 'all' (default)."
-    )
-    args = parser.parse_args()
+def generate_csv_report(backtest_trades, save_path):
+    if not backtest_trades: return
+    df = pd.DataFrame([vars(t) for t in backtest_trades])
+    df.to_csv(save_path, index=False)
+    logger.info(f"Backtest trades saved to {save_path}")
 
-    if args.step == 'all':
-        run_pipeline()
-    elif args.step == 'fetch':
-        fetch_initial_data()
-    elif args.step == 'label':
-        main_preprocess()
-    elif args.step == 'features':
-        engineer_features()
-    elif args.step == 'train':
-        train_model()
+def generate_json_report(backtest_trades, metrics, strategy_analysis, save_path):
+    if not backtest_trades: return
+    report = {
+        'metrics': metrics,
+        'strategy_analysis': strategy_analysis,
+        'trades': [vars(t) for t in backtest_trades]
+    }
+    with open(save_path, 'w') as f:
+        json.dump(report, f, indent=4)
+    logger.info(f"Backtest report saved to {save_path}")
+
+def generate_summary_report(metrics, strategy_analysis, config, starting_balance, save_path):
+    headers = ["Metric", "Value"]
+    table = [
+        ["Starting Balance", f"${starting_balance:,.2f}"],
+        ["Ending Balance", f"${metrics.get('net_pnl_usd', 0) + starting_balance:,.2f}"],
+        ["Total Profit", f"${metrics.get('net_pnl_usd', 0):,.2f}"],
+        ["Total Trades", metrics.get('total_trades', 0)],
+        ["Winning Trades", metrics.get('winning_trades', 0)],
+        ["Losing Trades", metrics.get('losing_trades', 0)],
+        ["Win Rate", f"{metrics.get('win_rate', 0):.2f}%"],
+        ["Profit Factor", f"{metrics.get('profit_factor', 0):.2f}"],
+        ["Max Drawdown", f"{metrics.get('max_drawdown', 0):.2f}%"]
+    ]
+    
+    report = "Backtesting Summary\n"
+    report += "===================\n\n"
+    report += tabulate(table, headers=headers, tablefmt="grid")
+    
+    # Print the report to the console
+    logger.info("\n" + report)
+    
+    with open(save_path, "w") as f:
+        f.write(report)
+    logger.info(f"Human-readable summary saved to {save_path}")
+
+def generate_backtest_report(backtest_trades, config, starting_balance, report_dir):
+    """
+    Generate a detailed report from the backtest results.
+    """
+    if not os.path.exists(report_dir):
+        os.makedirs(report_dir)
+    
+    if not backtest_trades:
+        logger.warning("No trades to generate a report for.")
+        return
+
+    metrics = calculate_performance_metrics(backtest_trades, starting_balance)
+    strategy_analysis = analyze_strategy_behavior(backtest_trades)
+    
+    generate_summary_report(metrics, strategy_analysis, config, starting_balance, os.path.join(report_dir, "summary.txt"))
+    generate_equity_curve(backtest_trades, starting_balance, os.path.join(report_dir, "equity_curve.png"))
+    generate_drawdown_curve(backtest_trades, starting_balance, os.path.join(report_dir, "drawdown_curve.png"))
+    generate_win_loss_distribution(backtest_trades, os.path.join(report_dir, "win_loss_distribution.png"))
+    generate_returns_histogram(backtest_trades, os.path.join(report_dir, "returns_histogram.png"))
+    generate_csv_report(backtest_trades, os.path.join(report_dir, "trades.csv"))
+    generate_json_report(backtest_trades, metrics, strategy_analysis, os.path.join(report_dir, "report.json"))
+    
+    logger.info(f"Backtest report generated in directory: {report_dir}")
+
+
+# --- ML Data Preparation ---
+
+def validate_data(samples):
+    """Logs statistics about the dataset for validation."""
+    if not samples:
+        logger.warning("No samples to validate.")
+        return
+
+    labels = [s[1] for s in samples]
+    wins = sum(labels)
+    losses = len(labels) - wins
+    win_pct = (wins / len(labels)) * 100
+    
+    logger.info("--- Data Validation ---")
+    logger.info(f"Total Samples: {len(samples)}")
+    logger.info(f"Label Balance: {wins} Wins ({win_pct:.2f}%) vs. {losses} Losses ({100-win_pct:.2f}%)")
+    
+    logger.info("Spot-checking 5 random samples (last 5 closing prices and label):")
+    for i in range(5):
+        idx = random.randint(0, len(samples) - 1)
+        features, label = samples[idx]
+        # Get the last 5 closing prices (index 3 of the features)
+        last_5_closes = features[-5:, 3] 
+        logger.info(f"  Sample {idx+1}: Closes={last_5_closes}, Label={label}")
+    logger.info("-----------------------")
+
+def add_technical_indicators(df):
+    """Adds technical indicators to the DataFrame."""
+    df['return'] = df['close'].pct_change()
+    df['ema_10'] = ta.ema(df['close'], length=10)
+    df['ema_50'] = ta.ema(df['close'], length=50)
+    df['rsi'] = ta.rsi(df['close'], length=14)
+    df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+    df.dropna(inplace=True)
+    return df
+
+def _process_symbol_data(symbol_file):
+    """
+    Worker function to load a symbol's data, generate trade signals, and label them.
+    This is designed to be run in a multiprocessing pool.
+    """
+    try:
+        symbol = os.path.basename(os.path.dirname(symbol_file))
+        logger.info(f"Processing data for {symbol}...")
+        
+        df = pd.read_parquet(symbol_file)
+        
+        # First, clean the core OHLCV columns
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df.dropna(subset=['open', 'high', 'low', 'close', 'volume'], inplace=True)
+        
+        # Now, calculate technical indicators on the cleaned data
+        df = add_technical_indicators(df)
+
+        # Final check for any NaNs or infs introduced by indicators
+        feature_cols = ['open', 'high', 'low', 'close', 'volume', 'return', 'ema_10', 'ema_50', 'rsi', 'atr']
+        df.dropna(subset=feature_cols, inplace=True)
+        df = df[np.isfinite(df[feature_cols]).all(axis=1)]
+
+        if CONFIG["quick_test"]:
+            fraction = CONFIG["quick_test_data_fraction"]
+            df = df.head(int(len(df) * fraction))
+
+        klines = df.to_numpy()
+        samples = []
+        
+        # Iterate through the data to find trade opportunities and label them
+        for i in range(CONFIG["lookback_candles"] + CONFIG["sequence_length"], len(klines) - 1):
+            # The sequence of data the model will see
+            sequence_start = i - CONFIG["sequence_length"]
+            sequence_end = i
+            data_sequence = klines[sequence_start:sequence_end]
+            
+            # The data used to determine the signal
+            signal_klines = klines[i - CONFIG["lookback_candles"]:i]
+            
+            swing_highs, swing_lows = get_swing_points(signal_klines, CONFIG["swing_window"])
+            trend = get_trend(swing_highs, swing_lows)
+            
+            signal = None
+            if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+                last_swing_high = swing_highs[-1][1]
+                last_swing_low = swing_lows[-1][1]
+                entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
+                current_price = float(signal_klines[-1][4]) # last close
+                
+                # Check if the signal is valid
+                if current_price > entry_price:
+                    sl = last_swing_high
+                    tp = entry_price - (sl - entry_price) # TP1
+                    signal = {'side': 'short', 'entry': entry_price, 'sl': sl, 'tp': tp}
+            
+            elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+                last_swing_high = swing_highs[-1][1]
+                last_swing_low = swing_lows[-1][1]
+                entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
+                current_price = float(signal_klines[-1][4])
+                
+                if current_price < entry_price:
+                    sl = last_swing_low
+                    tp = entry_price + (entry_price - sl) # TP1
+                    signal = {'side': 'long', 'entry': entry_price, 'sl': sl, 'tp': tp}
+            
+            # If a signal was generated, look into the future to label it
+            if signal:
+                label = 0 # Default to loss
+                for future_kline in klines[i:]:
+                    future_high = float(future_kline[2])
+                    future_low = float(future_kline[3])
+                    
+                    if signal['side'] == 'long':
+                        if future_high >= signal['tp']:
+                            label = 1 # Win
+                            break
+                        if future_low <= signal['sl']:
+                            label = 0 # Loss
+                            break
+                    elif signal['side'] == 'short':
+                        if future_low <= signal['tp']:
+                            label = 1 # Win
+                            break
+                        if future_high >= signal['sl']:
+                            label = 0 # Loss
+                            break
+                
+                # We have a sequence and a label, add it to our samples
+                # Features are OHLCV + new indicators
+                features = data_sequence[:, 1:11].astype(np.float32)
+                samples.append((features, label))
+
+        logger.info(f"Finished processing {symbol}. Found {len(samples)} samples.")
+        return samples
+    except Exception as e:
+        logger.error(f"Error processing file {symbol_file}: {e}")
+        return []
+
+class ManualMinMaxScaler:
+    """A manual implementation of a min-max scaler."""
+    def __init__(self):
+        self.min_ = None
+        self.max_ = None
+
+    def fit_transform(self, data):
+        self.min_ = np.min(data, axis=0)
+        self.max_ = np.max(data, axis=0)
+        # Add a small epsilon to avoid division by zero if a feature is constant
+        epsilon = 1e-8
+        return (data - self.min_) / (self.max_ - self.min_ + epsilon)
+
+    def transform(self, data):
+        if self.min_ is None or self.max_ is None:
+            raise RuntimeError("Scaler has not been fitted yet.")
+        epsilon = 1e-8
+        return (data - self.min_) / (self.max_ - self.min_ + epsilon)
+
+class TradingDataset(Dataset):
+    """PyTorch dataset for loading and preparing trading data."""
+    def __init__(self, samples, scaler=None):
+        if not samples:
+            self.samples = []
+            self.scaler = scaler
+            return
+            
+        features, labels = zip(*samples)
+        
+        n_samples, seq_len, n_features = len(features), features[0].shape[0], features[0].shape[1]
+        features_reshaped = np.reshape(features, (n_samples * seq_len, n_features))
+        
+        if scaler is None:
+            self.scaler = ManualMinMaxScaler()
+            features_scaled = self.scaler.fit_transform(features_reshaped)
+        else:
+            self.scaler = scaler
+            features_scaled = self.scaler.transform(features_reshaped)
+        
+        features_scaled = np.reshape(features_scaled, (n_samples, seq_len, n_features))
+        
+        self.features = torch.tensor(features_scaled, dtype=torch.float32)
+        self.labels = torch.tensor(labels, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.features) if hasattr(self, 'features') else 0
+
+    def __getitem__(self, idx):
+        return self.features[idx], self.labels[idx].unsqueeze(-1)
+
+def manual_train_test_split(samples, test_size=0.2, random_state=42):
+    """A manual implementation of train_test_split with stratification."""
+    if random_state is not None:
+        random.seed(random_state)
+    
+    # Separate samples by label
+    class_0 = [s for s in samples if s[1] == 0]
+    class_1 = [s for s in samples if s[1] == 1]
+    
+    # Shuffle each class list
+    random.shuffle(class_0)
+    random.shuffle(class_1)
+    
+    # Calculate split indices
+    split_0 = int(len(class_0) * (1 - test_size))
+    split_1 = int(len(class_1) * (1 - test_size))
+    
+    # Create train and validation sets
+    train_samples = class_0[:split_0] + class_1[:split_1]
+    val_samples = class_0[split_0:] + class_1[split_1:]
+    
+    # Shuffle the final sets
+    random.shuffle(train_samples)
+    random.shuffle(val_samples)
+    
+    return train_samples, val_samples
+
+def prepare_all_data():
+    """Scans data directory, loads all data, and prepares it for the model."""
+    logger.info("--- Preparing Data ---")
+    search_path = os.path.join(CONFIG["data_dir"], 'raw', '**', '*.parquet')
+    data_files = glob.glob(search_path, recursive=True)
+    
+    if not data_files:
+        raise FileNotFoundError(f"No Parquet files found in the '{CONFIG['data_dir']}/raw/' directory structure.")
+        
+    if CONFIG["quick_test"]:
+        data_files = data_files[:CONFIG["quick_test_symbols"]]
+    
+    logger.info(f"Found {len(data_files)} symbol files to process.")
+    
+    with Pool(processes=min(4, cpu_count())) as pool:
+        results = pool.map(_process_symbol_data, data_files)
+    
+    all_samples = [sample for result in results for sample in result]
+    
+    if not all_samples:
+        raise ValueError("No training samples could be generated from the data. Check data files and strategy logic.")
+        
+    logger.info(f"Total samples generated: {len(all_samples)}")
+    
+    if not CONFIG.get("quick_test", False):
+        validate_data(all_samples)
+    
+    train_samples, val_samples = manual_train_test_split(all_samples, test_size=0.2, random_state=42)
+    
+    train_dataset = TradingDataset(train_samples)
+    val_dataset = TradingDataset(val_samples, scaler=train_dataset.scaler) # Use same scaler for validation
+    
+    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True, num_workers=min(4, cpu_count()), pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=min(4, cpu_count()), pin_memory=True)
+    
+    logger.info("--- Data Preparation Complete ---")
+    return train_loader, val_loader, train_dataset.scaler
+
+
+# --- LSTM Model Definition ---
+
+class TraderLSTM(nn.Module):
+    """LSTM model to predict trade outcomes."""
+    def __init__(self, input_size=10, hidden_size=50, num_layers=2, output_size=1, dropout=0.2):
+        super(TraderLSTM, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        # LSTM layer
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
+                            batch_first=True, dropout=dropout)
+        
+        # Dropout layer
+        self.dropout = nn.Dropout(dropout)
+        
+        # Fully connected layer
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        # Initialize hidden and cell states
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        
+        # Forward propagate LSTM
+        out, _ = self.lstm(x, (h0, c0))
+        
+        # Get the output from the last time step
+        out = out[:, -1, :]
+        
+        # Apply dropout
+        out = self.dropout(out)
+        
+        # Pass to fully connected layer
+        out = self.fc(out)
+        
+        return out
+
+
+# --- Training and Evaluation ---
+
+def train_model(model, train_loader, val_loader, epochs, model_path):
+    """Function to train the LSTM model with advanced techniques."""
+    # Calculate pos_weight for imbalanced dataset
+    labels = train_loader.dataset.labels.numpy()
+    neg = np.sum(labels == 0)
+    pos = np.sum(labels == 1)
+    
+    if pos > 0:
+        pos_weight = torch.tensor([neg / pos], dtype=torch.float32).to(DEVICE)
+        logger.info(f"Using positive weight for loss function: {pos_weight.item():.2f}")
+    else:
+        # If there are no positive samples, weight is irrelevant but should be 1 to avoid errors.
+        pos_weight = torch.tensor([1.0], dtype=torch.float32).to(DEVICE)
+        logger.warning("No positive samples found in training data. Using default pos_weight of 1.0.")
+
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = optim.Adam(model.parameters(), lr=CONFIG["learning_rate"], weight_decay=CONFIG.get("weight_decay", 0))
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5, verbose=True)
+    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+
+    best_val_loss = float('inf')
+    history = {'train_loss': [], 'val_loss': [], 'val_acc': [], 'lr': []}
+
+    for epoch in range(epochs):
+        # Training
+        model.train()
+        running_train_loss = 0.0
+        for i, (sequences, labels) in enumerate(train_loader):
+            sequences, labels = sequences.to(DEVICE), labels.to(DEVICE)
+            
+            optimizer.zero_grad()
+            
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                outputs = model(sequences)
+                loss = criterion(outputs, labels)
+            
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            
+            running_train_loss += loss.item()
+        
+        avg_train_loss = running_train_loss / len(train_loader)
+        history['train_loss'].append(avg_train_loss)
+        
+        # Validation
+        model.eval()
+        running_val_loss = 0.0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for sequences, labels in val_loader:
+                sequences, labels = sequences.to(DEVICE), labels.to(DEVICE)
+                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                    outputs = model(sequences)
+                    loss = criterion(outputs, labels)
+                running_val_loss += loss.item()
+                
+                # Apply sigmoid to logits to get probabilities for prediction
+                predicted = (torch.sigmoid(outputs) > 0.5).float()
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        
+        avg_val_loss = running_val_loss / len(val_loader)
+        accuracy = 100 * correct / total
+        history['val_loss'].append(avg_val_loss)
+        history['val_acc'].append(accuracy)
+        history['lr'].append(optimizer.param_groups[0]['lr'])
+        
+        logger.info(f'Epoch [{epoch+1}/{epochs}], Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val Acc: {accuracy:.2f}%, LR: {optimizer.param_groups[0]["lr"]:.6f}')
+        
+        scheduler.step(avg_val_loss)
+        
+        # Checkpointing
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), model_path)
+            logger.info(f"Model saved to {model_path} (best validation loss: {best_val_loss:.4f})")
+            
+    return history
+
+def generate_model_report(history, report_dir):
+    """Generates a report on the model's training performance."""
+    logger.info("--- Generating Model Report ---")
+    os.makedirs(report_dir, exist_ok=True)
+    
+    # Plotting training & validation loss
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['train_loss'], label='Training Loss')
+    plt.plot(history['val_loss'], label='Validation Loss')
+    plt.title('Loss vs. Epochs')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.savefig(os.path.join(report_dir, 'loss_curve.png'), bbox_inches='tight')
+    plt.close()
+    
+    # Plotting validation accuracy
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['val_acc'], label='Validation Accuracy')
+    plt.title('Accuracy vs. Epochs')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy (%)')
+    plt.legend()
+    plt.savefig(os.path.join(report_dir, 'accuracy_curve.png'), bbox_inches='tight')
+    plt.close()
+    
+    # Summary text file
+    best_epoch = np.argmin(history['val_loss'])
+    summary = f"""
+Model Training Summary
+======================
+Total Epochs: {len(history['train_loss'])}
+Best Epoch: {best_epoch + 1}
+
+Final Metrics:
+--------------
+Final Training Loss: {history['train_loss'][-1]:.4f}
+Final Validation Loss: {history['val_loss'][-1]:.4f}
+Final Validation Accuracy: {history['val_acc'][-1]:.2f}%
+
+Best Model Metrics (Epoch {best_epoch + 1}):
+------------------------------------
+Validation Loss: {history['val_loss'][best_epoch]:.4f}
+Validation Accuracy: {history['val_acc'][best_epoch]:.2f}%
+"""
+    with open(os.path.join(report_dir, 'model_summary.txt'), 'w') as f:
+        f.write(summary)
+        
+    logger.info(f"Model report saved in {report_dir}")
+
+
+def generate_confidence_histogram(confidences, save_path):
+    """Generates and saves a histogram of model confidence scores."""
+    if not confidences:
+        logger.warning("No confidence scores to generate a histogram for.")
+        return
+    
+    plt.figure(figsize=(10, 6))
+    plt.hist(confidences, bins=50, color='purple', alpha=0.7)
+    plt.title('Model Logit Distribution')
+    plt.xlabel('Logit')
+    plt.ylabel('Frequency')
+    plt.grid(True)
+    plt.savefig(save_path, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Confidence histogram saved to {save_path}")
+
+
+# --- ML-Based Backtesting ---
+
+def run_ml_backtest(model, scaler, report_dir):
+    """Runs a backtest using the original strategy filtered by the ML model."""
+    logger.info("--- Starting ML-Based Backtest ---")
+    model.to(DEVICE)
+    model.eval()
+
+    search_path = os.path.join(CONFIG["data_dir"], 'raw', '**', '*.parquet')
+    data_files = glob.glob(search_path, recursive=True)
+    if not data_files:
+        logger.warning("No data files found for backtesting.")
+        return
+
+    backtest_trades = []
+    balance = CONFIG['starting_balance']
+    all_confidences = []
+    total_raw_signals = 0
+    total_ml_signals = 0
+
+    for symbol_file in data_files:
+        symbol = os.path.basename(os.path.dirname(symbol_file))
+        logger.info(f"Backtesting on {symbol}...")
+        
+        raw_signals = 0
+        ml_signals = 0
+        confidences_logged = 0
+        trades_before_symbol = len(backtest_trades)
+        
+        df = pd.read_parquet(symbol_file)
+        df = add_technical_indicators(df)
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df.dropna(inplace=True)
+        klines = df.to_numpy()
+
+        for i in range(CONFIG["lookback_candles"] + CONFIG["sequence_length"], len(klines) - 1):
+            signal_klines = klines[i - CONFIG["lookback_candles"]:i]
+            
+            swing_highs, swing_lows = get_swing_points(signal_klines, CONFIG["swing_window"])
+            trend = get_trend(swing_highs, swing_lows)
+            
+            signal = None
+            if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+                last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
+                entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
+                if float(signal_klines[-1][4]) > entry_price:
+                    sl, tp = last_swing_high, entry_price - (last_swing_high - entry_price)
+                    signal = {'side': 'short', 'entry': entry_price, 'sl': sl, 'tp': tp, 'reason': 'Fib retracement in downtrend'}
+            
+            elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+                last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
+                entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
+                if float(signal_klines[-1][4]) < entry_price:
+                    sl, tp = last_swing_low, entry_price + (entry_price - last_swing_low)
+                    signal = {'side': 'long', 'entry': entry_price, 'sl': sl, 'tp': tp, 'reason': 'Fib retracement in uptrend'}
+
+            if signal:
+                raw_signals += 1
+                logit = 1.0 # Default logit for debug mode
+
+                if not CONFIG.get("debug_no_ml", False):
+                    # ML Model Prediction Step
+                    sequence_start = i - CONFIG["sequence_length"]
+                    data_sequence = klines[sequence_start:i, 1:11].astype(np.float32)
+                    
+                    # Scale the sequence using the pre-fitted scaler
+                    scaled_sequence = scaler.transform(data_sequence)
+                    sequence_tensor = torch.tensor(scaled_sequence, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+                    
+                    with torch.no_grad():
+                        logit = model(sequence_tensor).item()
+                
+                all_confidences.append(logit)
+                if confidences_logged < 5:
+                    logger.info(f"Sample logit for {symbol} @ index {i}: {logit:.3f}")
+                    confidences_logged += 1
+
+                # A logit > 0 corresponds to a probability > 0.5
+                if logit > 0:
+                    ml_signals += 1
+                    # Simulate the trade
+                    exit_price, status, exit_timestamp = (None, None, None)
+                    for j in range(i, len(klines)):
+                        future_kline = klines[j]
+                        high, low = float(future_kline[2]), float(future_kline[3])
+                        
+                        if signal['side'] == 'long':
+                            if high >= signal['tp']:
+                                exit_price, status, exit_timestamp = signal['tp'], 'win', future_kline[0]
+                                break
+                            elif low <= signal['sl']:
+                                exit_price, status, exit_timestamp = signal['sl'], 'loss', future_kline[0]
+                                break
+                        elif signal['side'] == 'short':
+                            if low <= signal['tp']:
+                                exit_price, status, exit_timestamp = signal['tp'], 'win', future_kline[0]
+                                break
+                            elif high >= signal['sl']:
+                                exit_price, status, exit_timestamp = signal['sl'], 'loss', future_kline[0]
+                                break
+                    
+                    if j <= i:
+                        logger.error(f"Exit index did not advance for {symbol} at index {i}; continuing to avoid infinite loop.")
+                        continue
+
+                    if status:
+                        quantity = calculate_quantity(balance, CONFIG['risk_per_trade'], signal['sl'], signal['entry'], CONFIG['leverage'])
+                        pnl_usd = (exit_price - signal['entry']) * quantity if signal['side'] == 'long' else (signal['entry'] - exit_price) * quantity
+                        pnl_pct = (pnl_usd / (signal['entry'] * quantity)) * 100 if (signal['entry'] * quantity) != 0 else 0
+                        
+                        balance += pnl_usd
+                        
+                        trade = TradeResult(
+                            symbol=symbol, side=signal['side'], entry_price=signal['entry'],
+                            exit_price=exit_price, entry_timestamp=klines[i][0], exit_timestamp=exit_timestamp,
+                            status=status, pnl_usd=pnl_usd, pnl_pct=pnl_pct, drawdown=0, # Drawdown simplified
+                            reason_for_entry=signal['reason'], reason_for_exit=f'{status.capitalize()} hit', fib_levels=[]
+                        )
+                        trade.balance = balance
+                        backtest_trades.append(trade)
+                        i = j # Skip to the end of the concluded trade
+        
+        executed_trades = len(backtest_trades) - trades_before_symbol
+        logger.info(f"{symbol}: {raw_signals} raw signals, {ml_signals} ML-filtered, {executed_trades} executed trades.")
+        total_raw_signals += raw_signals
+        total_ml_signals += ml_signals
+    
+    logger.info(f"--- Global Backtest Summary ---")
+    logger.info(f"Total Raw Signals: {total_raw_signals}")
+    logger.info(f"Total ML-Filtered Signals: {total_ml_signals}")
+    logger.info(f"Total Trades Executed: {len(backtest_trades)}")
+    generate_backtest_report(backtest_trades, CONFIG, CONFIG['starting_balance'], report_dir)
+    generate_confidence_histogram(all_confidences, os.path.join(report_dir, "confidence_histogram.png"))
+
+
+# --- Main Execution Flow ---
+
+def cleanup_quick_test_files():
+    """Removes files generated during the quick test."""
+    logger.info("Cleaning up quick test files...")
+    quick_model_path = CONFIG["model_path"] + ".quick"
+    if os.path.exists(quick_model_path):
+        os.remove(quick_model_path)
+        
+    logger.info("Cleanup complete.")
+
+def quick_test():
+    """Runs a quick test of the entire pipeline with a subset of data."""
+    logger.info("--- Starting Quick Test ---")
+    CONFIG["quick_test"] = True
+    
+    # 1. Prepare Data
+    train_loader, val_loader, scaler = prepare_all_data()
+    
+    # 2. Define and Train Model
+    model = TraderLSTM().to(DEVICE)
+    quick_model_path = CONFIG["model_path"] + ".quick"
+    history = train_model(model, train_loader, val_loader, CONFIG["quick_test_epochs"], quick_model_path)
+    
+    # Quick test is only for verifying the pipeline runs, no need to run a backtest here.
+    
+    logger.info("--- Quick Test Passed ---")
+    cleanup_quick_test_files()
+    return True
+
+def full_run():
+    """Runs the full training and backtesting process."""
+    logger.info("--- Starting Full Run ---")
+    CONFIG["quick_test"] = False
+
+    # 1. Prepare Data
+    train_loader, val_loader, scaler = prepare_all_data()
+
+    # 2. Define and Train Model
+    model = TraderLSTM().to(DEVICE)
+    history = train_model(model, train_loader, val_loader, CONFIG["full_test_epochs"], CONFIG["model_path"])
+    
+    # 3. Generate Model Report
+    generate_model_report(history, report_dir=os.path.join(CONFIG["report_dir"], "model_training_report"))
+    
+    # 4. Run Final Backtest
+    logger.info("Loading best model for final backtest...")
+    try:
+        model.load_state_dict(torch.load(CONFIG["model_path"]))
+    except FileNotFoundError:
+        logger.error(f"Could not find saved model at {CONFIG['model_path']}. Halting.")
+        return
+    except Exception as e:
+        logger.error(f"An error occurred while loading the model: {e}", exc_info=True)
+        return
+        
+    run_ml_backtest(model, scaler, report_dir=os.path.join(CONFIG["report_dir"], "final_backtest_report"))
+
+    logger.info("--- Full Run Complete ---")
+
+
+def run_overfit_test():
+    """Trains the model on a single batch to ensure it can overfit."""
+    logger.info("--- Starting Single-Batch Overfit Test ---")
+    train_loader, _, _ = prepare_all_data()
+    
+    # Get a single batch
+    sequences, labels = next(iter(train_loader))
+    sequences, labels = sequences.to(DEVICE), labels.to(DEVICE)
+    
+    model = TraderLSTM().to(DEVICE)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
+
+    logger.info("Training on a single batch for 50 epochs...")
+    for epoch in range(50):
+        optimizer.zero_grad()
+        outputs = model(sequences)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        if (epoch + 1) % 5 == 0:
+            logger.info(f"Overfit Epoch [{epoch+1}/50], Loss: {loss.item():.4f}")
+            
+    logger.info("--- Overfit Test Complete ---")
+    # A successful test will show the loss decreasing to near-zero.
+
+
+def main():
+    """Main orchestration function."""
+    logger.info(f"Using device: {DEVICE}")
+    
+    if CONFIG.get("run_overfit_test_only", False):
+        run_overfit_test()
+        return
+
+    # Create main report directory if it doesn't exist
+    if not os.path.exists(CONFIG["report_dir"]):
+        os.makedirs(CONFIG["report_dir"])
+
+    # Determine if we start with a quick test
+    run_quick_test_first = True # This is the default behavior as requested
+
+    if run_quick_test_first:
+        try:
+            if quick_test():
+                logger.info("\nQuick test successful. Starting full run...\n")
+                full_run()
+            else:
+                # This else block might not be reachable if quick_test raises an exception
+                logger.warning("Quick test returned False. Halting.")
+        except Exception as e:
+            logger.error(f"\n--- An error occurred during execution ---", exc_info=True)
+            # Perform cleanup even if it fails
+            cleanup_quick_test_files()
+            logger.info("Halting execution due to an error.")
+            sys.exit(1)
+    else:
+        # If quick test is disabled, go straight to full run
+        full_run()
+
+if __name__ == "__main__":
+    main()
