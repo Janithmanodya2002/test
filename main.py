@@ -21,7 +21,6 @@ import logging
 from binance.exceptions import BinanceAPIException
 import ML
 import joblib
-
 try:
     import mplfinance as mpf
 except ImportError:
@@ -44,7 +43,7 @@ def is_session_valid(client):
         return False
 
 class TradeResult:
-    def __init__(self, symbol, side, entry_price, exit_price, entry_timestamp, exit_timestamp, status, pnl_usd, pnl_pct, drawdown, reason_for_entry, reason_for_exit, fib_levels):
+    def __init__(self, symbol, side, entry_price, exit_price, entry_timestamp, exit_timestamp, status, pnl_usd, pnl_pct, drawdown, reason_for_entry, reason_for_exit, fib_levels, ml_prediction=None, ml_confidence=None):
         self.symbol = symbol
         self.side = side
         self.entry_price = entry_price
@@ -58,6 +57,8 @@ class TradeResult:
         self.reason_for_entry = reason_for_entry
         self.reason_for_exit = reason_for_exit
         self.fib_levels = fib_levels
+        self.ml_prediction = ml_prediction
+        self.ml_confidence = ml_confidence
 
 def generate_fib_chart(symbol, klines, trend, swing_high, swing_low, entry_price, sl, tp1, tp2):
     """
@@ -455,7 +456,7 @@ def generate_csv_report(backtest_trades):
     """
     Generate a CSV report from the backtest results.
     """
-    df = pd.DataFrame([vars(t) for t in backtest_trades])
+    df = pd.DataFrame([{k: v for k, v in vars(t).items() if k != 'balance'} for t in backtest_trades]) # Exclude balance for clarity
     df.to_csv('backtest/backtest_trades.csv', index=False)
     print("Backtest trades saved to backtest/backtest_trades.csv")
 
@@ -466,7 +467,7 @@ def generate_json_report(backtest_trades, metrics, strategy_analysis):
     report = {
         'metrics': metrics,
         'strategy_analysis': strategy_analysis,
-        'trades': [vars(t) for t in backtest_trades]
+        'trades': [{k: v for k, v in vars(t).items() if k != 'balance'} for t in backtest_trades]
     }
     with open('backtest/backtest_report.json', 'w') as f:
         json.dump(report, f, indent=4)
@@ -603,7 +604,12 @@ Trade Log:
 """
     for trade in backtest_trades:
         report += f"Timestamp: {datetime.datetime.fromtimestamp(trade.entry_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')}, Symbol: {trade.symbol}, Side: {trade.side}, Entry: {trade.entry_price:.8f}, Exit: {trade.exit_price:.8f}, Status: {trade.status}, PnL: ${trade.pnl_usd:,.2f} ({trade.pnl_pct:.2f}%), Drawdown: {trade.drawdown:.2f}%\n"
+        if trade.ml_prediction is not None:
+            prediction_map = {0: "Loss", 1: "TP1 Win", 2: "TP2 Win"}
+            ml_info = f"    ML Prediction: {prediction_map.get(trade.ml_prediction, 'Unknown')} (Conf: {trade.ml_confidence:.1%})\n"
+            report += ml_info
 
+    # Save the report to a text file
     with open("backtest/backtest_report.txt", "w") as f:
         f.write(report)
 
@@ -625,7 +631,7 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
     # Load the ML model
     try:
         model_data = joblib.load('models/trading_model.joblib')
-        ml_model = model_data['model']
+        loaded_ml_model = model_data['model']
         ml_feature_columns = model_data['feature_columns']
         print("ML model loaded for backtesting.")
     except FileNotFoundError:
@@ -672,13 +678,15 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                 tp1 = entry_price - (sl - entry_price)
                 tp2 = entry_price - (sl - entry_price) * 2
 
-                if ml_model:
+                ml_prediction = None
+                ml_confidence = None
+                if loaded_ml_model:
                     setup_info = {
                         'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                         'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'short'
                     }
-                    prediction, _ = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, ml_model, ml_feature_columns)
-                    if prediction == 0:
+                    ml_prediction, ml_confidence = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, loaded_ml_model, ml_feature_columns)
+                    if ml_prediction == 0 or (ml_confidence is not None and ml_confidence < config.get('model_confidence_threshold', 0.0)): # Apply threshold if configured for backtest
                         continue
 
                 # Simulate trade entry
@@ -733,7 +741,9 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                         reason_for_entry=f"Fib retracement in downtrend",
                         reason_for_exit=reason_for_exit,
                         fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0] # Simplified for now
-                    )
+ ,
+ ml_prediction=ml_prediction,
+ ml_confidence=ml_confidence)
                     trade.balance = balance
                     backtest_trades.append(trade)
                     i += (j - i) # Move to the next candle after the trade is closed
@@ -746,13 +756,17 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                 tp1 = entry_price + (entry_price - last_swing_low)
                 tp2 = entry_price + (entry_price - last_swing_low) * 2
 
-                if ml_model:
+                ml_prediction = None
+                ml_confidence = None
+                if loaded_ml_model:
                     setup_info = {
                         'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                         'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'long'
                     }
-                    prediction, _ = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, ml_model, ml_feature_columns)
-                    if prediction == 0:
+                    ml_prediction, ml_confidence = get_model_prediction(
+                        [dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines],
+                        setup_info, loaded_ml_model, ml_feature_columns)
+                    if ml_prediction == 0 or (ml_confidence is not None and ml_confidence < config.get('model_confidence_threshold', 0.0)): # Apply threshold if configured for backtest
                         continue
 
                 # Simulate trade entry
@@ -807,7 +821,9 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                         reason_for_entry=f"Fib retracement in uptrend",
                         reason_for_exit=reason_for_exit,
                         fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0] # Simplified for now
-                    )
+ ,
+ ml_prediction=ml_prediction,
+ ml_confidence=ml_confidence)
                     trade.balance = balance
                     backtest_trades.append(trade)
                     i += (j - i) # Move to the next candle after the trade is closed
@@ -1177,6 +1193,8 @@ ml_model = None
 ml_feature_columns = None
 model_confidence_threshold = 0.7 # Default value
 
+rejected_symbols = {} # To store symbols recently rejected by ML
+
 def get_model_prediction(klines, setup_info, model, feature_columns):
     """
     Generates features for a live setup and gets a prediction from the ML model.
@@ -1195,6 +1213,7 @@ def get_model_prediction(klines, setup_info, model, feature_columns):
     confidence = probabilities[prediction]
     
     return prediction, confidence
+
 
 
 def start_order_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode):
@@ -1246,7 +1265,7 @@ async def main():
     # Load the ML model
     try:
         model_data = joblib.load('models/trading_model.joblib')
-        ml_model = model_data['model']
+        ml_model = model_data['model'] # Assign to global variable
         ml_feature_columns = model_data['feature_columns']
         print(f"ML model loaded. Signal confidence threshold is {model_confidence_threshold * 100}%.")
     except FileNotFoundError:
@@ -1412,7 +1431,7 @@ async def main():
 
             for symbol in symbols:
                 try:
-                    if symbol in rejected_symbols and time.time() - rejected_symbols[symbol] < 4 * 60 * 60:
+                    if symbol in rejected_symbols and time.time() - rejected_symbols[symbol] < 4 * 60 * 60: # Avoid re-scanning recently rejected symbols
                         continue
                     if symbol in virtual_orders:
                         continue
@@ -1450,22 +1469,23 @@ async def main():
                                 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'short'
                             }
                             prediction, confidence = get_model_prediction(klines, setup_info, ml_model, ml_feature_columns)
-                            
+
                             print(f"ML Model Prediction for {symbol} Short: Class {prediction} with {confidence:.2f}% confidence.")
 
-                            if prediction == 0 or confidence < model_confidence_threshold:
-                                print(f"  - ML Model REJECTED signal. Reason: Prediction={prediction}, Confidence={confidence:.2f}")
+                            if prediction != 1 or confidence < model_confidence_threshold: # Prediction 1 assumed to be "Win"
+                                rejection_reason = f"Prediction Class: {prediction}" if prediction != 1 else f"Confidence: {confidence:.2f} < {model_confidence_threshold:.2f}"
+                                await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Short\nReason: {rejection_reason}")
                                 rejected_symbols[symbol] = time.time() # Add to rejected list to avoid spam
                                 continue # Skip to next symbol
                             
                             print("  - ML Model ACCEPTED signal.")
-                        # --------------------------
-
+                        # -------------------------- # ML Model Integration End
+                        
                         symbol_info = symbols_info[symbol]
                         quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
                         if quantity is None or quantity == 0:
                             continue
-
+                        
                         prediction_map = {0: "Loss", 1: "TP1 Win", 2: "TP2 Win"}
                         ml_info = f"🧠 ML Prediction: {prediction_map.get(prediction, 'Unknown')} (Conf: {confidence:.1%})"
                         
@@ -1476,7 +1496,11 @@ async def main():
                                    f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
                         await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
-                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None}
+                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
+                                     'ml_prediction': prediction,
+                                     'ml_confidence': confidence
+                                     }
+
                         with trades_lock:
                             trades.append(new_trade)
                         virtual_orders[symbol] = new_trade
@@ -1502,17 +1526,18 @@ async def main():
                                 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'long'
                             }
                             prediction, confidence = get_model_prediction(klines, setup_info, ml_model, ml_feature_columns)
-                            
+
                             print(f"ML Model Prediction for {symbol} Long: Class {prediction} with {confidence:.2f}% confidence.")
 
-                            if prediction == 0 or confidence < model_confidence_threshold:
-                                print(f"  - ML Model REJECTED signal. Reason: Prediction={prediction}, Confidence={confidence:.2f}")
+                            if prediction != 1 or confidence < model_confidence_threshold: # Prediction 1 assumed to be "Win"
+                                rejection_reason = f"Prediction Class: {prediction}" if prediction != 1 else f"Confidence: {confidence:.2f} < {model_confidence_threshold:.2f}"
+                                await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Long\nReason: {rejection_reason}")
                                 rejected_symbols[symbol] = time.time()
                                 continue
                             
                             print("  - ML Model ACCEPTED signal.")
-                        # --------------------------
-
+                        # -------------------------- # ML Model Integration End
+                        
                         symbol_info = symbols_info[symbol]
                         quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
                         if quantity is None or quantity == 0:
@@ -1528,7 +1553,10 @@ async def main():
                                    f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
                         await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
-                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None}
+                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
+                                     'ml_prediction': prediction,
+                                     'ml_confidence': confidence
+                                     }
                         with trades_lock:
                             trades.append(new_trade)
                         virtual_orders[symbol] = new_trade
