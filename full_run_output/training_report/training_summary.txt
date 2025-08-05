@@ -1,0 +1,19 @@
+--- Model Training Report ---
+
+Final Validation Accuracy: 0.7837
+Final Validation Loss: 0.4297
+
+Classification Report (on Test Set):
+              precision    recall  f1-score   support
+
+        Loss       0.92      0.79      0.85      6176
+         Win       0.53      0.77      0.63      1907
+
+    accuracy                           0.78      8083
+   macro avg       0.72      0.78      0.74      8083
+weighted avg       0.83      0.78      0.79      8083
+
+
+Confusion Matrix (on Test Set):
+[[4854 1322]
+ [ 437 1470]]
