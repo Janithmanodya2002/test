@@ -1,10 +1,12 @@
 import os
-# Set TensorFlow logging level to suppress informational messages
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
+# Set TensorFlow logging level to suppress all but error messages
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 import pandas as pd
 import numpy as np
 import tensorflow as tf
+from absl import logging
+logging.set_verbosity(logging.ERROR)
 from tqdm import tqdm
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Input
@@ -212,85 +214,27 @@ def generate_full_backtest_report(backtest_trades, output_dir, starting_balance=
 
 # --- ML Specific Functions ---
 
-def load_data(symbol_limit=None):
-    """Load all parquet files from the data/raw directory."""
-    # The user specified the path with a backslash, which might not be portable.
-    # Using os.path.join and glob to handle this robustly.
-    path_pattern = os.path.join('data', 'raw', '*', '*.parquet')
+def load_processed_data(symbol_limit=None):
+    """Load all preprocessed feature files from the data/processed directory."""
+    path_pattern = os.path.join('data', 'processed', '*', '*.npz')
     files = glob.glob(path_pattern)
     if not files:
-        raise FileNotFoundError(f"No parquet files found at {path_pattern}. Make sure the data is in the correct directory.")
+        raise FileNotFoundError(f"No processed feature files found at {path_pattern}. Run preprocess_data.py first.")
 
     if symbol_limit:
         files = files[:symbol_limit]
 
-    print(f"Found {len(files)} symbol data files.")
-    return files
+    all_features = []
+    all_labels = []
+    for file in tqdm(files, desc="Loading Processed Features"):
+        data = np.load(file)
+        all_features.append(data['features'])
+        all_labels.append(data['labels'])
+    
+    if not all_features:
+        return np.array([]), np.array([])
 
-def generate_features_for_file(args):
-    """
-    Worker function for multiprocessing. Processes a single file and returns features/labels.
-    """
-    # Set env var BEFORE importing tensorflow in the new process
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-    import tensorflow as tf
-
-    filepath, is_quick_test = args
-    features, labels = [], []
-    try:
-        df = pd.read_parquet(filepath)
-        df.columns = df.columns.str.lower()
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df.set_index('timestamp', inplace=True)
-        
-        if is_quick_test:
-            df = df.head(QUICK_TEST_DATA_SIZE)
-
-        for i in range(LOOKBACK_CANDLES, len(df) - 1):
-            strategy_klines = df.iloc[i - LOOKBACK_CANDLES : i]
-            swing_highs, swing_lows = get_swing_points(strategy_klines, window=SWING_WINDOW)
-            trend = get_trend(swing_highs, swing_lows)
-            signal = None
-
-            if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
-                entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
-                if df['close'].iloc[i-1] > entry_price:
-                    sl, tp = last_swing_high, entry_price - (last_swing_high - entry_price)
-                    signal = {'side': 'short', 'entry': entry_price, 'sl': sl, 'tp': tp}
-            elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
-                entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
-                if df['close'].iloc[i-1] < entry_price:
-                    sl, tp = last_swing_low, entry_price + (entry_price - last_swing_low)
-                    signal = {'side': 'long', 'entry': entry_price, 'sl': sl, 'tp': tp}
-
-            if signal:
-                label = None
-                for j in range(i, len(df)):
-                    future_high, future_low = df['high'].iloc[j], df['low'].iloc[j]
-                    if signal['side'] == 'long':
-                        if future_high >= signal['tp']: label = 1; break
-                        if future_low <= signal['sl']: label = 0; break
-                    else:
-                        if future_low <= signal['tp']: label = 1; break
-                        if future_high >= signal['sl']: label = 0; break
-                
-                if label is not None:
-                    feature_klines = df.iloc[i - SEQUENCE_LENGTH : i]
-                    first_candle = feature_klines.iloc[0]
-                    if first_candle['close'] > 0 and first_candle['volume'] > 0:
-                        normalized_features = feature_klines[['open', 'high', 'low', 'close', 'volume']].copy()
-                        for col in ['open', 'high', 'low', 'close']:
-                            normalized_features[col] = (normalized_features[col] / first_candle['close']) - 1
-                        normalized_features['volume'] = (normalized_features['volume'] / first_candle['volume']) - 1
-                        features.append(normalized_features.to_numpy())
-                        labels.append(np.array([label], dtype=np.float32))
-    except Exception as e:
-        symbol = filepath.split(os.sep)[-2]
-        print(f"Error processing {symbol} in worker: {e}")
-
-    return features, labels
+    return np.concatenate(all_features), np.concatenate(all_labels)
 
 def generate_training_report(history, y_true, y_pred_probs, output_dir):
     """Generates and saves a report of the model's training and performance."""
@@ -325,7 +269,16 @@ def generate_training_report(history, y_true, y_pred_probs, output_dir):
     y_pred = (y_pred_probs > 0.5).astype(int)
     
     # Add zero_division=0 to prevent warnings when a class has no predictions
-    report = classification_report(y_true, y_pred, target_names=['Loss', 'Win'], zero_division=0)
+    unique_labels = np.unique(y_true)
+    if len(unique_labels) == 1:
+        # If only one class is present in the true labels, specify it for the report
+        target_names = [f'Class {int(unique_labels[0])}']
+        labels = unique_labels
+        report = classification_report(y_true, y_pred, target_names=target_names, labels=labels, zero_division=0)
+    else:
+        # Default case when both classes are present
+        report = classification_report(y_true, y_pred, target_names=['Loss', 'Win'], zero_division=0)
+
     conf_matrix = confusion_matrix(y_true, y_pred)
     
     test_loss, test_acc = -1, -1
@@ -360,7 +313,7 @@ def create_and_train_model(train_dataset, val_dataset, test_dataset, output_dir,
         LSTM(64, return_sequences=True),
         LSTM(64),
         Dense(32, activation='relu'),
-        Dense(1, activation='sigmoid')
+        Dense(1, activation='sigmoid', dtype='float32')
     ])
 
     model.compile(
@@ -392,12 +345,88 @@ def create_and_train_model(train_dataset, val_dataset, test_dataset, output_dir,
 
     return model_path
 
+def generate_signals_for_symbol(df):
+    """Generates all potential trade signals for a given symbol's DataFrame."""
+    potential_trades = []
+    np_close = df['close'].to_numpy()
+
+    for i in range(LOOKBACK_CANDLES, len(df) - 1):
+        strategy_klines = df.iloc[i - LOOKBACK_CANDLES : i]
+        swing_highs, swing_lows = get_swing_points(strategy_klines, window=SWING_WINDOW)
+        trend = get_trend(swing_highs, swing_lows)
+        
+        signal = None
+        if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+            last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
+            entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
+            if np_close[i-1] > entry_price:
+                sl, tp = last_swing_high, entry_price - (last_swing_high - entry_price)
+                signal = {'side': 'short', 'entry': entry_price, 'sl': sl, 'tp': tp}
+        elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+            last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
+            entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
+            if np_close[i-1] < entry_price:
+                sl, tp = last_swing_low, entry_price + (entry_price - last_swing_low)
+                signal = {'side': 'long', 'entry': entry_price, 'sl': sl, 'tp': tp}
+        
+        if signal:
+            potential_trades.append((signal, i))
+            
+    return potential_trades
+
+def get_features_for_signals(df, potential_trades):
+    """Extracts features for a list of potential trades."""
+    features_to_predict = []
+    for signal, i in potential_trades:
+        feature_klines = df.iloc[i - SEQUENCE_LENGTH : i]
+        first_candle = feature_klines.iloc[0]
+        if first_candle['close'] > 0 and first_candle['volume'] > 0:
+            normalized_features = feature_klines[['open', 'high', 'low', 'close', 'volume']].copy()
+            for col in ['open', 'high', 'low', 'close']:
+                normalized_features[col] = (normalized_features[col] / first_candle['close']) - 1
+            normalized_features['volume'] = (normalized_features['volume'] / first_candle['volume']) - 1
+            features_to_predict.append(normalized_features.to_numpy())
+    return np.array(features_to_predict)
+
+def simulate_trades(df, symbol, potential_trades, predictions):
+    """Simulates trades based on predictions and returns a list of TradeResult objects."""
+    local_trades = []
+    np_high = df['high'].to_numpy()
+    np_low = df['low'].to_numpy()
+
+    for (signal, trade_idx), prediction in zip(potential_trades, predictions):
+        if prediction[0] > 0.5:
+            exit_price, status, reason = (None, None, None)
+            for j in range(trade_idx, len(df)):
+                future_high, future_low = np_high[j], np_low[j]
+                if signal['side'] == 'long':
+                    if future_high >= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
+                    if future_low <= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
+                else:
+                    if future_low <= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
+                    if future_high >= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
+            
+            if status:
+                trade = TradeResult(
+                    symbol=symbol, side=signal['side'], entry_price=signal['entry'], exit_price=exit_price,
+                    entry_timestamp=df.index[trade_idx], exit_timestamp=df.index[j], status=status,
+                    pnl_usd=0, pnl_pct=0,
+                    reason_for_entry=f"ML Signal (Pred: {prediction[0]:.2f})",
+                    reason_for_exit=reason
+                )
+                local_trades.append(trade)
+    return local_trades
+
 def backtest_symbol(args):
     """
     Backtesting logic for a single symbol. Designed to be called by a multiprocessing pool.
     """
+    # Disable GPU in worker process
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     # Set env var BEFORE importing tensorflow in the new process
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    from absl import logging
+    logging.set_verbosity(logging.ERROR)
     import tensorflow as tf
 
     filepath, model_path = args
@@ -414,6 +443,11 @@ def backtest_symbol(args):
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
         
+        # Convert to numpy for faster access
+        np_close = df['close'].to_numpy()
+        np_high = df['high'].to_numpy()
+        np_low = df['low'].to_numpy()
+        
         i = LOOKBACK_CANDLES
         while i < len(df) - 1:
             strategy_klines = df.iloc[i - LOOKBACK_CANDLES : i]
@@ -424,13 +458,13 @@ def backtest_symbol(args):
             if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
                 last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
                 entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
-                if df['close'].iloc[i-1] > entry_price:
+                if np_close[i-1] > entry_price:
                     sl, tp = last_swing_high, entry_price - (last_swing_high - entry_price)
                     signal = {'side': 'short', 'entry': entry_price, 'sl': sl, 'tp': tp}
             elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
                 last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
                 entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
-                if df['close'].iloc[i-1] < entry_price:
+                if np_close[i-1] < entry_price:
                     sl, tp = last_swing_low, entry_price + (entry_price - last_swing_low)
                     signal = {'side': 'long', 'entry': entry_price, 'sl': sl, 'tp': tp}
 
@@ -444,31 +478,43 @@ def backtest_symbol(args):
                     normalized_features['volume'] = (normalized_features['volume'] / first_candle['volume']) - 1
                     feature_array = np.array([normalized_features.to_numpy()])
                     
-                    prediction = model.predict(feature_array, verbose=0)[0][0]
+                # Collect all features for batch prediction
+                features_to_predict = []
+                potential_trades = []
+
+                if first_candle['close'] > 0 and first_candle['volume'] > 0:
+                    normalized_features = feature_klines[['open', 'high', 'low', 'close', 'volume']].copy()
+                    for col in ['open', 'high', 'low', 'close']:
+                        normalized_features[col] = (normalized_features[col] / first_candle['close']) - 1
+                    normalized_features['volume'] = (normalized_features['volume'] / first_candle['volume']) - 1
+                    features_to_predict.append(normalized_features.to_numpy())
+                    potential_trades.append((signal, i))
+            i += 1
+        
+        # Batch prediction
+        if features_to_predict:
+            predictions = model.predict(np.array(features_to_predict), verbose=0)
+            for (signal, trade_idx), prediction in zip(potential_trades, predictions):
+                if prediction[0] > 0.5:
+                    exit_price, status, reason = (None, None, None)
+                    for j in range(trade_idx, len(df)):
+                        future_high, future_low = np_high[j], np_low[j]
+                        if signal['side'] == 'long':
+                            if future_high >= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
+                            if future_low <= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
+                        else:
+                            if future_low <= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
+                            if future_high >= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
                     
-                    if prediction > 0.5:
-                        exit_price, status, reason = (None, None, None)
-                        for j in range(i, len(df)):
-                            future_high, future_low = df['high'].iloc[j], df['low'].iloc[j]
-                            if signal['side'] == 'long':
-                                if future_high >= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
-                                if future_low <= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
-                            else:
-                                if future_low <= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
-                                if future_high >= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
-                        
-                        if status:
-                            # PnL is calculated later, just store the raw data for now
-                            trade = TradeResult(
-                                symbol=symbol, side=signal['side'], entry_price=signal['entry'], exit_price=exit_price,
-                                entry_timestamp=df.index[i], exit_timestamp=df.index[j], status=status,
-                                pnl_usd=0, pnl_pct=0, # Will be calculated later
-                                reason_for_entry=f"ML Signal (Pred: {prediction:.2f})",
-                                reason_for_exit=reason
-                            )
-                            local_trades.append(trade)
-                            i = j
-                            continue
+                    if status:
+                        trade = TradeResult(
+                            symbol=symbol, side=signal['side'], entry_price=signal['entry'], exit_price=exit_price,
+                            entry_timestamp=df.index[trade_idx], exit_timestamp=df.index[j], status=status,
+                            pnl_usd=0, pnl_pct=0,
+                            reason_for_entry=f"ML Signal (Pred: {prediction[0]:.2f})",
+                            reason_for_exit=reason
+                        )
+                        local_trades.append(trade)
             i += 1
     except Exception as e:
         print(f"Error backtesting {symbol}: {e}")
@@ -479,13 +525,7 @@ def run_ml_backtest(model_path, data_files, output_dir, starting_balance=10000, 
     """Run a backtest using the trained ML model to filter trades in parallel."""
     print("Starting parallel ML-powered backtest simulation...")
     
-    # Set start method to 'spawn' to avoid CUDA initialization issues with multiprocessing
-    try:
-        mp.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass # Start method can only be set once
-
-    num_cores = mp.cpu_count()
+    num_cores = min(mp.cpu_count(), 4)
     pool_args = [(file, model_path) for file in data_files]
     
     all_trades_lists = []
@@ -551,29 +591,9 @@ def run_pipeline(is_quick_test: bool):
     print(f"--- Starting {run_mode} ---")
 
     try:
-        # Step 1: Load Data
-        print(f"\n[Step 1/5] Loading data files for {run_mode}...")
-        data_files = load_data(symbol_limit)
-
-        # Step 2: Generate Features in Parallel
-        print(f"\n[Step 2/5] Generating features in parallel for {run_mode}...")
-        num_cores = mp.cpu_count()
-        pool_args = [(file, is_quick_test) for file in data_files]
-
-        all_features = []
-        all_labels = []
-        with mp.Pool(processes=num_cores) as pool:
-            # Use tqdm to show progress for the parallel feature generation
-            for features, labels in tqdm(pool.imap_unordered(generate_features_for_file, pool_args), total=len(pool_args), desc="Generating Features"):
-                all_features.extend(features)
-                all_labels.extend(labels)
-        
-        if not all_features:
-            print("\nError: No trade signals generated from the data. Cannot proceed.")
-            return False
-
-        X = np.array(all_features)
-        y = np.array(all_labels)
+        # Step 1 & 2: Load Preprocessed Data
+        print(f"\n[Step 1-2/5] Loading preprocessed data for {run_mode}...")
+        X, y = load_processed_data(symbol_limit)
         
         dataset_size = len(X)
         print(f"Found {dataset_size} samples.")
@@ -608,8 +628,13 @@ def run_pipeline(is_quick_test: bool):
 
         # Step 4: Run ML-powered backtest
         print(f"\n[Step 4/5] Running ML-powered backtest for {run_mode}...")
-        # Note: The backtest still uses the original data files, not the dataset, which is correct.
-        run_ml_backtest(trained_model_path, data_files, backtest_report_dir, starting_balance=10000)
+        # Load raw data file paths for the backtest simulation
+        raw_files_path = os.path.join('data', 'raw', '*', '*.parquet')
+        raw_data_files = glob.glob(raw_files_path)
+        if symbol_limit:
+            raw_data_files = raw_data_files[:symbol_limit]
+        
+        run_ml_backtest(trained_model_path, raw_data_files, backtest_report_dir, starting_balance=10000)
 
         # Step 5: Finalization
         print(f"\n[Step 5/5] {run_mode} finished.")
@@ -628,6 +653,13 @@ def run_pipeline(is_quick_test: bool):
 
 def main():
     """Main function to orchestrate the quick test and full run."""
+    # Check if preprocessing is needed
+    processed_path = os.path.join('data', 'processed')
+    if not os.path.exists(processed_path) or not os.listdir(processed_path):
+        print("--- Processed data not found. Running preprocessing script. ---")
+        import subprocess
+        subprocess.run(['python3', 'preprocess_data.py'], check=True)
+
     # We need to declare the global here before any access.
     global QUICK_TEST
     
@@ -661,10 +693,23 @@ def main():
 
 
 if __name__ == "__main__":
+    # Set the multiprocessing start method to 'spawn'
+    # This is crucial for CUDA compatibility to prevent initialization errors in child processes.
+    # It must be called once at the entry point of the script, before any other CUDA or multiprocessing code.
+    try:
+        mp.set_start_method('spawn', force=True)
+        print("Set multiprocessing start method to 'spawn'.")
+    except RuntimeError:
+        pass # It may have been set already.
+
     # Check for GPU
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
         try:
+            # Enable mixed precision for performance
+            from tensorflow.keras import mixed_precision
+            mixed_precision.set_global_policy('mixed_float16')
+
             # Currently, memory growth needs to be the same across GPUs
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
