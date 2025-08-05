@@ -24,7 +24,7 @@ import datetime
 
 # --- Configuration ---
 # Set to True to run a quick test on a small subset of data
-QUICK_TEST = True
+QUICK_TEST = False
 QUICK_TEST_DATA_SIZE = 1000
 QUICK_TEST_EPOCHS = 5
 QUICK_TEST_SYMBOL_COUNT = 1
@@ -301,7 +301,7 @@ def generate_training_report(history, y_true, y_pred_probs, output_dir):
     print(f"Training report saved to {output_dir}")
 
 
-def create_and_train_model(train_dataset, val_dataset, test_dataset, output_dir, training_report_dir, epochs):
+def create_and_train_model(train_dataset, val_dataset, test_dataset, output_dir, training_report_dir, epochs, class_weight=None):
     """Build, compile, and train the LSTM model using tf.data.Dataset."""
     print("Building LSTM model...")
     
@@ -329,7 +329,8 @@ def create_and_train_model(train_dataset, val_dataset, test_dataset, output_dir,
         train_dataset,
         validation_data=val_dataset,
         epochs=epochs,
-        verbose=1
+        verbose=1,
+        class_weight=class_weight
     )
 
     print("Model training complete.")
@@ -395,7 +396,7 @@ def simulate_trades(df, symbol, potential_trades, predictions):
     np_low = df['low'].to_numpy()
 
     for (signal, trade_idx), prediction in zip(potential_trades, predictions):
-        if prediction[0] > 0.5:
+        if prediction[0] > 0.45:
             exit_price, status, reason = (None, None, None)
             for j in range(trade_idx, len(df)):
                 future_high, future_low = np_high[j], np_low[j]
@@ -495,7 +496,7 @@ def backtest_symbol(args):
         if features_to_predict:
             predictions = model.predict(np.array(features_to_predict), verbose=0)
             for (signal, trade_idx), prediction in zip(potential_trades, predictions):
-                if prediction[0] > 0.5:
+                if prediction[0] > 0.45:
                     exit_price, status, reason = (None, None, None)
                     for j in range(trade_idx, len(df)):
                         future_high, future_low = np_high[j], np_low[j]
@@ -602,6 +603,18 @@ def run_pipeline(is_quick_test: bool):
             print("Error: Not enough data generated to proceed with training.")
             return False
 
+        # Calculate class weights to handle imbalance
+        neg = np.sum(y == 0)
+        pos = np.sum(y == 1)
+        total = neg + pos
+        
+        class_weight = None
+        if neg > 0 and pos > 0:
+            weight_for_0 = (1 / neg) * (total / 2.0)
+            weight_for_1 = (1 / pos) * (total / 2.0)
+            class_weight = {0: weight_for_0, 1: weight_for_1}
+            print(f"Calculated class weights for imbalanced data: {class_weight}")
+
         # Create a tf.data.Dataset from the in-memory numpy arrays
         dataset = tf.data.Dataset.from_tensor_slices((X, y))
         dataset = dataset.shuffle(buffer_size=dataset_size).cache()
@@ -623,7 +636,7 @@ def run_pipeline(is_quick_test: bool):
         # Step 3: Build and Train the Model
         print(f"\n[Step 3/5] Training model for {run_mode}... (Epochs: {epochs})")
         # The training function now takes datasets instead of numpy arrays
-        trained_model_path = create_and_train_model(train_dataset, val_dataset, test_dataset, model_output_dir, training_report_dir, epochs)
+        trained_model_path = create_and_train_model(train_dataset, val_dataset, test_dataset, model_output_dir, training_report_dir, epochs, class_weight)
         print(f"Model for {run_mode} saved to {trained_model_path}")
 
         # Step 4: Run ML-powered backtest
