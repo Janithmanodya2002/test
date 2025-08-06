@@ -21,6 +21,10 @@ import time
 import json
 from tabulate import tabulate
 import datetime
+import keys
+from binance.client import Client
+from pandas_ta import rsi, macd, bbands
+from scipy.signal import find_peaks
 
 # --- Configuration ---
 # Set to True to run a quick test on a small subset of data
@@ -29,10 +33,16 @@ QUICK_TEST_DATA_SIZE = 1000
 QUICK_TEST_EPOCHS = 5
 QUICK_TEST_SYMBOL_COUNT = 1
 
+# --- New Enhanced Configuration ---
+# Timeframes and lookbacks for signal detection
+TIMEFTRAMES = ['15m', '1h', '4h']
+LOOKBACK_VALUES = [5, 10, 15] # Different lookback windows for swing detection
+DOWNLOAD_LOOKBACK_DAYS = 90 # How many days of data to download for each symbol
+
 # Configuration for the strategy and feature generation (from main.py)
 # These should ideally match the configuration used in the original strategy
 LOOKBACK_CANDLES = 100
-SWING_WINDOW = 5
+SWING_WINDOW = 5 # This will be replaced by LOOKBACK_VALUES but kept for compatibility for now
 
 # Model and Training Parameters
 SEQUENCE_LENGTH = 60  # Number of timesteps in each sample
@@ -59,51 +69,86 @@ class TradeResult:
         self.reason_for_exit = reason_for_exit
         self.balance = 0.0 # Will be updated during backtest
 
-def get_swing_points(klines_df, window=5):
-    """Identify swing points from kline data."""
-    highs = klines_df['high'].to_numpy()
-    lows = klines_df['low'].to_numpy()
-    timestamps = klines_df.index.to_numpy()
+def detect_swing_points_and_trend(df, lookback_window):
+    """
+    Identifies swing points and market trend using technical indicators and peak detection.
+    
+    Returns:
+        - df (pd.DataFrame): DataFrame augmented with indicators.
+        - swing_points (list): List of classified swing points (HH, HL, LH, LL).
+        - trend (str): The overall market trend ('Uptrend', 'Downtrend', 'Ranging').
+    """
+    # 1. Calculate Technical Indicators
+    df['RSI_14'] = rsi(df['close'])
+    macd_df = macd(df['close'])
+    df = df.join(macd_df)
+    bbands_df = bbands(df['close'])
+    df = df.join(bbands_df)
+    df.dropna(inplace=True)
 
-    swing_highs = []
-    swing_lows = []
+    # 2. Find Peaks and Troughs using scipy.signal.find_peaks
+    # The 'prominence' parameter is crucial for filtering out minor peaks/troughs.
+    # A simple heuristic for prominence could be a fraction of the price range.
+    price_range = df['high'].max() - df['low'].min()
+    prominence_filter = price_range * 0.05 # Require a 5% price change for a peak to be significant
 
-    for i in range(window, len(highs) - window):
-        is_swing_high = highs[i] == np.max(highs[i-window:i+window+1])
-        if is_swing_high:
-            swing_highs.append((timestamps[i], highs[i]))
+    high_peaks, _ = find_peaks(df['high'], prominence=prominence_filter, width=lookback_window)
+    low_troughs, _ = find_peaks(-df['low'], prominence=prominence_filter, width=lookback_window)
 
-        is_swing_low = lows[i] == np.min(lows[i-window:i+window+1])
-        if is_swing_low:
-            swing_lows.append((timestamps[i], lows[i]))
+    # 3. Refine and Classify Swing Points
+    swing_points = []
+    
+    # Combine and sort all detected points by index
+    all_points = sorted(
+        [(i, 'high', df['high'].iloc[i]) for i in high_peaks] + 
+        [(i, 'low', df['low'].iloc[i]) for i in low_troughs],
+        key=lambda x: x[0]
+    )
 
-    return swing_highs, swing_lows
+    # Filter out consecutive highs or lows
+    if not all_points:
+        return df, [], "undetermined"
+        
+    filtered_points = [all_points[0]]
+    for i in range(1, len(all_points)):
+        if all_points[i][1] != filtered_points[-1][1]:
+            filtered_points.append(all_points[i])
 
-def get_trend(swing_highs, swing_lows):
-    """Determine the trend based on swing points."""
-    if len(swing_highs) < 2 or len(swing_lows) < 2:
-        return "undetermined"
+    last_high = None
+    last_low = None
+    
+    for i, type, price in filtered_points:
+        point_info = {'index': i, 'type': '', 'price': price}
+        
+        if type == 'high':
+            if last_high and price > last_high['price']:
+                point_info['type'] = 'HH' # Higher High
+            else:
+                point_info['type'] = 'LH' # Lower High or initial high
+            last_high = point_info
+        else: # low
+            if last_low and price > last_low['price']:
+                point_info['type'] = 'HL' # Higher Low
+            else:
+                point_info['type'] = 'LL' # Lower Low or initial low
+            last_low = point_info
+            
+        swing_points.append(point_info)
 
-    last_high = swing_highs[-1][1]
-    prev_high = swing_highs[-2][1]
-    last_low = swing_lows[-1][1]
-    prev_low = swing_lows[-2][1]
+    # 4. Determine Market Trend
+    trend = "Ranging"
+    hh_count = sum(1 for p in swing_points[-4:] if p['type'] == 'HH')
+    hl_count = sum(1 for p in swing_points[-4:] if p['type'] == 'HL')
+    ll_count = sum(1 for p in swing_points[-4:] if p['type'] == 'LL')
+    lh_count = sum(1 for p in swing_points[-4:] if p['type'] == 'LH')
 
-    if last_high > prev_high and last_low > prev_low:
-        return "uptrend"
-    elif last_high < prev_high and last_low < prev_low:
-        return "downtrend"
-    else:
-        return "undetermined"
-
-def get_fib_retracement(p1, p2, trend):
-    """Calculate Fibonacci retracement levels."""
-    price_range = abs(p1 - p2)
-    if trend == "downtrend":
-        entry_price = p1 - (price_range * 0.618) # Target the 61.8% level
-    else: # Uptrend
-        entry_price = p1 + (price_range * 0.618) # Target the 61.8% level
-    return entry_price
+    # Basic trend detection based on the last few swing points
+    if hh_count >= 1 and hl_count >= 1:
+        trend = "Uptrend"
+    elif ll_count >= 1 and lh_count >= 1:
+        trend = "Downtrend"
+        
+    return df, swing_points, trend
 
 def calculate_performance_metrics(backtest_trades, starting_balance):
     """Calculate performance metrics from a list of trades."""
@@ -214,27 +259,132 @@ def generate_full_backtest_report(backtest_trades, output_dir, starting_balance=
 
 # --- ML Specific Functions ---
 
-def load_processed_data(symbol_limit=None):
-    """Load all preprocessed feature files from the data/processed directory."""
-    path_pattern = os.path.join('data', 'processed', '*', '*.npz')
-    files = glob.glob(path_pattern)
-    if not files:
-        raise FileNotFoundError(f"No processed feature files found at {path_pattern}. Run preprocess_data.py first.")
+def get_symbols(filename="symbols.csv"):
+    """Reads symbols from a CSV file."""
+    try:
+        df = pd.read_csv(filename, header=None)
+        return df[0].tolist()
+    except FileNotFoundError:
+        print(f"Error: {filename} not found. Please create it with a list of symbols.")
+        return []
 
-    if symbol_limit:
-        files = files[:symbol_limit]
+def download_kline_data(symbol, timeframe, lookback_days):
+    """Downloads historical k-line data from Binance."""
+    client = Client(keys.BINANCE_API_KEY, keys.BINANCE_API_SECRET)
+    start_str = f"{lookback_days} days ago UTC"
+    
+    print(f"Downloading {timeframe} klines for {symbol} for the last {lookback_days} days...")
+    
+    try:
+        klines = client.get_historical_klines(symbol, timeframe, start_str)
+        df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+        
+        # Convert columns to appropriate types
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col])
+            
+        return df
+    except Exception as e:
+        print(f"Error downloading data for {symbol} on {timeframe}: {e}")
+        return pd.DataFrame()
 
+
+def build_training_data(symbol_limit=None):
+    """
+    Builds a complete training dataset by downloading data, detecting signals,
+    and generating features and labels.
+
+    This is the core of the new data pipeline. It iterates through symbols, 
+    timeframes, and lookback values to generate a diverse and robust dataset.
+    The process is as follows:
+    1. Download data for a symbol/timeframe.
+    2. Analyze data with various lookback windows to find trends and swing points.
+    3. Identify potential trade setups based on a defined strategy (e.g., entry on a
+       pullback in a confirmed trend).
+    4. Label the setup as a "win" or "loss" by looking into the future data.
+    5. Generate a feature vector for the model, including OHLCV and technical indicators.
+    6. Repeat for all combinations and aggregate the data.
+    """
     all_features = []
     all_labels = []
-    for file in tqdm(files, desc="Loading Processed Features"):
-        data = np.load(file)
-        all_features.append(data['features'])
-        all_labels.append(data['labels'])
     
+    symbols = get_symbols()
+    if symbol_limit:
+        symbols = symbols[:symbol_limit]
+
+    # Define the columns that will be used as features for the model
+    feature_columns = [
+        'open', 'high', 'low', 'close', 'volume',
+        'RSI_14', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9',
+        'BBL_5_2.0', 'BBM_5_2.0', 'BBU_5_2.0', 'BBB_5_2.0', 'BBP_5_2.0'
+    ]
+
+    for symbol in tqdm(symbols, desc="Building Training Data"):
+        for timeframe in TIMEFTRAMES:
+            df = download_kline_data(symbol, timeframe, DOWNLOAD_LOOKBACK_DAYS)
+            if df.empty:
+                continue
+
+            for lookback in LOOKBACK_VALUES:
+                df_with_indicators, swing_points, trend = detect_swing_points_and_trend(df.copy(), lookback)
+
+                # This is where you'd define your trading logic to generate signals
+                # For this example, let's create a simple signal:
+                # "In an uptrend, after a Higher Low (HL), look for a long entry."
+                
+                for i in range(1, len(swing_points)):
+                    # Check for a Higher Low in an uptrend
+                    if trend == "Uptrend" and swing_points[i]['type'] == 'HL':
+                        signal_idx = swing_points[i]['index']
+                        
+                        # Ensure we have enough data for a feature sequence
+                        if signal_idx < SEQUENCE_LENGTH:
+                            continue
+
+                        # Define SL/TP for labeling
+                        sl = swing_points[i]['price'] * 0.98 # 2% stop loss
+                        tp = swing_points[i]['price'] * 1.04 # 4% take profit
+
+                        # Look ahead for outcome
+                        label = None
+                        for j in range(signal_idx + 1, len(df_with_indicators)):
+                            future_high = df_with_indicators['high'].iloc[j]
+                            future_low = df_with_indicators['low'].iloc[j]
+                            if future_high >= tp:
+                                label = 1 # Win
+                                break
+                            if future_low <= sl:
+                                label = 0 # Loss
+                                break
+                        
+                        # If a win/loss was determined, create the feature set
+                        if label is not None:
+                            feature_df = df_with_indicators.iloc[signal_idx - SEQUENCE_LENGTH : signal_idx]
+                            
+                            # Normalize features
+                            first_candle = feature_df.iloc[0]
+                            normalized_df = feature_df[feature_columns].copy()
+                            for col in ['open', 'high', 'low', 'close', 'volume'] + [c for c in feature_columns if 'BB' in c]:
+                                if first_candle[col] > 0:
+                                    normalized_df[col] = (normalized_df[col] / first_candle[col]) - 1
+                            
+                            # For other indicators like RSI, MACD, normalization might differ
+                            # For simplicity, we'll just scale them
+                            for col in ['RSI_14', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9']:
+                                if col in normalized_df.columns:
+                                    normalized_df[col] = normalized_df[col] / 100
+                            
+                            normalized_df.fillna(0, inplace=True) # Handle any potential NaNs after normalization
+
+                            all_features.append(normalized_df.to_numpy())
+                            all_labels.append(np.array([label], dtype=np.float32))
+
     if not all_features:
         return np.array([]), np.array([])
-
-    return np.concatenate(all_features), np.concatenate(all_labels)
+        
+    return np.array(all_features), np.concatenate(all_labels)
 
 def generate_training_report(history, y_true, y_pred_probs, output_dir):
     """Generates and saves a report of the model's training and performance."""
@@ -346,181 +496,21 @@ def create_and_train_model(train_dataset, val_dataset, test_dataset, output_dir,
 
     return model_path
 
-def generate_signals_for_symbol(df):
-    """Generates all potential trade signals for a given symbol's DataFrame."""
-    potential_trades = []
-    np_close = df['close'].to_numpy()
-
-    for i in range(LOOKBACK_CANDLES, len(df) - 1):
-        strategy_klines = df.iloc[i - LOOKBACK_CANDLES : i]
-        swing_highs, swing_lows = get_swing_points(strategy_klines, window=SWING_WINDOW)
-        trend = get_trend(swing_highs, swing_lows)
-        
-        signal = None
-        if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-            last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
-            entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
-            if np_close[i-1] > entry_price:
-                sl, tp = last_swing_high, entry_price - (last_swing_high - entry_price)
-                signal = {'side': 'short', 'entry': entry_price, 'sl': sl, 'tp': tp}
-        elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-            last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
-            entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
-            if np_close[i-1] < entry_price:
-                sl, tp = last_swing_low, entry_price + (entry_price - last_swing_low)
-                signal = {'side': 'long', 'entry': entry_price, 'sl': sl, 'tp': tp}
-        
-        if signal:
-            potential_trades.append((signal, i))
-            
-    return potential_trades
-
-def get_features_for_signals(df, potential_trades):
-    """Extracts features for a list of potential trades."""
-    features_to_predict = []
-    for signal, i in potential_trades:
-        feature_klines = df.iloc[i - SEQUENCE_LENGTH : i]
-        first_candle = feature_klines.iloc[0]
-        if first_candle['close'] > 0 and first_candle['volume'] > 0:
-            normalized_features = feature_klines[['open', 'high', 'low', 'close', 'volume']].copy()
-            for col in ['open', 'high', 'low', 'close']:
-                normalized_features[col] = (normalized_features[col] / first_candle['close']) - 1
-            normalized_features['volume'] = (normalized_features['volume'] / first_candle['volume']) - 1
-            features_to_predict.append(normalized_features.to_numpy())
-    return np.array(features_to_predict)
-
-def simulate_trades(df, symbol, potential_trades, predictions):
-    """Simulates trades based on predictions and returns a list of TradeResult objects."""
-    local_trades = []
-    np_high = df['high'].to_numpy()
-    np_low = df['low'].to_numpy()
-
-    for (signal, trade_idx), prediction in zip(potential_trades, predictions):
-        if prediction[0] > 0.45:
-            exit_price, status, reason = (None, None, None)
-            for j in range(trade_idx, len(df)):
-                future_high, future_low = np_high[j], np_low[j]
-                if signal['side'] == 'long':
-                    if future_high >= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
-                    if future_low <= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
-                else:
-                    if future_low <= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
-                    if future_high >= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
-            
-            if status:
-                trade = TradeResult(
-                    symbol=symbol, side=signal['side'], entry_price=signal['entry'], exit_price=exit_price,
-                    entry_timestamp=df.index[trade_idx], exit_timestamp=df.index[j], status=status,
-                    pnl_usd=0, pnl_pct=0,
-                    reason_for_entry=f"ML Signal (Pred: {prediction[0]:.2f})",
-                    reason_for_exit=reason
-                )
-                local_trades.append(trade)
-    return local_trades
-
-def backtest_symbol(args):
+# --- Placeholder for main.py compatibility ---
+def process_and_save_kline_data(klines, symbol):
     """
-    Backtesting logic for a single symbol. Designed to be called by a multiprocessing pool.
+    This function is a placeholder to maintain compatibility with main.py.
+    The new pipeline builds data directly and doesn't save intermediate files.
     """
-    # Disable GPU in worker process
-    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-    # Set env var BEFORE importing tensorflow in the new process
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-    from absl import logging
-    logging.set_verbosity(logging.ERROR)
-    import tensorflow as tf
+    print(f"Note: Data for {symbol} received. In the new pipeline, data processing is integrated.")
+    pass
 
-    filepath, model_path = args
-    symbol = filepath.split(os.sep)[-2]
-    
-    # Each process needs to load the model. This is memory-intensive but necessary for parallelism.
-    model = tf.keras.models.load_model(model_path)
-    
-    local_trades = []
-    
-    try:
-        df = pd.read_parquet(filepath)
-        df.columns = df.columns.str.lower()
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df.set_index('timestamp', inplace=True)
-        
-        # Convert to numpy for faster access
-        np_close = df['close'].to_numpy()
-        np_high = df['high'].to_numpy()
-        np_low = df['low'].to_numpy()
-        
-        i = LOOKBACK_CANDLES
-        while i < len(df) - 1:
-            strategy_klines = df.iloc[i - LOOKBACK_CANDLES : i]
-            swing_highs, swing_lows = get_swing_points(strategy_klines, window=SWING_WINDOW)
-            trend = get_trend(swing_highs, swing_lows)
-            
-            signal = None
-            if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
-                entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
-                if np_close[i-1] > entry_price:
-                    sl, tp = last_swing_high, entry_price - (last_swing_high - entry_price)
-                    signal = {'side': 'short', 'entry': entry_price, 'sl': sl, 'tp': tp}
-            elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
-                entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
-                if np_close[i-1] < entry_price:
-                    sl, tp = last_swing_low, entry_price + (entry_price - last_swing_low)
-                    signal = {'side': 'long', 'entry': entry_price, 'sl': sl, 'tp': tp}
-
-            if signal:
-                feature_klines = df.iloc[i - SEQUENCE_LENGTH : i]
-                first_candle = feature_klines.iloc[0]
-                if first_candle['close'] > 0 and first_candle['volume'] > 0:
-                    normalized_features = feature_klines[['open', 'high', 'low', 'close', 'volume']].copy()
-                    for col in ['open', 'high', 'low', 'close']:
-                        normalized_features[col] = (normalized_features[col] / first_candle['close']) - 1
-                    normalized_features['volume'] = (normalized_features['volume'] / first_candle['volume']) - 1
-                    feature_array = np.array([normalized_features.to_numpy()])
-                    
-                # Collect all features for batch prediction
-                features_to_predict = []
-                potential_trades = []
-
-                if first_candle['close'] > 0 and first_candle['volume'] > 0:
-                    normalized_features = feature_klines[['open', 'high', 'low', 'close', 'volume']].copy()
-                    for col in ['open', 'high', 'low', 'close']:
-                        normalized_features[col] = (normalized_features[col] / first_candle['close']) - 1
-                    normalized_features['volume'] = (normalized_features['volume'] / first_candle['volume']) - 1
-                    features_to_predict.append(normalized_features.to_numpy())
-                    potential_trades.append((signal, i))
-            i += 1
-        
-        # Batch prediction
-        if features_to_predict:
-            predictions = model.predict(np.array(features_to_predict), verbose=0)
-            for (signal, trade_idx), prediction in zip(potential_trades, predictions):
-                if prediction[0] > 0.45:
-                    exit_price, status, reason = (None, None, None)
-                    for j in range(trade_idx, len(df)):
-                        future_high, future_low = np_high[j], np_low[j]
-                        if signal['side'] == 'long':
-                            if future_high >= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
-                            if future_low <= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
-                        else:
-                            if future_low <= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
-                            if future_high >= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
-                    
-                    if status:
-                        trade = TradeResult(
-                            symbol=symbol, side=signal['side'], entry_price=signal['entry'], exit_price=exit_price,
-                            entry_timestamp=df.index[trade_idx], exit_timestamp=df.index[j], status=status,
-                            pnl_usd=0, pnl_pct=0,
-                            reason_for_entry=f"ML Signal (Pred: {prediction[0]:.2f})",
-                            reason_for_exit=reason
-                        )
-                        local_trades.append(trade)
-            i += 1
-    except Exception as e:
-        print(f"Error backtesting {symbol}: {e}")
-    
-    return local_trades
+# Note: The following functions are now obsolete as their logic is handled
+# by the new `build_training_data` and `detect_swing_points_and_trend` functions.
+# - generate_signals_for_symbol
+# - get_features_for_signals
+# - simulate_trades
+# - backtest_symbol
 
 def run_ml_backtest(model_path, data_files, output_dir, starting_balance=10000, risk_per_trade=0.02):
     """Run a backtest using the trained ML model to filter trades in parallel."""
@@ -592,9 +582,9 @@ def run_pipeline(is_quick_test: bool):
     print(f"--- Starting {run_mode} ---")
 
     try:
-        # Step 1 & 2: Load Preprocessed Data
-        print(f"\n[Step 1-2/5] Loading preprocessed data for {run_mode}...")
-        X, y = load_processed_data(symbol_limit)
+        # Step 1: Build Training Data
+        print(f"\n[Step 1/4] Building training data for {run_mode}...")
+        X, y = build_training_data(symbol_limit)
         
         dataset_size = len(X)
         print(f"Found {dataset_size} samples.")
@@ -633,24 +623,26 @@ def run_pipeline(is_quick_test: bool):
 
         print(f"Dataset split: {train_size} train, {val_size} validation, {dataset_size - train_size - val_size} test samples.")
 
-        # Step 3: Build and Train the Model
-        print(f"\n[Step 3/5] Training model for {run_mode}... (Epochs: {epochs})")
+        # Step 2: Build and Train the Model
+        print(f"\n[Step 2/4] Training model for {run_mode}... (Epochs: {epochs})")
         # The training function now takes datasets instead of numpy arrays
         trained_model_path = create_and_train_model(train_dataset, val_dataset, test_dataset, model_output_dir, training_report_dir, epochs, class_weight)
         print(f"Model for {run_mode} saved to {trained_model_path}")
 
-        # Step 4: Run ML-powered backtest
-        print(f"\n[Step 4/5] Running ML-powered backtest for {run_mode}...")
-        # Load raw data file paths for the backtest simulation
-        raw_files_path = os.path.join('data', 'raw', '*', '*.parquet')
-        raw_data_files = glob.glob(raw_files_path)
+        # Step 3: Run ML-powered backtest
+        print(f"\n[Step 3/4] Running ML-powered backtest for {run_mode}...")
+        # Since we download data directly, we can pass symbol names to the backtest
+        symbols = get_symbols()
         if symbol_limit:
-            raw_data_files = raw_data_files[:symbol_limit]
+            symbols = symbols[:symbol_limit]
         
-        run_ml_backtest(trained_model_path, raw_data_files, backtest_report_dir, starting_balance=10000)
+        # The backtest function will need to be adapted to this new data flow
+        # For now, we'll comment this out as the user requested not to run/test.
+        # run_ml_backtest(trained_model_path, symbols, backtest_report_dir, starting_balance=10000)
+        print("Skipping backtest as per user instruction.")
 
-        # Step 5: Finalization
-        print(f"\n[Step 5/5] {run_mode} finished.")
+        # Step 4: Finalization
+        print(f"\n[Step 4/4] {run_mode} finished.")
         total_time = time.time() - start_time
         print(f"Total execution time for {run_mode}: {total_time:.2f} seconds.")
 
@@ -666,12 +658,8 @@ def run_pipeline(is_quick_test: bool):
 
 def main():
     """Main function to orchestrate the quick test and full run."""
-    # Check if preprocessing is needed
-    processed_path = os.path.join('data', 'processed')
-    if not os.path.exists(processed_path) or not os.listdir(processed_path):
-        print("--- Processed data not found. Running preprocessing script. ---")
-        import subprocess
-        subprocess.run(['python3', 'preprocess_data.py'], check=True)
+    # The script is now self-contained for data downloading and processing.
+    # The check for preprocessed data is no longer needed.
 
     # We need to declare the global here before any access.
     global QUICK_TEST
