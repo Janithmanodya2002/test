@@ -8,7 +8,7 @@ from binance.client import Client
 import keys
 import asyncio
 import telegram
-from telegram.ext import ApplicationBuilder, CommandHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, JobQueue
 import numpy as np
 import json
 import pytz
@@ -1321,20 +1321,30 @@ async def main():
         print(f"Error loading configuration: {e}")
         return
 
-    # Load the ML model
-    try:
-        model_path = config.get('model_path', 'full_run_output/model/lstm_trader.keras')
-        ml_model = load_model(model_path)
-        feature_columns_path = os.path.join(os.path.dirname(model_path), "feature_columns.json")
-        with open(feature_columns_path, 'r') as f:
-            ml_feature_columns = json.load(f)
-        print(f"ML model loaded from {model_path}. Signal confidence threshold is {model_confidence_threshold * 100}%.")
-    except FileNotFoundError:
-        print(f"ML model not found at {model_path}. The bot will run with rule-based logic only.")
+
+
+        # Load the ML model
+    model_path = config.get('model_path', '').strip()
+    print(f"Attempting to load ML model from: {model_path!r}")
+
+    if not os.path.isfile(model_path):
+        print(f"❌ Model file does not exist at: {model_path}")
         ml_model = None
-    except Exception as e:
-        print(f"Error loading ML model: {e}. The bot will run with rule-based logic only.")
-        ml_model = None
+        ml_feature_columns = None
+    else:
+        try:
+            ml_model = load_model(model_path)
+            print(f"✅ ML model loaded successfully from {model_path}")
+
+            feature_columns_path = os.path.join(os.path.dirname(model_path), "feature_columns.json")
+            with open(feature_columns_path, 'r') as f:
+                ml_feature_columns = json.load(f)
+            print(f"Signal confidence threshold is {model_confidence_threshold * 100:.1f}%.")
+        except Exception as e:
+            print(f"❌ Error loading ML model: {e}")
+            ml_model = None
+            ml_feature_columns = None
+
 
     # Load symbols
     try:
