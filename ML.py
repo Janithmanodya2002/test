@@ -1,4 +1,22 @@
 import os
+import subprocess
+import sys
+
+def install_dependencies():
+    """
+    Installs all required libraries from requirements.txt.
+    """
+    print("--- Installing dependencies from requirements.txt ---")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+        print("--- Dependencies installed successfully ---")
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to install dependencies: {e}")
+        sys.exit(1)
+
+# Run the dependency installer
+install_dependencies()
+
 # Set TensorFlow logging level to suppress all but error messages
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
@@ -9,8 +27,9 @@ from absl import logging
 logging.set_verbosity(logging.ERROR)
 from tqdm import tqdm
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Input
+from tensorflow.keras.layers import LSTM, Dense, Input, Dropout
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
@@ -48,7 +67,7 @@ SWING_WINDOW = 5 # This will be replaced by LOOKBACK_VALUES but kept for compati
 SEQUENCE_LENGTH = 60  # Number of timesteps in each sample
 QUICK_TEST_BATCH_SIZE = 32
 FULL_RUN_BATCH_SIZE = 128 # Larger batch size for better GPU utilization
-EPOCHS = 50
+EPOCHS = 200
 LEARNING_RATE = 0.001
 
 # --- Classes and Functions from main.py (for backtesting and reporting) ---
@@ -461,8 +480,11 @@ def create_and_train_model(train_dataset, val_dataset, test_dataset, output_dir,
     model = Sequential([
         Input(shape=input_shape),
         LSTM(64, return_sequences=True),
+        Dropout(0.3),
         LSTM(64),
+        Dropout(0.3),
         Dense(32, activation='relu'),
+        Dropout(0.3),
         Dense(1, activation='sigmoid', dtype='float32')
     ])
 
@@ -475,12 +497,17 @@ def create_and_train_model(train_dataset, val_dataset, test_dataset, output_dir,
     model.summary()
 
     print("Training model...")
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    model_checkpoint = ModelCheckpoint(filepath=os.path.join(output_dir, "best_model.keras"), save_best_only=True, monitor='val_loss')
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=0.00001)
+
     history = model.fit(
         train_dataset,
         validation_data=val_dataset,
         epochs=epochs,
         verbose=1,
-        class_weight=class_weight
+        class_weight=class_weight,
+        callbacks=[early_stopping, model_checkpoint, reduce_lr]
     )
 
     print("Model training complete.")
@@ -493,6 +520,15 @@ def create_and_train_model(train_dataset, val_dataset, test_dataset, output_dir,
     y_true = np.concatenate([y for x, y in test_dataset], axis=0)
     y_pred_probs = model.predict(test_dataset)
     generate_training_report(history, y_true, y_pred_probs, training_report_dir)
+
+    # Save the feature columns
+    feature_columns = [
+        'open', 'high', 'low', 'close', 'volume',
+        'RSI_14', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9',
+        'BBL_5_2.0', 'BBM_5_2.0', 'BBU_5_2.0', 'BBB_5_2.0', 'BBP_5_2.0'
+    ]
+    with open(os.path.join(output_dir, "feature_columns.json"), 'w') as f:
+        json.dump(feature_columns, f)
 
     return model_path
 
@@ -611,11 +647,12 @@ def run_pipeline(is_quick_test: bool):
 
         # Splitting the dataset
         train_size = int(0.7 * dataset_size)
-        val_size = int(0.2 * dataset_size)
+        val_size = int(0.15 * dataset_size)
+        test_size = dataset_size - train_size - val_size
         
         train_dataset = dataset.take(train_size)
         val_dataset = dataset.skip(train_size).take(val_size)
-        test_dataset = dataset.skip(train_size + val_size)
+        test_dataset = dataset.skip(train_size + val_size).take(test_size)
 
         train_dataset = train_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
         val_dataset = val_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
