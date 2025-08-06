@@ -23,7 +23,7 @@ import requests
 import logging
 from binance.exceptions import BinanceAPIException
 import ML
-from tensorflow.keras.models import load_model
+from keras.models import load_model
 from pandas_ta import rsi, macd, bbands
 try:
     import mplfinance as mpf
@@ -646,18 +646,8 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
     """
     print("Starting backtest...")
 
-    # Load the ML model
-    try:
-        model_data = joblib.load('models/trading_model.joblib')
-        loaded_ml_model = model_data['model']
-        ml_feature_columns = model_data['feature_columns']
-        print("ML model loaded for backtesting.")
-    except FileNotFoundError:
-        print("ML model not found. Backtest will run without ML filtering.")
-        ml_model = None
-    except Exception as e:
-        print(f"Error loading ML model: {e}. Backtest will run without ML filtering.")
-        ml_model = None
+    # The ML model is now loaded in the main function, so this is not needed here.
+    loaded_ml_model = ml_model
 
     end_date = datetime.datetime.now(pytz.utc)
     start_date = end_date - datetime.timedelta(days=days_to_backtest)
@@ -703,9 +693,14 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                         'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                         'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'short'
                     }
-                    ml_prediction, ml_confidence = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, loaded_ml_model, ml_feature_columns)
-                    if ml_prediction == 0 or (ml_confidence is not None and ml_confidence < config.get('model_confidence_threshold', 0.0)): # Apply threshold if configured for backtest
-                        continue
+                    features = generate_live_features(current_klines, ml_feature_columns)
+                    if features is not None:
+                        pred_prob = loaded_ml_model.predict(features)[0][0]
+                        if pred_prob < config.get('model_confidence_threshold', 0.0):
+                            continue
+                        ml_prediction, ml_confidence = (1, pred_prob)
+                    else:
+                        ml_prediction, ml_confidence = (None, None)
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) > entry_price:
@@ -781,11 +776,14 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                         'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                         'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'long'
                     }
-                    ml_prediction, ml_confidence = get_model_prediction(
-                        [dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines],
-                        setup_info, loaded_ml_model, ml_feature_columns)
-                    if ml_prediction == 0 or (ml_confidence is not None and ml_confidence < config.get('model_confidence_threshold', 0.0)): # Apply threshold if configured for backtest
-                        continue
+                    features = generate_live_features(current_klines, ml_feature_columns)
+                    if features is not None:
+                        pred_prob = loaded_ml_model.predict(features)[0][0]
+                        if pred_prob < config.get('model_confidence_threshold', 0.0):
+                            continue
+                        ml_prediction, ml_confidence = (1, pred_prob)
+                    else:
+                        ml_prediction, ml_confidence = (None, None)
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) < entry_price:
@@ -1246,11 +1244,11 @@ def generate_live_features(klines, feature_columns, sequence_length=60):
     for col in ['open', 'high', 'low', 'close', 'volume'] + [c for c in feature_columns if 'BB' in c]:
         if first_candle[col] > 0:
             normalized_df[col] = (normalized_df[col] / first_candle[col]) - 1
-
+    
     for col in ['RSI_14', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9']:
         if col in normalized_df.columns:
             normalized_df[col] = normalized_df[col] / 100
-
+    
     normalized_df.fillna(0, inplace=True)
 
     # Reshape for the model
@@ -1271,7 +1269,7 @@ def log_ml_decision(symbol, side, prediction, confidence, outcome='pending'):
         'confidence': confidence,
         'outcome': outcome
     }
-
+    
     file_exists = os.path.isfile(log_file)
     with open(log_file, 'a', newline='') as f:
         writer = pd.DataFrame([log_entry])
