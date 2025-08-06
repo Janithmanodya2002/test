@@ -1,0 +1,2 @@
+risk_per_trade,risk_amount_usd,use_fixed_risk_amount,leverage,atr_value,lookback_candles,swing_window,starting_balance,chart_image_candles,max_open_positions,model_confidence_threshold,model_path
+0.5,20,False,10,14,100,5,10000,100,5,0.7,"full_run_output/model/best_model.keras"

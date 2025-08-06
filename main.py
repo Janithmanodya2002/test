@@ -1,3 +1,7 @@
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+import subprocess
+import sys
 import pandas as pd
 import time
 from binance.client import Client
@@ -8,7 +12,6 @@ from telegram.ext import ApplicationBuilder, CommandHandler
 import numpy as np
 import json
 import pytz
-import os
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -20,13 +23,28 @@ import requests
 import logging
 from binance.exceptions import BinanceAPIException
 import ML
-import joblib
+from tensorflow.keras.models import load_model
+from pandas_ta import rsi, macd, bbands
 try:
     import mplfinance as mpf
 except ImportError:
     print("mplfinance not found. Please install it by running: pip install mplfinance")
     exit()
 from tabulate import tabulate
+
+def install_dependencies():
+    """
+    Installs all required libraries from requirements.txt.
+    """
+    print("--- Installing dependencies from requirements.txt ---")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+        print("--- Dependencies installed successfully ---")
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to install dependencies: {e}")
+        sys.exit(1)
+
+install_dependencies()
 
 def is_session_valid(client):
     """
@@ -1195,26 +1213,69 @@ model_confidence_threshold = 0.7 # Default value
 
 rejected_symbols = {} # To store symbols recently rejected by ML
 
-def get_model_prediction(klines, setup_info, model, feature_columns):
+def generate_live_features(klines, feature_columns, sequence_length=60):
     """
-    Generates features for a live setup and gets a prediction from the ML model.
+    Generates features for a live setup to be used for model prediction.
     """
-    # Convert klines to a DataFrame for the feature generation function
-    klines_df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    if len(klines) < sequence_length:
+        return None
+
+    # Convert klines to a DataFrame
+    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     for col in ['open', 'high', 'low', 'close', 'volume']:
-        klines_df[col] = pd.to_numeric(klines_df[col], errors='coerce')
+        df[col] = pd.to_numeric(df[col])
 
-    # Generate the feature vector
-    feature_vector = ML.generate_features_for_live_setup(klines_df, setup_info, feature_columns)
+    # Calculate indicators
+    df['RSI_14'] = rsi(df['close'])
+    macd_df = macd(df['close'])
+    df = df.join(macd_df)
+    bbands_df = bbands(df['close'])
+    df = df.join(bbands_df)
+    df.dropna(inplace=True)
+
+    if len(df) < sequence_length:
+        return None
+
+    # Get the last sequence
+    feature_df = df.iloc[-sequence_length:]
     
-    # Make prediction
-    prediction = model.predict(feature_vector)[0]
-    probabilities = model.predict_proba(feature_vector)[0]
-    confidence = probabilities[prediction]
+    # Normalize features
+    first_candle = feature_df.iloc[0]
+    normalized_df = feature_df[feature_columns].copy()
+    for col in ['open', 'high', 'low', 'close', 'volume'] + [c for c in feature_columns if 'BB' in c]:
+        if first_candle[col] > 0:
+            normalized_df[col] = (normalized_df[col] / first_candle[col]) - 1
+
+    for col in ['RSI_14', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9']:
+        if col in normalized_df.columns:
+            normalized_df[col] = normalized_df[col] / 100
+
+    normalized_df.fillna(0, inplace=True)
+
+    # Reshape for the model
+    feature_array = np.array([normalized_df.to_numpy()])
     
-    return prediction, confidence
+    return feature_array
 
 
+
+def log_ml_decision(symbol, side, prediction, confidence, outcome='pending'):
+    """Logs the ML model's decision and the trade outcome."""
+    log_file = 'ml_decisions.csv'
+    log_entry = {
+        'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'symbol': symbol,
+        'side': side,
+        'prediction': prediction,
+        'confidence': confidence,
+        'outcome': outcome
+    }
+
+    file_exists = os.path.isfile(log_file)
+    with open(log_file, 'a', newline='') as f:
+        writer = pd.DataFrame([log_entry])
+        writer.to_csv(f, header=not file_exists, index=False)
 
 def start_order_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode):
     """Wrapper to run the async order_status_monitor in a separate thread."""
@@ -1264,15 +1325,17 @@ async def main():
 
     # Load the ML model
     try:
-        model_data = joblib.load('models/trading_model.joblib')
-        ml_model = model_data['model'] # Assign to global variable
-        ml_feature_columns = model_data['feature_columns']
-        print(f"ML model loaded. Signal confidence threshold is {model_confidence_threshold * 100}%.")
+        model_path = config.get('model_path', 'full_run_output/model/lstm_trader.keras')
+        ml_model = load_model(model_path)
+        feature_columns_path = os.path.join(os.path.dirname(model_path), "feature_columns.json")
+        with open(feature_columns_path, 'r') as f:
+            ml_feature_columns = json.load(f)
+        print(f"ML model loaded from {model_path}. Signal confidence threshold is {model_confidence_threshold * 100}%.")
     except FileNotFoundError:
-        print("ML model not found. The bot will run in signal-only mode without ML filtering.")
-        ml_model = None # Ensure it's None if loading fails
+        print(f"ML model not found at {model_path}. The bot will run with rule-based logic only.")
+        ml_model = None
     except Exception as e:
-        print(f"Error loading ML model: {e}. The bot will run in signal-only mode.")
+        print(f"Error loading ML model: {e}. The bot will run with rule-based logic only.")
         ml_model = None
 
     # Load symbols
@@ -1463,22 +1526,20 @@ async def main():
                         tp2 = entry_price - (sl - entry_price) * 2
 
                         # --- ML Model Integration ---
-                        if ml_model:
-                            setup_info = {
-                                'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
-                                'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'short'
-                            }
-                            prediction, confidence = get_model_prediction(klines, setup_info, ml_model, ml_feature_columns)
-
-                            print(f"ML Model Prediction for {symbol} Short: Class {prediction} with {confidence:.2f}% confidence.")
-
-                            if prediction != 1 or confidence < model_confidence_threshold: # Prediction 1 assumed to be "Win"
-                                rejection_reason = f"Prediction Class: {prediction}" if prediction != 1 else f"Confidence: {confidence:.2f} < {model_confidence_threshold:.2f}"
-                                await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Short\nReason: {rejection_reason}")
-                                rejected_symbols[symbol] = time.time() # Add to rejected list to avoid spam
-                                continue # Skip to next symbol
-                            
-                            print("  - ML Model ACCEPTED signal.")
+                        if ml_model and ml_feature_columns:
+                            features = generate_live_features(klines, ml_feature_columns)
+                            if features is not None:
+                                pred_prob = ml_model.predict(features)[0][0]
+                                if pred_prob < model_confidence_threshold:
+                                    log_ml_decision(symbol, 'short', 0, pred_prob, 'rejected')
+                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Short\nReason: Confidence {pred_prob:.2f} < {model_confidence_threshold:.2f}")
+                                    rejected_symbols[symbol] = time.time()
+                                    continue
+                                else:
+                                    log_ml_decision(symbol, 'short', 1, pred_prob)
+                                    print(f"  - ML Model ACCEPTED signal for {symbol} Short with confidence {pred_prob:.2f}")
+                            else:
+                                print(f"Could not generate features for {symbol}. Skipping ML check.")
                         # -------------------------- # ML Model Integration End
                         
                         symbol_info = symbols_info[symbol]
@@ -1486,8 +1547,8 @@ async def main():
                         if quantity is None or quantity == 0:
                             continue
                         
-                        prediction_map = {0: "Loss", 1: "TP1 Win", 2: "TP2 Win"}
-                        ml_info = f"🧠 ML Prediction: {prediction_map.get(prediction, 'Unknown')} (Conf: {confidence:.1%})"
+                        pred_label = 1 if pred_prob > 0.5 else 0
+                        ml_info = f"🧠 ML Prediction: Win (Conf: {pred_prob:.1%})"
                         
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
                         caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
@@ -1497,8 +1558,8 @@ async def main():
                         await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
                         new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
-                                     'ml_prediction': prediction,
-                                     'ml_confidence': confidence
+                                     'ml_prediction': pred_label,
+                                     'ml_confidence': pred_prob
                                      }
 
                         with trades_lock:
@@ -1520,22 +1581,20 @@ async def main():
                         tp2 = entry_price + (entry_price - last_swing_low) * 2
 
                         # --- ML Model Integration ---
-                        if ml_model:
-                            setup_info = {
-                                'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
-                                'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'long'
-                            }
-                            prediction, confidence = get_model_prediction(klines, setup_info, ml_model, ml_feature_columns)
-
-                            print(f"ML Model Prediction for {symbol} Long: Class {prediction} with {confidence:.2f}% confidence.")
-
-                            if prediction != 1 or confidence < model_confidence_threshold: # Prediction 1 assumed to be "Win"
-                                rejection_reason = f"Prediction Class: {prediction}" if prediction != 1 else f"Confidence: {confidence:.2f} < {model_confidence_threshold:.2f}"
-                                await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Long\nReason: {rejection_reason}")
-                                rejected_symbols[symbol] = time.time()
-                                continue
-                            
-                            print("  - ML Model ACCEPTED signal.")
+                        if ml_model and ml_feature_columns:
+                            features = generate_live_features(klines, ml_feature_columns)
+                            if features is not None:
+                                pred_prob = ml_model.predict(features)[0][0]
+                                if pred_prob < model_confidence_threshold:
+                                    log_ml_decision(symbol, 'long', 0, pred_prob, 'rejected')
+                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Long\nReason: Confidence {pred_prob:.2f} < {model_confidence_threshold:.2f}")
+                                    rejected_symbols[symbol] = time.time()
+                                    continue
+                                else:
+                                    log_ml_decision(symbol, 'long', 1, pred_prob)
+                                    print(f"  - ML Model ACCEPTED signal for {symbol} Long with confidence {pred_prob:.2f}")
+                            else:
+                                print(f"Could not generate features for {symbol}. Skipping ML check.")
                         # -------------------------- # ML Model Integration End
                         
                         symbol_info = symbols_info[symbol]
@@ -1543,8 +1602,8 @@ async def main():
                         if quantity is None or quantity == 0:
                             continue
 
-                        prediction_map = {0: "Loss", 1: "TP1 Win", 2: "TP2 Win"}
-                        ml_info = f"🧠 ML Prediction: {prediction_map.get(prediction, 'Unknown')} (Conf: {confidence:.1%})"
+                        pred_label = 1 if pred_prob > 0.5 else 0
+                        ml_info = f"🧠 ML Prediction: Win (Conf: {pred_prob:.1%})"
 
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
                         caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
@@ -1554,8 +1613,8 @@ async def main():
                         await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
                         new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
-                                     'ml_prediction': prediction,
-                                     'ml_confidence': confidence
+                                     'ml_prediction': pred_label,
+                                     'ml_confidence': pred_prob
                                      }
                         with trades_lock:
                             trades.append(new_trade)
