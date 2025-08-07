@@ -33,6 +33,9 @@ except ImportError:
     exit()
 from tabulate import tabulate
 
+MINIMUM_PROFIT_USD = 0.05
+developer_mode = True
+
 def install_dependencies():
     """
     Installs all required libraries from requirements.txt.
@@ -190,9 +193,10 @@ def get_public_ip():
 def analyze_trade_signal(klines, trend, swing_points, entry_price):
     """
     Analyzes a trade signal for various SMC confluences.
-    Returns a tuple of (is_valid, confluence_score).
+    Returns a tuple of (is_valid, confluence_score, reason).
     """
-    confluence_score = 1  # Start with 1 for basic trend alignment
+    confluence_score = 1
+    report = ""
     
     klines_df = pd.DataFrame(klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
     klines_df[['open', 'high', 'low', 'close', 'volume']] = klines_df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
@@ -211,7 +215,7 @@ def analyze_trade_signal(klines, trend, swing_points, entry_price):
             in_fvg = True
             confluence_score += 1
             break
-    if not in_fvg: return False, confluence_score
+    report += f"FVG: {'PASS' if in_fvg else 'FAIL'}\n"
 
     # Breaker Block Confluence
     order_blocks = detect_order_blocks(klines_df)
@@ -223,24 +227,42 @@ def analyze_trade_signal(klines, trend, swing_points, entry_price):
             in_breaker = True
             confluence_score += 1
             break
-    if not in_breaker: return False, confluence_score
+    report += f"Breaker Block: {'PASS' if in_breaker else 'FAIL'}\n"
+    
+    if not in_fvg and not in_breaker:
+        if developer_mode:
+            print(f"--- Signal Analysis for {klines_df.index[-1]} ---\n{report}")
+        return False, confluence_score, "No FVG or Breaker Block."
 
     # Liquidity Sweep Confluence
     sweeps = detect_liquidity_sweeps(klines_df, swing_points)
+    liquidity_sweep_found = False
     for sweep in sweeps:
         if (trend == 'uptrend' and sweep['type'] == 'bullish' and (pd.to_datetime(klines[-1][0], unit='ms') - sweep['timestamp']).total_seconds() < 3600 * 4) or \
            (trend == 'downtrend' and sweep['type'] == 'bearish' and (pd.to_datetime(klines[-1][0], unit='ms') - sweep['timestamp']).total_seconds() < 3600 * 4):
             confluence_score += 1
+            liquidity_sweep_found = True
             break
+    report += f"Liquidity Sweep: {'PASS' if liquidity_sweep_found else 'FAIL'}\n"
+    if not liquidity_sweep_found:
+        if developer_mode:
+            print(f"--- Signal Analysis for {klines_df.index[-1]} ---\n{report}")
+        return False, confluence_score, "No Liquidity Sweep."
 
     # Volume Spike Confluence
     klines_df['volume_ma'] = klines_df['volume'].rolling(window=20).mean()
-    if klines_df.iloc[-1]['volume'] > klines_df.iloc[-1]['volume_ma'] * 1.5:
+    volume_spike = klines_df.iloc[-1]['volume'] > klines_df.iloc[-1]['volume_ma'] * 1.5
+    if volume_spike:
         confluence_score += 1
-    else:
-        return False, confluence_score
+    report += f"Volume Spike: {'PASS' if volume_spike else 'FAIL'}\n"
+    if not volume_spike:
+        if developer_mode:
+            print(f"--- Signal Analysis for {klines_df.index[-1]} ---\n{report}")
+        return False, confluence_score, "No volume spike."
 
-    return True, confluence_score
+    if developer_mode:
+        print(f"--- Signal Analysis for {klines_df.index[-1]} ---\n{report}")
+    return True, confluence_score, "All confluences met."
 
 
 def get_higher_timeframe_bias(client, symbol, htf_interval='4h', htf_lookback=200, htf_swing_window=5):
@@ -932,6 +954,39 @@ def update_trade_report(trades, backtest_mode=False):
         with open('trades.json', 'w') as f:
             json.dump(trades, f, indent=4, default=lambda o: o.__dict__ if hasattr(o, '__dict__') else str(o))
 
+def generate_live_report(trades):
+    """
+    Generate a live report of the bot's status and trades.
+    """
+    report = "Live Bot Status Report\n"
+    report += "======================\n\n"
+    report += f"Report generated at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    report += f"Developer mode: {'On' if developer_mode else 'Off'}\n"
+    report += f"Number of active trades: {len([t for t in trades if t['status'] in ['running', 'tp1_hit']])}\n"
+    report += f"Number of pending trades: {len([t for t in trades if t['status'] == 'pending'])}\n\n"
+
+    report += "Active Trades:\n"
+    report += "--------------\n"
+    active_trades = [t for t in trades if t['status'] in ['running', 'tp1_hit']]
+    if not active_trades:
+        report += "No active trades.\n"
+    else:
+        for trade in active_trades:
+            report += f"  - Symbol: {trade['symbol']}, Side: {trade['side']}, Entry: {trade['entry_price']:.8f}, Status: {trade['status']}\n"
+    
+    report += "\nPending Trades:\n"
+    report += "---------------\n"
+    pending_trades = [t for t in trades if t['status'] == 'pending']
+    if not pending_trades:
+        report += "No pending trades.\n"
+    else:
+        for trade in pending_trades:
+            report += f"  - Symbol: {trade['symbol']}, Side: {trade['side']}, Entry: {trade['entry_price']:.8f}\n"
+
+    with open("live_report.txt", "w") as f:
+        f.write(report)
+    print("Live report generated: live_report.txt")
+
 async def place_new_order(client, symbol_info, side, order_type, quantity, price=None, stop_price=None, reduce_only=None, position_side=None, is_closing_order=False):
     symbol = symbol_info['symbol']
     p_prec = int(symbol_info['pricePrecision'])
@@ -1002,6 +1057,27 @@ async def send_telegram_alert(bot, message):
         await bot.send_message(chat_id=keys.telegram_chat_id, text=message)
     except Exception as e:
         logging.error(f"Failed to send Telegram alert: {e}")
+
+async def send_developer_message(bot, chat_id, symbol, status, reason, details=None):
+    """
+    Send a detailed developer message to Telegram, if developer_mode is True.
+    """
+    if not developer_mode:
+        return
+
+    message = f"**Developer Info for {symbol}**\n"
+    message += f"Status: **{status}**\n"
+    message += f"Reason: {reason}\n"
+
+    if details:
+        message += "**Details:**\n"
+        for key, value in details.items():
+            message += f"  - {key}: {value}\n"
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+    except Exception as e:
+        print(f"Error sending developer message: {e}")
 
 async def send_start_message(bot, backtest_mode=False, current_session=None):
     if backtest_mode:
@@ -1078,12 +1154,20 @@ async def op_command(update, context):
         symbol = trade['symbol']
         klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=chart_image_candles)
         if klines:
-            swing_highs, swing_lows = get_swing_points(klines, 5)
+            klines_df = pd.DataFrame(klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+            klines_df[['open', 'high', 'low', 'close', 'volume']] = klines_df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+            klines_df['dt'] = pd.to_datetime(klines_df['dt'], unit='ms')
+            klines_df.set_index('dt', inplace=True)
+
+            _, swing_points, _, _, _, _, _ = detect_swing_points_and_trend(klines_df.copy(), 5)
+            swing_highs = [p['price'] for p in swing_points if p['type'] in ['HH', 'LH']]
+            swing_lows = [p['price'] for p in swing_points if p['type'] in ['LL', 'HL']]
+
             if not swing_highs or not swing_lows:
                 continue
 
-            last_swing_high = swing_highs[-1][1]
-            last_swing_low = swing_lows[-1][1]
+            last_swing_high = swing_highs[-1]
+            last_swing_low = swing_lows[-1]
 
             image_buffer = generate_fib_chart(symbol, klines, trade['side'], last_swing_high, last_swing_low, trade['entry_price'], trade['sl'], trade['tp1'], trade['tp2'])
             current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
@@ -1111,7 +1195,7 @@ async def cancel_order(client, symbol, order_id):
         print(error_msg)
         return False, str(e)
 
-async def order_status_monitor(client, application, backtest_mode=False, live_mode=False, symbols_info=None, is_hedge_mode=False):
+async def order_status_monitor(client, application, backtest_mode=False, live_mode=False, symbols_info=None, is_hedge_mode=False, config=None):
     """
     Continuously monitor the status of open and pending trades using order status polling.
     """
@@ -1138,7 +1222,7 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                 pos_side = 'LONG' if trade['side'] == 'long' else 'SHORT' if is_hedge_mode else None
 
                 if trade['status'] == 'pending':
-                    if time.time() * 1000 - trade['timestamp'] > 4 * 60 * 60 * 1000:
+                    if time.time() * 1000 - trade['entry_time'] > 4 * 60 * 60 * 1000:
                         await send_telegram_alert(bot, f"⚠️ TRADE INVALIDATED ⚠️\nSymbol: {symbol}\nSide: {trade['side']}\nReason: Order expired (4 hours)")
                         trade['status'] = 'rejected'
                         if symbol in virtual_orders: del virtual_orders[symbol]
@@ -1266,29 +1350,6 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                     else:
                                         await send_telegram_alert(bot, f"Warning: Failed to update SL for {symbol}. Original SL may be active or filled.")
                     
-                    # --- Time-Based Stop ---
-                    print(f"  - Checking time-based stop for {symbol}...")
-                    time_in_trade_ms = time.time() * 1000 - trade['timestamp']
-                    candles_in_trade = time_in_trade_ms / (15 * 60 * 1000) # Assuming 15m timeframe
-                    max_candles = 4 # Time limit
-                    print(f"    - Candles in trade: {candles_in_trade:.1f}/{max_candles}")
-                    
-                    if candles_in_trade > max_candles:
-                        current_price = float((await loop.run_in_executor(None, lambda: client.get_symbol_ticker(symbol=symbol)))['price'])
-                        in_profit = (trade['side'] == 'long' and current_price > trade['entry_price']) or \
-                                    (trade['side'] == 'short' and current_price < trade['entry_price'])
-                        
-                        if not in_profit:
-                            await send_telegram_alert(bot, f"⏰ TIME STOP HIT ⏰\nSymbol: {symbol}\nSide: {trade['side']}\nReason: Trade not in profit after {max_candles} candles.")
-                            if live_mode:
-                                close_side = 'SELL' if trade['side'] == 'long' else 'BUY'
-                                await cancel_order(client, symbol, trade['sl_order_id'])
-                                await cancel_order(client, symbol, trade['tp_order_id'])
-                                await place_new_order(client, symbol_info, close_side, 'MARKET', trade['quantity'], reduce_only=True, position_side=pos_side)
-                            
-                            trade['status'] = 'time_stop'
-                            if symbol in virtual_orders: del virtual_orders[symbol]
-                            continue
                     # -----------------------
 
 
@@ -1363,6 +1424,7 @@ def generate_live_features(klines, feature_columns, sequence_length=60):
 
 def log_ml_decision(symbol, side, prediction, confidence, outcome='pending'):
     """Logs the ML model's decision and the trade outcome."""
+    print(f"Logging ML decision for {symbol}...")
     log_file = 'ml_decisions.csv'
     log_entry = {
         'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -1378,11 +1440,11 @@ def log_ml_decision(symbol, side, prediction, confidence, outcome='pending'):
         writer = pd.DataFrame([log_entry])
         writer.to_csv(f, header=not file_exists, index=False)
 
-def start_order_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode):
+def start_order_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, config):
     """Wrapper to run the async order_status_monitor in a separate thread."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(order_status_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode))
+    loop.run_until_complete(order_status_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, config))
 
 
 async def main():
@@ -1416,6 +1478,7 @@ async def main():
         chart_image_candles = int(config['chart_image_candles'])
         max_open_positions = int(config['max_open_positions'])
         model_confidence_threshold = config.get('model_confidence_threshold', 0.7) # Use .get for safe access
+        config['max_trade_duration_candles'] = int(config.get('max_trade_duration_candles', 4))
         print("Configuration loaded.")
     except FileNotFoundError:
         print("Error: configuration.csv not found.")
@@ -1543,7 +1606,7 @@ async def main():
                 pass
 
     if not backtest_mode:
-        monitor_thread = threading.Thread(target=start_order_monitor, args=(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode), daemon=True)
+        monitor_thread = threading.Thread(target=start_order_monitor, args=(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, config), daemon=True)
         monitor_thread.start()
 
     if backtest_mode:
@@ -1602,6 +1665,42 @@ async def main():
                 print(f"Outside of trading session. Current UTC hour: {current_hour}. Sleeping...")
                 await asyncio.sleep(60)
                 continue
+            
+            # --- Time-Based Stop ---
+            with trades_lock:
+                active_trades = [t for t in trades if t['status'] in ['running', 'tp1_hit']]
+
+            loop = asyncio.get_running_loop()
+            for trade in active_trades:
+                symbol = trade['symbol']
+                symbol_info = symbols_info[symbol]
+                pos_side = 'LONG' if trade['side'] == 'long' else 'SHORT' if is_hedge_mode else None
+                
+                print(f"  - Checking time-based stop for {symbol}...")
+                time_in_trade_ms = time.time() * 1000 - trade['entry_time']
+                candles_in_trade = time_in_trade_ms / (15 * 60 * 1000) # Assuming 15m timeframe
+                max_candles = config['max_trade_duration_candles']
+                print(f"    - Candles in trade: {candles_in_trade:.1f}/{max_candles}")
+                
+                if candles_in_trade > max_candles:
+                    current_price = float((await loop.run_in_executor(None, lambda: client.get_symbol_ticker(symbol=symbol)))['price'])
+                    
+                    if trade['side'] == 'long':
+                        current_profit = (current_price - trade['entry_price']) * trade['quantity']
+                    else: # short
+                        current_profit = (trade['entry_price'] - current_price) * trade['quantity']
+
+                    if current_profit >= MINIMUM_PROFIT_USD:
+                        await send_telegram_alert(bot, f"⏰ TIME STOP HIT (PROFITABLE) ⏰\nSymbol: {symbol}\nSide: {trade['side']}\nReason: Trade in profit after {max_candles} candles.")
+                        if live_mode:
+                            close_side = 'SELL' if trade['side'] == 'long' else 'BUY'
+                            await cancel_order(client, symbol, trade['sl_order_id'])
+                            await cancel_order(client, symbol, trade['tp_order_id'])
+                            await place_new_order(client, symbol_info, close_side, 'MARKET', trade['quantity'], reduce_only=True, position_side=pos_side)
+                        
+                        trade['status'] = 'time_stop_profit'
+                        if symbol in virtual_orders: del virtual_orders[symbol]
+            # --- End of Time-Based Stop ---
 
             for symbol in symbols:
                 try:
@@ -1653,8 +1752,9 @@ async def main():
                         if current_price < entry_price:
                             continue
 
-                        is_valid, confluence_score = analyze_trade_signal(klines, trend, swing_points, entry_price)
+                        is_valid, confluence_score, reason = analyze_trade_signal(klines, trend, swing_points, entry_price)
                         if not is_valid:
+                            await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Rejected', reason, {'Confluence Score': confluence_score})
                             continue
 
                         sl = last_swing_high
@@ -1668,7 +1768,7 @@ async def main():
                                 pred_prob = ml_model.predict(features)[0][0]
                                 if pred_prob < model_confidence_threshold:
                                     log_ml_decision(symbol, 'short', 0, pred_prob, 'rejected')
-                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Short\nReason: Confidence {pred_prob:.2f} < {model_confidence_threshold:.2f}")
+                                    await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Rejected', 'ML Model rejected trade', {'Confidence': f"{pred_prob:.2f}", 'Threshold': model_confidence_threshold})
                                     rejected_symbols[symbol] = time.time()
                                     continue
                                 else:
@@ -1688,6 +1788,7 @@ async def main():
                         ml_info = f"🧠 ML Prediction: Win (Conf: {pred_prob:.1%})"
                         
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
+                        await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Accepted', 'All conditions met', {'Confluence Score': confluence_score, 'ML Confidence': pred_prob})
                         caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
                                    f"Symbol: {symbol}\nSide: Short\nLeverage: {leverage}x\n"
                                    f"HTF Bias: {htf_bias.upper()}\n"
@@ -1695,7 +1796,7 @@ async def main():
                                    f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
                         await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
-                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
+                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'entry_time': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
                                      'ml_prediction': pred_label,
                                      'ml_confidence': pred_prob
                                      }
@@ -1722,8 +1823,9 @@ async def main():
                         if current_price > entry_price:
                             continue
 
-                        is_valid, confluence_score = analyze_trade_signal(klines, trend, swing_points, entry_price)
+                        is_valid, confluence_score, reason = analyze_trade_signal(klines, trend, swing_points, entry_price)
                         if not is_valid:
+                            await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Rejected', reason, {'Confluence Score': confluence_score})
                             continue
 
                         sl = last_swing_low
@@ -1737,7 +1839,7 @@ async def main():
                                 pred_prob = ml_model.predict(features)[0][0]
                                 if pred_prob < model_confidence_threshold:
                                     log_ml_decision(symbol, 'long', 0, pred_prob, 'rejected')
-                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Long\nReason: Confidence {pred_prob:.2f} < {model_confidence_threshold:.2f}")
+                                    await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Rejected', 'ML Model rejected trade', {'Confidence': f"{pred_prob:.2f}", 'Threshold': model_confidence_threshold})
                                     rejected_symbols[symbol] = time.time()
                                     continue
                                 else:
@@ -1757,6 +1859,7 @@ async def main():
                         ml_info = f"🧠 ML Prediction: Win (Conf: {pred_prob:.1%})"
 
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
+                        await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Accepted', 'All conditions met', {'Confluence Score': confluence_score, 'ML Confidence': pred_prob})
                         caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
                                    f"Symbol: {symbol}\nSide: Long\nLeverage: {leverage}x\n"
                                    f"HTF Bias: {htf_bias.upper()}\n"
@@ -1764,7 +1867,7 @@ async def main():
                                    f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
                         await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
-                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
+                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'entry_time': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
                                      'ml_prediction': pred_label,
                                      'ml_confidence': pred_prob
                                      }
@@ -1773,8 +1876,13 @@ async def main():
                         virtual_orders[symbol] = new_trade
                         update_trade_report(trades)
                 except Exception as e:
+                    await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Rejected', 'Exception occurred', {'Exception': str(e)})
                     print(f"Error scanning {symbol}: {e}")
                     rejected_symbols[symbol] = time.time()
+
+            # Generate live report
+            with trades_lock:
+                generate_live_report(trades)
 
             print("Scan cycle complete. Cooling down for 2 minutes...")
             await asyncio.sleep(120)
