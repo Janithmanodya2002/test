@@ -88,6 +88,162 @@ class TradeResult:
         self.reason_for_exit = reason_for_exit
         self.balance = 0.0 # Will be updated during backtest
 
+def detect_order_blocks(df, lookback=20, strength_multiplier=2.0):
+    """
+    Detects Order Blocks (OBs) in the price data.
+    An OB is the last opposing candle before a strong, impulsive move.
+    
+    Returns:
+        - obs (list): A list of dictionaries, each representing an OB.
+    """
+    obs = []
+    df['body_size'] = abs(df['open'] - df['close'])
+    df['avg_body_size'] = df['body_size'].rolling(window=lookback).mean()
+
+    for i in range(lookback, len(df) - 1):
+        candle = df.iloc[i]
+        next_candle = df.iloc[i+1]
+
+        is_strong_move = next_candle['body_size'] > (candle['avg_body_size'] * strength_multiplier)
+
+        if not is_strong_move:
+            continue
+
+        # Bullish OB: Last down candle before a strong up move
+        if candle['close'] < candle['open'] and next_candle['close'] > next_candle['open']:
+            obs.append({
+                'start': candle['low'],
+                'end': candle['high'],
+                'type': 'bullish',
+                'timestamp': candle.name
+            })
+
+        # Bearish OB: Last up candle before a strong down move
+        elif candle['close'] > candle['open'] and next_candle['close'] < next_candle['open']:
+            obs.append({
+                'start': candle['high'],
+                'end': candle['low'],
+                'type': 'bearish',
+                'timestamp': candle.name
+            })
+            
+    return obs
+
+def detect_liquidity_sweeps(df, swing_points):
+    """
+    Detects liquidity sweeps (stop hunts) above swing highs or below swing lows.
+    A sweep is confirmed if the price wicks past the swing point but the candle body closes back inside the range.
+    """
+    sweeps = []
+    for sp in swing_points:
+        sp_price = sp['price']
+        sp_timestamp = df.index[sp['index']]
+        
+        # Look at candles that formed after the swing point
+        future_candles = df[df.index > sp_timestamp]
+        
+        for i in range(len(future_candles)):
+            candle = future_candles.iloc[i]
+            
+            # Sweep of a high
+            if sp['type'] in ['HH', 'LH']:
+                if candle['high'] > sp_price and candle['close'] < sp_price:
+                    sweeps.append({'price': sp_price, 'type': 'bearish', 'timestamp': candle.name})
+                    break # Stop after the first sweep of this point
+            
+            # Sweep of a low
+            elif sp['type'] in ['LL', 'HL']:
+                if candle['low'] < sp_price and candle['close'] > sp_price:
+                    sweeps.append({'price': sp_price, 'type': 'bullish', 'timestamp': candle.name})
+                    break # Stop after the first sweep
+
+    return sweeps
+
+def detect_breaker_blocks(df, order_blocks, swing_points):
+    """
+    Detects Breaker Blocks.
+    A breaker block is an order block that led to a swing point, but the swing point was then violated.
+    """
+    breaker_blocks = []
+    
+    # Find the swing highs and lows from the swing_points list
+    swing_highs = [p for p in swing_points if p['type'] in ['HH', 'LH']]
+    swing_lows = [p for p in swing_points if p['type'] in ['LL', 'HL']]
+
+    for ob in order_blocks:
+        ob_timestamp = ob['timestamp']
+        
+        # Bearish Breaker (a bullish OB that failed)
+        if ob['type'] == 'bullish':
+            # Find the next swing low that formed after this OB
+            relevant_lows = [sw for sw in swing_lows if df.index[sw['index']] > ob_timestamp]
+            if not relevant_lows: continue
+            
+            first_low_after_ob = relevant_lows[0]
+            
+            # Check if this low was violated (a "break of structure")
+            break_of_structure = df['low'][df.index > df.index[first_low_after_ob['index']]].min() < first_low_after_ob['price']
+            
+            if break_of_structure:
+                breaker_blocks.append({
+                    'start': ob['start'], 'end': ob['end'], 'type': 'bearish', 'timestamp': ob_timestamp
+                })
+
+        # Bullish Breaker (a bearish OB that failed)
+        elif ob['type'] == 'bearish':
+            # Find the next swing high that formed after this OB
+            relevant_highs = [sh for sh in swing_highs if df.index[sh['index']] > ob_timestamp]
+            if not relevant_highs: continue
+            
+            first_high_after_ob = relevant_highs[0]
+
+            # Check if this high was violated
+            break_of_structure = df['high'][df.index > df.index[first_high_after_ob['index']]].max() > first_high_after_ob['price']
+
+            if break_of_structure:
+                breaker_blocks.append({
+                    'start': ob['start'], 'end': ob['end'], 'type': 'bullish', 'timestamp': ob_timestamp
+                })
+
+    return breaker_blocks
+
+def detect_fair_value_gaps(df):
+    """
+    Detects Fair Value Gaps (FVGs) in the price data.
+    An FVG is a three-candle pattern where an inefficiency or imbalance occurs.
+    
+    Returns:
+        - fvgs (list): A list of dictionaries, each representing an FVG with
+                       'start', 'end', 'type', and 'midpoint'.
+    """
+    fvgs = []
+    for i in range(1, len(df) - 1):
+        prev_candle = df.iloc[i-1]
+        current_candle = df.iloc[i]
+        next_candle = df.iloc[i+1]
+
+        # Bullish FVG (Gap between prev high and next low)
+        if prev_candle['high'] < next_candle['low']:
+            fvgs.append({
+                'start': prev_candle['high'],
+                'end': next_candle['low'],
+                'type': 'bullish',
+                'midpoint': (prev_candle['high'] + next_candle['low']) / 2,
+                'timestamp': current_candle.name
+            })
+            
+        # Bearish FVG (Gap between prev low and next high)
+        if prev_candle['low'] > next_candle['high']:
+            fvgs.append({
+                'start': prev_candle['low'],
+                'end': next_candle['high'],
+                'type': 'bearish',
+                'midpoint': (prev_candle['low'] + next_candle['high']) / 2,
+                'timestamp': current_candle.name
+            })
+            
+    return fvgs
+
 def detect_swing_points_and_trend(df, lookback_window):
     """
     Identifies swing points and market trend using technical indicators and peak detection.
@@ -166,8 +322,14 @@ def detect_swing_points_and_trend(df, lookback_window):
         trend = "Uptrend"
     elif ll_count >= 1 and lh_count >= 1:
         trend = "Downtrend"
+
+    # --- SMC Analysis ---
+    order_blocks = detect_order_blocks(df)
+    fair_value_gaps = detect_fair_value_gaps(df)
+    breaker_blocks = detect_breaker_blocks(df, order_blocks, swing_points)
+    liquidity_sweeps = detect_liquidity_sweeps(df, swing_points)
         
-    return df, swing_points, trend
+    return df, swing_points, trend, order_blocks, fair_value_gaps, breaker_blocks, liquidity_sweeps
 
 def calculate_performance_metrics(backtest_trades, starting_balance):
     """Calculate performance metrics from a list of trades."""
@@ -337,7 +499,8 @@ def build_training_data(symbol_limit=None):
     feature_columns = [
         'open', 'high', 'low', 'close', 'volume',
         'RSI_14', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9',
-        'BBL_5_2.0', 'BBM_5_2.0', 'BBU_5_2.0', 'BBB_5_2.0', 'BBP_5_2.0'
+        'BBL_5_2.0', 'BBM_5_2.0', 'BBU_5_2.0', 'BBB_5_2.0', 'BBP_5_2.0',
+        'in_fvg', 'distance_to_ob', 'in_breaker', 'liquidity_sweep', 'volume_spike' # New SMC features
     ]
 
     for symbol in tqdm(symbols, desc="Building Training Data"):
@@ -347,7 +510,11 @@ def build_training_data(symbol_limit=None):
                 continue
 
             for lookback in LOOKBACK_VALUES:
-                df_with_indicators, swing_points, trend = detect_swing_points_and_trend(df.copy(), lookback)
+                df_with_indicators, swing_points, trend, order_blocks, fair_value_gaps, breaker_blocks, liquidity_sweeps = detect_swing_points_and_trend(df.copy(), lookback)
+
+                # --- Volume Spike Calculation ---
+                df_with_indicators['volume_spike'] = df_with_indicators['volume'] > (df_with_indicators['volume'].rolling(window=20).mean() * 2)
+                # --------------------------
 
                 # This is where you'd define your trading logic to generate signals
                 # For this example, let's create a simple signal:
@@ -380,22 +547,58 @@ def build_training_data(symbol_limit=None):
                         
                         # If a win/loss was determined, create the feature set
                         if label is not None:
-                            feature_df = df_with_indicators.iloc[signal_idx - SEQUENCE_LENGTH : signal_idx]
+                            feature_df = df_with_indicators.iloc[signal_idx - SEQUENCE_LENGTH : signal_idx].copy()
                             
+                            # --- SMC Feature Calculation ---
+                            signal_price = df_with_indicators['close'].iloc[signal_idx]
+                            
+                            # FVG Feature
+                            in_fvg = 0
+                            for fvg in fair_value_gaps:
+                                if fvg['timestamp'] < feature_df.index[-1] and fvg['start'] <= signal_price <= fvg['end']:
+                                    in_fvg = 1 if fvg['type'] == 'bullish' else -1
+                                    break
+                            feature_df['in_fvg'] = in_fvg
+
+                            # Order Block Feature
+                            distance_to_ob = np.nan
+                            for ob in order_blocks:
+                                if ob['timestamp'] < feature_df.index[-1]:
+                                    dist = abs(signal_price - ob['start'])
+                                    if np.isnan(distance_to_ob) or dist < distance_to_ob:
+                                        distance_to_ob = dist
+                            feature_df['distance_to_ob'] = distance_to_ob / signal_price if distance_to_ob is not np.nan else 0
+
+                            # Breaker Block Feature
+                            in_breaker = 0
+                            for bb in breaker_blocks:
+                                if bb['timestamp'] < feature_df.index[-1] and bb['start'] <= signal_price <= bb['end']:
+                                    in_breaker = 1 if bb['type'] == 'bullish' else -1
+                                    break
+                            feature_df['in_breaker'] = in_breaker
+                            
+                            # Liquidity Sweep feature
+                            liquidity_sweep = 0
+                            for sweep in liquidity_sweeps:
+                                # Check if a sweep happened within the sequence lookback period
+                                if feature_df.index[0] <= sweep['timestamp'] <= feature_df.index[-1]:
+                                    liquidity_sweep = 1 if sweep['type'] == 'bullish' else -1
+                                    break
+                            feature_df['liquidity_sweep'] = liquidity_sweep
+
                             # Normalize features
                             first_candle = feature_df.iloc[0]
                             normalized_df = feature_df[feature_columns].copy()
-                            for col in ['open', 'high', 'low', 'close', 'volume'] + [c for c in feature_columns if 'BB' in c]:
-                                if first_candle[col] > 0:
+                            for col in ['open', 'high', 'low', 'close', 'volume', 'distance_to_ob'] + [c for c in feature_columns if 'BB' in c]:
+                                if col in normalized_df.columns and first_candle[col] > 0:
                                     normalized_df[col] = (normalized_df[col] / first_candle[col]) - 1
                             
                             # For other indicators like RSI, MACD, normalization might differ
-                            # For simplicity, we'll just scale them
-                            for col in ['RSI_14', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9']:
+                            for col in ['RSI_14', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9', 'in_fvg', 'in_breaker', 'liquidity_sweep', 'volume_spike']:
                                 if col in normalized_df.columns:
                                     normalized_df[col] = normalized_df[col] / 100
                             
-                            normalized_df.fillna(0, inplace=True) # Handle any potential NaNs after normalization
+                            normalized_df.fillna(0, inplace=True)
 
                             all_features.append(normalized_df.to_numpy())
                             all_labels.append(np.array([label], dtype=np.float32))
