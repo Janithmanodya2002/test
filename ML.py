@@ -512,10 +512,29 @@ def create_and_train_model(train_dataset, val_dataset, test_dataset, output_dir,
 
     print("Model training complete.")
     
+       # Save the trained model
     model_path = os.path.join(output_dir, "lstm_trader.keras")
     model.save(model_path)
-    
-    print("Generating training report on test data...")
+    print(f"✅ Model saved to {model_path}")
+
+    # ——— SAVE FEATURE COLUMNS FOR LIVE PREDICTION ———
+    feature_columns = [
+        "open", "high", "low", "close", "volume",
+        "RSI_14",
+        "MACD_12_26_9", "MACDh_12_26_9", "MACDs_12_26_9",
+        "BBL_20_2.0", "BBM_20_2.0", "BBU_20_2.0"
+    ]
+    feature_columns_path = os.path.join(output_dir, "feature_columns.json")
+    with open(feature_columns_path, "w") as f:
+        json.dump(feature_columns, f)
+    print(f"✅ Saved feature_columns.json to {feature_columns_path}")
+
+    # Generating training report on test data…
+    print("Generating training report on test data…")
+    # … rest of your reporting code …
+
+
+
     # To generate the report, we need to get the labels from the test_dataset
     y_true = np.concatenate([y for x, y in test_dataset], axis=0)
     y_pred_probs = model.predict(test_dataset)
