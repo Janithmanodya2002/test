@@ -25,6 +25,7 @@ from binance.exceptions import BinanceAPIException
 import ML
 from keras.models import load_model
 from pandas_ta import rsi, macd, bbands
+from ML import detect_order_blocks, detect_fair_value_gaps, detect_breaker_blocks, detect_liquidity_sweeps, detect_swing_points_and_trend
 try:
     import mplfinance as mpf
 except ImportError:
@@ -77,6 +78,7 @@ class TradeResult:
         self.fib_levels = fib_levels
         self.ml_prediction = ml_prediction
         self.ml_confidence = ml_confidence
+        self.confluence_score = confluence_score
 
 def generate_fib_chart(symbol, klines, trend, swing_high, swing_low, entry_price, sl, tp1, tp2):
     """
@@ -185,151 +187,7 @@ def get_public_ip():
         print(f"Error getting public IP address: {e}")
         return None
 
-def get_swing_points(klines, window=5):
-    """
-    Identify swing points from kline data.
-    """
-    highs = np.array([float(k[2]) for k in klines])
-    lows = np.array([float(k[3]) for k in klines])
-
-    swing_highs = []
-    swing_lows = []
-
-    for i in range(window, len(highs) - window):
-        is_swing_high = True
-        for j in range(1, window + 1):
-            if highs[i] < highs[i-j] or highs[i] < highs[i+j]:
-                is_swing_high = False
-                break
-        if is_swing_high:
-            swing_highs.append((klines[i][0], highs[i]))
-
-        is_swing_low = True
-        for j in range(1, window + 1):
-            if lows[i] > lows[i-j] or lows[i] > lows[i+j]:
-                is_swing_low = False
-                break
-        if is_swing_low:
-            swing_lows.append((klines[i][0], lows[i]))
-
-    return swing_highs, swing_lows
-
-def get_trend(swing_highs, swing_lows):
-    """
-    Determine the trend based on swing points.
-    """
-    if len(swing_highs) < 2 or len(swing_lows) < 2:
-        return "undetermined"
-
-    last_high = swing_highs[-1][1]
-    prev_high = swing_highs[-2][1]
-    last_low = swing_lows[-1][1]
-    prev_low = swing_lows[-2][1]
-
-    if last_high > prev_high and last_low > prev_low:
-        return "uptrend"
-    elif last_high < prev_high and last_low < prev_low:
-        return "downtrend"
-    else:
-        return "undetermined"
-
-def detect_order_blocks(df, lookback=20, strength_multiplier=2.0):
-    """
-    Detects Order Blocks (OBs) from a DataFrame.
-    """
-    obs = []
-    df['body_size'] = abs(df['open'] - df['close'])
-    df['avg_body_size'] = df['body_size'].rolling(window=lookback).mean()
-
-    for i in range(lookback, len(df) - 1):
-        candle = df.iloc[i]
-        next_candle = df.iloc[i+1]
-        is_strong_move = next_candle['body_size'] > (candle['avg_body_size'] * strength_multiplier)
-        if not is_strong_move:
-            continue
-        if candle['close'] < candle['open'] and next_candle['close'] > next_candle['open']: # Bullish OB
-            obs.append({'start': candle['low'], 'end': candle['high'], 'type': 'bullish'})
-        elif candle['close'] > candle['open'] and next_candle['close'] < next_candle['open']: # Bearish OB
-            obs.append({'start': candle['high'], 'end': candle['low'], 'type': 'bearish'})
-    return obs
-
-def detect_liquidity_sweeps(df, swing_points):
-    """
-    Detects liquidity sweeps (stop hunts) from a DataFrame.
-    """
-    sweeps = []
-    for sp in swing_points:
-        sp_price = sp[1]
-        sp_timestamp = pd.to_datetime(sp[0], unit='ms')
-        future_candles = df[df.index > sp_timestamp]
-        for i in range(len(future_candles)):
-            candle = future_candles.iloc[i]
-            # Sweep of a high
-            if candle['high'] > sp_price and candle['close'] < sp_price:
-                sweeps.append({'price': sp_price, 'type': 'bearish', 'timestamp': candle.name})
-                break
-            # Sweep of a low
-            elif candle['low'] < sp_price and candle['close'] > sp_price:
-                sweeps.append({'price': sp_price, 'type': 'bullish', 'timestamp': candle.name})
-                break
-    return sweeps
-
-def detect_breaker_blocks(df, order_blocks, swing_points):
-    """
-    Detects Breaker Blocks from a DataFrame.
-    """
-    breaker_blocks = []
-    swing_highs = [p for p in swing_points if p[1] == max(p[1] for p in swing_points)] # Simplified
-    swing_lows = [p for p in swing_points if p[1] == min(p[1] for p in swing_points)] # Simplified
-
-    for ob in order_blocks:
-        ob_timestamp = ob.get('timestamp') # Assuming timestamp is available
-        if not ob_timestamp: continue
-
-        if ob['type'] == 'bullish':
-            relevant_lows = [sw for sw in swing_lows if pd.to_datetime(sw[0], unit='ms') > ob_timestamp]
-            if not relevant_lows: continue
-            first_low_after_ob = relevant_lows[0]
-            if df['low'][df.index > pd.to_datetime(first_low_after_ob[0], unit='ms')].min() < first_low_after_ob[1]:
-                breaker_blocks.append({'start': ob['start'], 'end': ob['end'], 'type': 'bearish'})
-        elif ob['type'] == 'bearish':
-            relevant_highs = [sh for sh in swing_highs if pd.to_datetime(sh[0], unit='ms') > ob_timestamp]
-            if not relevant_highs: continue
-            first_high_after_ob = relevant_highs[0]
-            if df['high'][df.index > pd.to_datetime(first_high_after_ob[0], unit='ms')].max() > first_high_after_ob[1]:
-                breaker_blocks.append({'start': ob['start'], 'end': ob['end'], 'type': 'bullish'})
-    return breaker_blocks
-
-def detect_fair_value_gaps(df):
-    """
-    Detects Fair Value Gaps (FVGs) in the price data from a DataFrame.
-    """
-    fvgs = []
-    # Ensure DataFrame has enough rows
-    if len(df) < 3:
-        return fvgs
-
-    for i in range(len(df) - 2):
-        candle1 = df.iloc[i]
-        candle3 = df.iloc[i+2]
-
-        # Bullish FVG
-        if candle1['high'] < candle3['low']:
-            fvgs.append({
-                'start': candle1['high'],
-                'end': candle3['low'],
-                'type': 'bullish'
-            })
-        # Bearish FVG
-        elif candle1['low'] > candle3['high']:
-            fvgs.append({
-                'start': candle1['low'],
-                'end': candle3['high'],
-                'type': 'bearish'
-            })
-    return fvgs
-
-def analyze_trade_signal(klines, trend, swing_highs, swing_lows, entry_price):
+def analyze_trade_signal(klines, trend, swing_points, entry_price):
     """
     Analyzes a trade signal for various SMC confluences.
     Returns a tuple of (is_valid, confluence_score).
@@ -340,6 +198,9 @@ def analyze_trade_signal(klines, trend, swing_highs, swing_lows, entry_price):
     klines_df[['open', 'high', 'low', 'close', 'volume']] = klines_df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
     klines_df['dt'] = pd.to_datetime(klines_df['dt'], unit='ms')
     klines_df.set_index('dt', inplace=True)
+    
+    swing_highs = [p for p in swing_points if p['type'] in ['HH', 'LH']]
+    swing_lows = [p for p in swing_points if p['type'] in ['LL', 'HL']]
 
     # FVG Confluence
     fvgs = detect_fair_value_gaps(klines_df)
@@ -354,7 +215,7 @@ def analyze_trade_signal(klines, trend, swing_highs, swing_lows, entry_price):
 
     # Breaker Block Confluence
     order_blocks = detect_order_blocks(klines_df)
-    breaker_blocks = detect_breaker_blocks(klines_df, order_blocks, swing_highs + swing_lows)
+    breaker_blocks = detect_breaker_blocks(klines_df, order_blocks, swing_points)
     in_breaker = False
     for bb in breaker_blocks:
         if (trend == 'uptrend' and bb['type'] == 'bullish' and bb['start'] <= entry_price <= bb['end']) or \
@@ -365,7 +226,7 @@ def analyze_trade_signal(klines, trend, swing_highs, swing_lows, entry_price):
     if not in_breaker: return False, confluence_score
 
     # Liquidity Sweep Confluence
-    sweeps = detect_liquidity_sweeps(klines_df, swing_highs + swing_lows)
+    sweeps = detect_liquidity_sweeps(klines_df, swing_points)
     for sweep in sweeps:
         if (trend == 'uptrend' and sweep['type'] == 'bullish' and (pd.to_datetime(klines[-1][0], unit='ms') - sweep['timestamp']).total_seconds() < 3600 * 4) or \
            (trend == 'downtrend' and sweep['type'] == 'bearish' and (pd.to_datetime(klines[-1][0], unit='ms') - sweep['timestamp']).total_seconds() < 3600 * 4):
@@ -390,9 +251,13 @@ def get_higher_timeframe_bias(client, symbol, htf_interval='4h', htf_lookback=20
     if not htf_klines or len(htf_klines) < htf_swing_window * 2:
         return "undetermined"
     
-    swing_highs, swing_lows = get_swing_points(htf_klines, htf_swing_window)
-    htf_trend = get_trend(swing_highs, swing_lows)
-    return htf_trend
+    htf_df = pd.DataFrame(htf_klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    htf_df[['open', 'high', 'low', 'close', 'volume']] = htf_df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+    htf_df['dt'] = pd.to_datetime(htf_df['dt'], unit='ms')
+    htf_df.set_index('dt', inplace=True)
+    
+    _, swing_points, trend, _, _, _, _ = detect_swing_points_and_trend(htf_df.copy(), htf_swing_window)
+    return trend
 
 def get_fib_retracement(p1, p2, trend, atr_multiplier=1.0):
     """
@@ -872,12 +737,19 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
         klines = all_klines[symbol]
         for i in range(config['lookback_candles'], len(klines)):
             current_klines = klines[i-config['lookback_candles']:i]
-            swing_highs, swing_lows = get_swing_points(current_klines, config['swing_window'])
-            trend = get_trend(swing_highs, swing_lows)
+            
+            klines_df = pd.DataFrame(current_klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+            klines_df[['open', 'high', 'low', 'close', 'volume']] = klines_df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+            klines_df['dt'] = pd.to_datetime(klines_df['dt'], unit='ms')
+            klines_df.set_index('dt', inplace=True)
+
+            _, swing_points, trend, _, _, _, _ = detect_swing_points_and_trend(klines_df.copy(), config['swing_window'])
+            swing_highs = [p for p in swing_points if p['type'] in ['HH', 'LH']]
+            swing_lows = [p for p in swing_points if p['type'] in ['LL', 'HL']]
 
             if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                last_swing_high = swing_highs[-1][1]
-                last_swing_low = swing_lows[-1][1]
+                last_swing_high = swing_highs[-1]['price']
+                last_swing_low = swing_lows[-1]['price']
                 entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
                 sl = last_swing_high
                 tp1 = entry_price - (sl - entry_price)
@@ -901,7 +773,7 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) > entry_price:
-                    is_valid, confluence_score = analyze_trade_signal(current_klines, trend, swing_highs, swing_lows, entry_price)
+                    is_valid, confluence_score = analyze_trade_signal(current_klines, trend, swing_points, entry_price)
                     if not is_valid:
                         continue
                     
@@ -963,8 +835,8 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                     i += (j - i) # Move to the next candle after the trade is closed
 
             elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                last_swing_high = swing_highs[-1][1]
-                last_swing_low = swing_lows[-1][1]
+                last_swing_high = swing_highs[-1]['price']
+                last_swing_low = swing_lows[-1]['price']
                 entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
                 sl = last_swing_low
                 tp1 = entry_price + (entry_price - last_swing_low)
@@ -988,7 +860,7 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) < entry_price:
-                    is_valid, confluence_score = analyze_trade_signal(current_klines, trend, swing_highs, swing_lows, entry_price)
+                    is_valid, confluence_score = analyze_trade_signal(current_klines, trend, swing_points, entry_price)
                     if not is_valid:
                         continue
                     
@@ -1395,9 +1267,11 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                         await send_telegram_alert(bot, f"Warning: Failed to update SL for {symbol}. Original SL may be active or filled.")
                     
                     # --- Time-Based Stop ---
+                    print(f"  - Checking time-based stop for {symbol}...")
                     time_in_trade_ms = time.time() * 1000 - trade['timestamp']
                     candles_in_trade = time_in_trade_ms / (15 * 60 * 1000) # Assuming 15m timeframe
                     max_candles = 4 # Time limit
+                    print(f"    - Candles in trade: {candles_in_trade:.1f}/{max_candles}")
                     
                     if candles_in_trade > max_candles:
                         current_price = float((await loop.run_in_executor(None, lambda: client.get_symbol_ticker(symbol=symbol)))['price'])
@@ -1741,7 +1615,6 @@ async def main():
                             continue
 
                     print(f"Scanning {symbol}...")
-                    
                     # --- Multi-Timeframe Analysis ---
                     htf_bias = get_higher_timeframe_bias(client, symbol)
                     print(f"  - Higher Timeframe (4H) Bias for {symbol}: {htf_bias.upper()}")
@@ -1751,16 +1624,23 @@ async def main():
                     if not klines:
                         continue
 
-                    swing_highs, swing_lows = get_swing_points(klines, swing_window)
-                    trend = get_trend(swing_highs, swing_lows)
+                    klines_df = pd.DataFrame(klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+                    klines_df[['open', 'high', 'low', 'close', 'volume']] = klines_df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+                    klines_df['dt'] = pd.to_datetime(klines_df['dt'], unit='ms')
+                    klines_df.set_index('dt', inplace=True)
+
+                    _, swing_points, trend, _, _, _, _ = detect_swing_points_and_trend(klines_df.copy(), swing_window)
+                    swing_highs = [p for p in swing_points if p['type'] in ['HH', 'LH']]
+                    swing_lows = [p for p in swing_points if p['type'] in ['LL', 'HL']]
+                    
                     print(f"  - Lower Timeframe (15M) Trend for {symbol}: {trend.upper()}")
 
                     current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
                     if trend == "downtrend" and htf_bias == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                        if time.time() * 1000 - swing_highs[-1][0] > 4 * 60 * 60 * 1000:
+                        if time.time() * 1000 - klines_df.index[swing_highs[-1]['index']].timestamp() * 1000 > 4 * 60 * 60 * 1000:
                             continue
-                        last_swing_high = swing_highs[-1][1]
-                        last_swing_low = swing_lows[-1][1]
+                        last_swing_high = swing_highs[-1]['price']
+                        last_swing_low = swing_lows[-1]['price']
                         
                         atr = get_atr(klines)
                         atr_multiplier = 1.0
@@ -1773,7 +1653,7 @@ async def main():
                         if current_price < entry_price:
                             continue
 
-                        is_valid, confluence_score = analyze_trade_signal(klines, trend, swing_highs, swing_lows, entry_price)
+                        is_valid, confluence_score = analyze_trade_signal(klines, trend, swing_points, entry_price)
                         if not is_valid:
                             continue
 
@@ -1826,10 +1706,10 @@ async def main():
                         update_trade_report(trades)
 
                     elif trend == "uptrend" and htf_bias == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                        if time.time() * 1000 - swing_lows[-1][0] > 4 * 60 * 60 * 1000:
+                        if time.time() * 1000 - klines_df.index[swing_lows[-1]['index']].timestamp() * 1000 > 4 * 60 * 60 * 1000:
                             continue
-                        last_swing_high = swing_highs[-1][1]
-                        last_swing_low = swing_lows[-1][1]
+                        last_swing_high = swing_highs[-1]['price']
+                        last_swing_low = swing_lows[-1]['price']
 
                         atr = get_atr(klines)
                         atr_multiplier = 1.0
@@ -1842,7 +1722,7 @@ async def main():
                         if current_price > entry_price:
                             continue
 
-                        is_valid, confluence_score = analyze_trade_signal(klines, trend, swing_highs, swing_lows, entry_price)
+                        is_valid, confluence_score = analyze_trade_signal(klines, trend, swing_points, entry_price)
                         if not is_valid:
                             continue
 
@@ -1872,7 +1752,7 @@ async def main():
                         quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount, confluence_score)
                         if quantity is None or quantity == 0:
                             continue
-
+                        
                         pred_label = 1 if pred_prob > 0.5 else 0
                         ml_info = f"🧠 ML Prediction: Win (Conf: {pred_prob:.1%})"
 
@@ -1901,3 +1781,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
