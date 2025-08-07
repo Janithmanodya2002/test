@@ -8,7 +8,7 @@ from binance.client import Client
 import keys
 import asyncio
 import telegram
-from telegram.ext import ApplicationBuilder, CommandHandler, JobQueue
+from telegram.ext import ApplicationBuilder, CommandHandler
 import numpy as np
 import json
 import pytz
@@ -23,18 +23,14 @@ import requests
 import logging
 from binance.exceptions import BinanceAPIException
 import ML
-from keras.models import load_model
+from tensorflow.keras.models import load_model
 from pandas_ta import rsi, macd, bbands
-from ML import detect_order_blocks, detect_fair_value_gaps, detect_breaker_blocks, detect_liquidity_sweeps, detect_swing_points_and_trend
 try:
     import mplfinance as mpf
 except ImportError:
     print("mplfinance not found. Please install it by running: pip install mplfinance")
     exit()
 from tabulate import tabulate
-
-MINIMUM_PROFIT_USD = 0.05
-developer_mode = True
 
 def install_dependencies():
     """
@@ -65,7 +61,7 @@ def is_session_valid(client):
         return False
 
 class TradeResult:
-    def __init__(self, symbol, side, entry_price, exit_price, entry_timestamp, exit_timestamp, status, pnl_usd, pnl_pct, drawdown, reason_for_entry, reason_for_exit, fib_levels, ml_prediction=None, ml_confidence=None, confluence_score=0):
+    def __init__(self, symbol, side, entry_price, exit_price, entry_timestamp, exit_timestamp, status, pnl_usd, pnl_pct, drawdown, reason_for_entry, reason_for_exit, fib_levels, ml_prediction=None, ml_confidence=None):
         self.symbol = symbol
         self.side = side
         self.entry_price = entry_price
@@ -81,7 +77,6 @@ class TradeResult:
         self.fib_levels = fib_levels
         self.ml_prediction = ml_prediction
         self.ml_confidence = ml_confidence
-        self.confluence_score = confluence_score
 
 def generate_fib_chart(symbol, klines, trend, swing_high, swing_low, entry_price, sl, tp1, tp2):
     """
@@ -190,145 +185,79 @@ def get_public_ip():
         print(f"Error getting public IP address: {e}")
         return None
 
-def analyze_trade_signal(klines, trend, swing_points, entry_price):
+def get_swing_points(klines, window=5):
     """
-    Analyzes a trade signal for various SMC confluences.
-    Returns a tuple of (is_valid, confluence_score, reason).
+    Identify swing points from kline data.
     """
-    confluence_score = 1
-    report = ""
-    
-    klines_df = pd.DataFrame(klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-    klines_df[['open', 'high', 'low', 'close', 'volume']] = klines_df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
-    klines_df['dt'] = pd.to_datetime(klines_df['dt'], unit='ms')
-    klines_df.set_index('dt', inplace=True)
-    
-    swing_highs = [p for p in swing_points if p['type'] in ['HH', 'LH']]
-    swing_lows = [p for p in swing_points if p['type'] in ['LL', 'HL']]
+    highs = np.array([float(k[2]) for k in klines])
+    lows = np.array([float(k[3]) for k in klines])
 
-    # FVG Confluence
-    fvgs = detect_fair_value_gaps(klines_df)
-    in_fvg = False
-    for fvg in fvgs:
-        if (trend == 'uptrend' and fvg['type'] == 'bullish' and fvg['start'] <= entry_price <= fvg['end']) or \
-           (trend == 'downtrend' and fvg['type'] == 'bearish' and fvg['end'] <= entry_price <= fvg['start']):
-            in_fvg = True
-            confluence_score += 1
-            break
-    report += f"FVG: {'PASS' if in_fvg else 'FAIL'}\n"
+    swing_highs = []
+    swing_lows = []
 
-    # Breaker Block Confluence
-    order_blocks = detect_order_blocks(klines_df)
-    breaker_blocks = detect_breaker_blocks(klines_df, order_blocks, swing_points)
-    in_breaker = False
-    for bb in breaker_blocks:
-        if (trend == 'uptrend' and bb['type'] == 'bullish' and bb['start'] <= entry_price <= bb['end']) or \
-           (trend == 'downtrend' and bb['type'] == 'bearish' and bb['end'] <= entry_price <= bb['start']):
-            in_breaker = True
-            confluence_score += 1
-            break
-    report += f"Breaker Block: {'PASS' if in_breaker else 'FAIL'}\n"
-    
-    if not in_fvg and not in_breaker:
-        if developer_mode:
-            print(f"--- Signal Analysis for {klines_df.index[-1]} ---\n{report}")
-        return False, confluence_score, "No FVG or Breaker Block."
+    for i in range(window, len(highs) - window):
+        is_swing_high = True
+        for j in range(1, window + 1):
+            if highs[i] < highs[i-j] or highs[i] < highs[i+j]:
+                is_swing_high = False
+                break
+        if is_swing_high:
+            swing_highs.append((klines[i][0], highs[i]))
 
-    # Liquidity Sweep Confluence
-    sweeps = detect_liquidity_sweeps(klines_df, swing_points)
-    liquidity_sweep_found = False
-    for sweep in sweeps:
-        if (trend == 'uptrend' and sweep['type'] == 'bullish' and (pd.to_datetime(klines[-1][0], unit='ms') - sweep['timestamp']).total_seconds() < 3600 * 4) or \
-           (trend == 'downtrend' and sweep['type'] == 'bearish' and (pd.to_datetime(klines[-1][0], unit='ms') - sweep['timestamp']).total_seconds() < 3600 * 4):
-            confluence_score += 1
-            liquidity_sweep_found = True
-            break
-    report += f"Liquidity Sweep: {'PASS' if liquidity_sweep_found else 'FAIL'}\n"
-    if not liquidity_sweep_found:
-        if developer_mode:
-            print(f"--- Signal Analysis for {klines_df.index[-1]} ---\n{report}")
-        return False, confluence_score, "No Liquidity Sweep."
+        is_swing_low = True
+        for j in range(1, window + 1):
+            if lows[i] > lows[i-j] or lows[i] > lows[i+j]:
+                is_swing_low = False
+                break
+        if is_swing_low:
+            swing_lows.append((klines[i][0], lows[i]))
 
-    # Volume Spike Confluence
-    klines_df['volume_ma'] = klines_df['volume'].rolling(window=20).mean()
-    volume_spike = klines_df.iloc[-1]['volume'] > klines_df.iloc[-1]['volume_ma'] * 1.5
-    if volume_spike:
-        confluence_score += 1
-    report += f"Volume Spike: {'PASS' if volume_spike else 'FAIL'}\n"
-    if not volume_spike:
-        if developer_mode:
-            print(f"--- Signal Analysis for {klines_df.index[-1]} ---\n{report}")
-        return False, confluence_score, "No volume spike."
+    return swing_highs, swing_lows
 
-    if developer_mode:
-        print(f"--- Signal Analysis for {klines_df.index[-1]} ---\n{report}")
-    return True, confluence_score, "All confluences met."
-
-
-def get_higher_timeframe_bias(client, symbol, htf_interval='4h', htf_lookback=200, htf_swing_window=5):
+def get_trend(swing_highs, swing_lows):
     """
-    Fetches higher timeframe data to establish an overall market trend bias.
+    Determine the trend based on swing points.
     """
-    htf_klines = get_klines(client, symbol, interval=htf_interval, limit=htf_lookback)
-    if not htf_klines or len(htf_klines) < htf_swing_window * 2:
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
         return "undetermined"
-    
-    htf_df = pd.DataFrame(htf_klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-    htf_df[['open', 'high', 'low', 'close', 'volume']] = htf_df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
-    htf_df['dt'] = pd.to_datetime(htf_df['dt'], unit='ms')
-    htf_df.set_index('dt', inplace=True)
-    
-    _, swing_points, trend, _, _, _, _ = detect_swing_points_and_trend(htf_df.copy(), htf_swing_window)
-    return trend
 
-def get_fib_retracement(p1, p2, trend, atr_multiplier=1.0):
+    last_high = swing_highs[-1][1]
+    prev_high = swing_highs[-2][1]
+    last_low = swing_lows[-1][1]
+    prev_low = swing_lows[-2][1]
+
+    if last_high > prev_high and last_low > prev_low:
+        return "uptrend"
+    elif last_high < prev_high and last_low < prev_low:
+        return "downtrend"
+    else:
+        return "undetermined"
+
+def get_fib_retracement(p1, p2, trend):
     """
-    Calculate Fibonacci retracement levels, with a zone width scaled by ATR.
+    Calculate Fibonacci retracement levels.
     """
     price_range = abs(p1 - p2)
-    
-    # ATR can scale the zone. A multiplier > 1 widens the zone, < 1 tightens it.
-    # We cap the multiplier to avoid extreme zones.
-    atr_multiplier = max(0.5, min(1.5, atr_multiplier)) 
-    
-    level1 = 0.5
-    level2 = 0.618
-    
-    # Adjust levels based on ATR
-    center = (level1 + level2) / 2
-    half_width = ((level2 - level1) / 2) * atr_multiplier
-    
-    dynamic_level1 = center - half_width
-    dynamic_level2 = center + half_width
 
     if trend == "downtrend":
-        golden_zone_start = p1 - (price_range * dynamic_level1)
-        golden_zone_end = p1 - (price_range * dynamic_level2)
+        golden_zone_start = p1 - (price_range * 0.5)
+        golden_zone_end = p1 - (price_range * 0.618)
     else: # Uptrend
-        golden_zone_start = p1 + (price_range * dynamic_level1)
-        golden_zone_end = p1 + (price_range * dynamic_level2)
+        golden_zone_start = p1 + (price_range * 0.5)
+        golden_zone_end = p1 + (price_range * 0.618)
 
     entry_price = (golden_zone_start + golden_zone_end) / 2
 
     return entry_price
 
-def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_price, leverage, risk_amount_usd=0, use_fixed_risk_amount=False, confluence_score=1):
+def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_price, leverage, risk_amount_usd=0, use_fixed_risk_amount=False):
     """
-    Calculate the order quantity based on risk, leverage, and a confluence score.
+    Calculate the order quantity based on risk and leverage.
     """
     try:
         # Get account balance
         account_info = client.futures_account()
         balance = float(account_info['totalWalletBalance'])
-
-        # --- Dynamic Risk based on Confluence Score ---
-        base_risk = 0.5  # Base risk for a signal with minimum confluence
-        risk_step = 0.25 # Additional risk per point of confluence
-        max_risk = 2.0   # Maximum risk allowed
-        
-        dynamic_risk_per_trade = min(base_risk + (confluence_score - 1) * risk_step, max_risk)
-        print(f"  - Confluence Score: {confluence_score} -> Dynamic Risk: {dynamic_risk_per_trade:.2f}%")
-        # --------------------------------------------
 
         # Calculate the maximum position size allowed by leverage
         max_position_size = balance * leverage
@@ -338,7 +267,7 @@ def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_pric
         if use_fixed_risk_amount:
             risk_amount = risk_amount_usd
         else:
-            risk_amount = balance * (dynamic_risk_per_trade / 100)
+            risk_amount = balance * (risk_per_trade / 100)
         sl_percentage = abs(entry_price - sl_price) / entry_price
         if sl_percentage == 0:
             return 0
@@ -613,19 +542,6 @@ def generate_summary_report(backtest_trades, metrics, strategy_analysis, config,
         win_rate = (data['wins'] / data['total']) * 100 if data['total'] > 0 else 0
         trend_table.append([trend.capitalize(), data['wins'], data['losses'], f"{win_rate:.2f}%"])
     report += tabulate(trend_table, headers="firstrow", tablefmt="grid")
-    report += "\n\n"
-
-    report += "Confluence Score Performance:\n"
-    winning_scores = [t.confluence_score for t in backtest_trades if t.status == 'win']
-    losing_scores = [t.confluence_score for t in backtest_trades if t.status == 'loss']
-    avg_win_score = np.mean(winning_scores) if winning_scores else 0
-    avg_loss_score = np.mean(losing_scores) if losing_scores else 0
-    score_table = [
-        ["Average Score (Wins)", f"{avg_win_score:.2f}"],
-        ["Average Score (Losses)", f"{avg_loss_score:.2f}"]
-    ]
-    report += tabulate(score_table, headers=["Metric", "Value"], tablefmt="grid")
-
 
     with open("backtest/backtest_summary.txt", "w") as f:
         f.write(report)
@@ -705,7 +621,7 @@ Trade Log:
 ----------
 """
     for trade in backtest_trades:
-        report += f"Timestamp: {datetime.datetime.fromtimestamp(trade.entry_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')}, Symbol: {trade.symbol}, Side: {trade.side}, Entry: {trade.entry_price:.8f}, Exit: {trade.exit_price:.8f}, Status: {trade.status}, PnL: ${trade.pnl_usd:,.2f} ({trade.pnl_pct:.2f}%), Score: {trade.confluence_score}\n"
+        report += f"Timestamp: {datetime.datetime.fromtimestamp(trade.entry_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')}, Symbol: {trade.symbol}, Side: {trade.side}, Entry: {trade.entry_price:.8f}, Exit: {trade.exit_price:.8f}, Status: {trade.status}, PnL: ${trade.pnl_usd:,.2f} ({trade.pnl_pct:.2f}%), Drawdown: {trade.drawdown:.2f}%\n"
         if trade.ml_prediction is not None:
             prediction_map = {0: "Loss", 1: "TP1 Win", 2: "TP2 Win"}
             ml_info = f"    ML Prediction: {prediction_map.get(trade.ml_prediction, 'Unknown')} (Conf: {trade.ml_confidence:.1%})\n"
@@ -730,8 +646,18 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
     """
     print("Starting backtest...")
 
-    # The ML model is now loaded in the main function, so this is not needed here.
-    loaded_ml_model = ml_model
+    # Load the ML model
+    try:
+        model_data = joblib.load('models/trading_model.joblib')
+        loaded_ml_model = model_data['model']
+        ml_feature_columns = model_data['feature_columns']
+        print("ML model loaded for backtesting.")
+    except FileNotFoundError:
+        print("ML model not found. Backtest will run without ML filtering.")
+        ml_model = None
+    except Exception as e:
+        print(f"Error loading ML model: {e}. Backtest will run without ML filtering.")
+        ml_model = None
 
     end_date = datetime.datetime.now(pytz.utc)
     start_date = end_date - datetime.timedelta(days=days_to_backtest)
@@ -759,19 +685,12 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
         klines = all_klines[symbol]
         for i in range(config['lookback_candles'], len(klines)):
             current_klines = klines[i-config['lookback_candles']:i]
-            
-            klines_df = pd.DataFrame(current_klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-            klines_df[['open', 'high', 'low', 'close', 'volume']] = klines_df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
-            klines_df['dt'] = pd.to_datetime(klines_df['dt'], unit='ms')
-            klines_df.set_index('dt', inplace=True)
-
-            _, swing_points, trend, _, _, _, _ = detect_swing_points_and_trend(klines_df.copy(), config['swing_window'])
-            swing_highs = [p for p in swing_points if p['type'] in ['HH', 'LH']]
-            swing_lows = [p for p in swing_points if p['type'] in ['LL', 'HL']]
+            swing_highs, swing_lows = get_swing_points(current_klines, config['swing_window'])
+            trend = get_trend(swing_highs, swing_lows)
 
             if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                last_swing_high = swing_highs[-1]['price']
-                last_swing_low = swing_lows[-1]['price']
+                last_swing_high = swing_highs[-1][1]
+                last_swing_low = swing_lows[-1][1]
                 entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
                 sl = last_swing_high
                 tp1 = entry_price - (sl - entry_price)
@@ -784,23 +703,14 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                         'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                         'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'short'
                     }
-                    features = generate_live_features(current_klines, ml_feature_columns)
-                    if features is not None:
-                        pred_prob = loaded_ml_model.predict(features)[0][0]
-                        if pred_prob < config.get('model_confidence_threshold', 0.0):
-                            continue
-                        ml_prediction, ml_confidence = (1, pred_prob)
-                    else:
-                        ml_prediction, ml_confidence = (None, None)
+                    ml_prediction, ml_confidence = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, loaded_ml_model, ml_feature_columns)
+                    if ml_prediction == 0 or (ml_confidence is not None and ml_confidence < config.get('model_confidence_threshold', 0.0)): # Apply threshold if configured for backtest
+                        continue
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) > entry_price:
-                    is_valid, confluence_score = analyze_trade_signal(current_klines, trend, swing_points, entry_price)
-                    if not is_valid:
-                        continue
-                    
                     entry_timestamp = current_klines[-1][0]
-                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'], confluence_score=confluence_score)
+                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'])
                     if quantity is None or quantity == 0:
                         continue
 
@@ -848,17 +758,17 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                         drawdown=0, # Simplified for now
                         reason_for_entry=f"Fib retracement in downtrend",
                         reason_for_exit=reason_for_exit,
-                        fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0], # Simplified for now
-                        ml_prediction=ml_prediction,
-                        ml_confidence=ml_confidence,
-                        confluence_score=confluence_score)
+                        fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0] # Simplified for now
+ ,
+ ml_prediction=ml_prediction,
+ ml_confidence=ml_confidence)
                     trade.balance = balance
                     backtest_trades.append(trade)
                     i += (j - i) # Move to the next candle after the trade is closed
 
             elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                last_swing_high = swing_highs[-1]['price']
-                last_swing_low = swing_lows[-1]['price']
+                last_swing_high = swing_highs[-1][1]
+                last_swing_low = swing_lows[-1][1]
                 entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
                 sl = last_swing_low
                 tp1 = entry_price + (entry_price - last_swing_low)
@@ -871,23 +781,16 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                         'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                         'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'long'
                     }
-                    features = generate_live_features(current_klines, ml_feature_columns)
-                    if features is not None:
-                        pred_prob = loaded_ml_model.predict(features)[0][0]
-                        if pred_prob < config.get('model_confidence_threshold', 0.0):
-                            continue
-                        ml_prediction, ml_confidence = (1, pred_prob)
-                    else:
-                        ml_prediction, ml_confidence = (None, None)
+                    ml_prediction, ml_confidence = get_model_prediction(
+                        [dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines],
+                        setup_info, loaded_ml_model, ml_feature_columns)
+                    if ml_prediction == 0 or (ml_confidence is not None and ml_confidence < config.get('model_confidence_threshold', 0.0)): # Apply threshold if configured for backtest
+                        continue
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) < entry_price:
-                    is_valid, confluence_score = analyze_trade_signal(current_klines, trend, swing_points, entry_price)
-                    if not is_valid:
-                        continue
-                    
                     entry_timestamp = current_klines[-1][0]
-                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'], confluence_score=confluence_score)
+                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'])
                     if quantity is None or quantity == 0:
                         continue
 
@@ -935,10 +838,10 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                         drawdown=0, # Simplified for now
                         reason_for_entry=f"Fib retracement in uptrend",
                         reason_for_exit=reason_for_exit,
-                        fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0], # Simplified for now
-                        ml_prediction=ml_prediction,
-                        ml_confidence=ml_confidence,
-                        confluence_score=confluence_score)
+                        fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0] # Simplified for now
+ ,
+ ml_prediction=ml_prediction,
+ ml_confidence=ml_confidence)
                     trade.balance = balance
                     backtest_trades.append(trade)
                     i += (j - i) # Move to the next candle after the trade is closed
@@ -952,40 +855,7 @@ def update_trade_report(trades, backtest_mode=False):
     """
     if not backtest_mode:
         with open('trades.json', 'w') as f:
-            json.dump(trades, f, indent=4, default=lambda o: o.__dict__ if hasattr(o, '__dict__') else str(o))
-
-def generate_live_report(trades):
-    """
-    Generate a live report of the bot's status and trades.
-    """
-    report = "Live Bot Status Report\n"
-    report += "======================\n\n"
-    report += f"Report generated at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-    report += f"Developer mode: {'On' if developer_mode else 'Off'}\n"
-    report += f"Number of active trades: {len([t for t in trades if t['status'] in ['running', 'tp1_hit']])}\n"
-    report += f"Number of pending trades: {len([t for t in trades if t['status'] == 'pending'])}\n\n"
-
-    report += "Active Trades:\n"
-    report += "--------------\n"
-    active_trades = [t for t in trades if t['status'] in ['running', 'tp1_hit']]
-    if not active_trades:
-        report += "No active trades.\n"
-    else:
-        for trade in active_trades:
-            report += f"  - Symbol: {trade['symbol']}, Side: {trade['side']}, Entry: {trade['entry_price']:.8f}, Status: {trade['status']}\n"
-    
-    report += "\nPending Trades:\n"
-    report += "---------------\n"
-    pending_trades = [t for t in trades if t['status'] == 'pending']
-    if not pending_trades:
-        report += "No pending trades.\n"
-    else:
-        for trade in pending_trades:
-            report += f"  - Symbol: {trade['symbol']}, Side: {trade['side']}, Entry: {trade['entry_price']:.8f}\n"
-
-    with open("live_report.txt", "w") as f:
-        f.write(report)
-    print("Live report generated: live_report.txt")
+            json.dump(trades, f, indent=4, default=lambda o: o.__dict__ if hasattr(o, '__dict__') else o)
 
 async def place_new_order(client, symbol_info, side, order_type, quantity, price=None, stop_price=None, reduce_only=None, position_side=None, is_closing_order=False):
     symbol = symbol_info['symbol']
@@ -1057,27 +927,6 @@ async def send_telegram_alert(bot, message):
         await bot.send_message(chat_id=keys.telegram_chat_id, text=message)
     except Exception as e:
         logging.error(f"Failed to send Telegram alert: {e}")
-
-async def send_developer_message(bot, chat_id, symbol, status, reason, details=None):
-    """
-    Send a detailed developer message to Telegram, if developer_mode is True.
-    """
-    if not developer_mode:
-        return
-
-    message = f"**Developer Info for {symbol}**\n"
-    message += f"Status: **{status}**\n"
-    message += f"Reason: {reason}\n"
-
-    if details:
-        message += "**Details:**\n"
-        for key, value in details.items():
-            message += f"  - {key}: {value}\n"
-
-    try:
-        await bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
-    except Exception as e:
-        print(f"Error sending developer message: {e}")
 
 async def send_start_message(bot, backtest_mode=False, current_session=None):
     if backtest_mode:
@@ -1154,20 +1003,12 @@ async def op_command(update, context):
         symbol = trade['symbol']
         klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=chart_image_candles)
         if klines:
-            klines_df = pd.DataFrame(klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-            klines_df[['open', 'high', 'low', 'close', 'volume']] = klines_df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
-            klines_df['dt'] = pd.to_datetime(klines_df['dt'], unit='ms')
-            klines_df.set_index('dt', inplace=True)
-
-            _, swing_points, _, _, _, _, _ = detect_swing_points_and_trend(klines_df.copy(), 5)
-            swing_highs = [p['price'] for p in swing_points if p['type'] in ['HH', 'LH']]
-            swing_lows = [p['price'] for p in swing_points if p['type'] in ['LL', 'HL']]
-
+            swing_highs, swing_lows = get_swing_points(klines, 5)
             if not swing_highs or not swing_lows:
                 continue
 
-            last_swing_high = swing_highs[-1]
-            last_swing_low = swing_lows[-1]
+            last_swing_high = swing_highs[-1][1]
+            last_swing_low = swing_lows[-1][1]
 
             image_buffer = generate_fib_chart(symbol, klines, trade['side'], last_swing_high, last_swing_low, trade['entry_price'], trade['sl'], trade['tp1'], trade['tp2'])
             current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
@@ -1195,7 +1036,7 @@ async def cancel_order(client, symbol, order_id):
         print(error_msg)
         return False, str(e)
 
-async def order_status_monitor(client, application, backtest_mode=False, live_mode=False, symbols_info=None, is_hedge_mode=False, config=None):
+async def order_status_monitor(client, application, backtest_mode=False, live_mode=False, symbols_info=None, is_hedge_mode=False):
     """
     Continuously monitor the status of open and pending trades using order status polling.
     """
@@ -1222,7 +1063,7 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                 pos_side = 'LONG' if trade['side'] == 'long' else 'SHORT' if is_hedge_mode else None
 
                 if trade['status'] == 'pending':
-                    if time.time() * 1000 - trade['entry_time'] > 4 * 60 * 60 * 1000:
+                    if time.time() * 1000 - trade['timestamp'] > 4 * 60 * 60 * 1000:
                         await send_telegram_alert(bot, f"⚠️ TRADE INVALIDATED ⚠️\nSymbol: {symbol}\nSide: {trade['side']}\nReason: Order expired (4 hours)")
                         trade['status'] = 'rejected'
                         if symbol in virtual_orders: del virtual_orders[symbol]
@@ -1349,9 +1190,6 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                         await send_telegram_alert(bot, f"🔒 STOP LOSS UPDATED 🔒\nSymbol: {symbol}\nSide: {trade['side']}\nNew SL: {new_sl:.8f}")
                                     else:
                                         await send_telegram_alert(bot, f"Warning: Failed to update SL for {symbol}. Original SL may be active or filled.")
-                    
-                    # -----------------------
-
 
             with trades_lock:
                 update_trade_report(trades)
@@ -1424,7 +1262,6 @@ def generate_live_features(klines, feature_columns, sequence_length=60):
 
 def log_ml_decision(symbol, side, prediction, confidence, outcome='pending'):
     """Logs the ML model's decision and the trade outcome."""
-    print(f"Logging ML decision for {symbol}...")
     log_file = 'ml_decisions.csv'
     log_entry = {
         'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -1440,11 +1277,11 @@ def log_ml_decision(symbol, side, prediction, confidence, outcome='pending'):
         writer = pd.DataFrame([log_entry])
         writer.to_csv(f, header=not file_exists, index=False)
 
-def start_order_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, config):
+def start_order_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode):
     """Wrapper to run the async order_status_monitor in a separate thread."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(order_status_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, config))
+    loop.run_until_complete(order_status_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode))
 
 
 async def main():
@@ -1478,7 +1315,6 @@ async def main():
         chart_image_candles = int(config['chart_image_candles'])
         max_open_positions = int(config['max_open_positions'])
         model_confidence_threshold = config.get('model_confidence_threshold', 0.7) # Use .get for safe access
-        config['max_trade_duration_candles'] = int(config.get('max_trade_duration_candles', 4))
         print("Configuration loaded.")
     except FileNotFoundError:
         print("Error: configuration.csv not found.")
@@ -1487,30 +1323,20 @@ async def main():
         print(f"Error loading configuration: {e}")
         return
 
-
-
-        # Load the ML model
-    model_path = config.get('model_path', '').strip()
-    print(f"Attempting to load ML model from: {model_path!r}")
-
-    if not os.path.isfile(model_path):
-        print(f"❌ Model file does not exist at: {model_path}")
+    # Load the ML model
+    try:
+        model_path = config.get('model_path', 'full_run_output/model/lstm_trader.keras')
+        ml_model = load_model(model_path)
+        feature_columns_path = os.path.join(os.path.dirname(model_path), "feature_columns.json")
+        with open(feature_columns_path, 'r') as f:
+            ml_feature_columns = json.load(f)
+        print(f"ML model loaded from {model_path}. Signal confidence threshold is {model_confidence_threshold * 100}%.")
+    except FileNotFoundError:
+        print(f"ML model not found at {model_path}. The bot will run with rule-based logic only.")
         ml_model = None
-        ml_feature_columns = None
-    else:
-        try:
-            ml_model = load_model(model_path)
-            print(f"✅ ML model loaded successfully from {model_path}")
-
-            feature_columns_path = os.path.join(os.path.dirname(model_path), "feature_columns.json")
-            with open(feature_columns_path, 'r') as f:
-                ml_feature_columns = json.load(f)
-            print(f"Signal confidence threshold is {model_confidence_threshold * 100:.1f}%.")
-        except Exception as e:
-            print(f"❌ Error loading ML model: {e}")
-            ml_model = None
-            ml_feature_columns = None
-
+    except Exception as e:
+        print(f"Error loading ML model: {e}. The bot will run with rule-based logic only.")
+        ml_model = None
 
     # Load symbols
     try:
@@ -1606,7 +1432,7 @@ async def main():
                 pass
 
     if not backtest_mode:
-        monitor_thread = threading.Thread(target=start_order_monitor, args=(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, config), daemon=True)
+        monitor_thread = threading.Thread(target=start_order_monitor, args=(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode), daemon=True)
         monitor_thread.start()
 
     if backtest_mode:
@@ -1665,42 +1491,6 @@ async def main():
                 print(f"Outside of trading session. Current UTC hour: {current_hour}. Sleeping...")
                 await asyncio.sleep(60)
                 continue
-            
-            # --- Time-Based Stop ---
-            with trades_lock:
-                active_trades = [t for t in trades if t['status'] in ['running', 'tp1_hit']]
-
-            loop = asyncio.get_running_loop()
-            for trade in active_trades:
-                symbol = trade['symbol']
-                symbol_info = symbols_info[symbol]
-                pos_side = 'LONG' if trade['side'] == 'long' else 'SHORT' if is_hedge_mode else None
-                
-                print(f"  - Checking time-based stop for {symbol}...")
-                time_in_trade_ms = time.time() * 1000 - trade['entry_time']
-                candles_in_trade = time_in_trade_ms / (15 * 60 * 1000) # Assuming 15m timeframe
-                max_candles = config['max_trade_duration_candles']
-                print(f"    - Candles in trade: {candles_in_trade:.1f}/{max_candles}")
-                
-                if candles_in_trade > max_candles:
-                    current_price = float((await loop.run_in_executor(None, lambda: client.get_symbol_ticker(symbol=symbol)))['price'])
-                    
-                    if trade['side'] == 'long':
-                        current_profit = (current_price - trade['entry_price']) * trade['quantity']
-                    else: # short
-                        current_profit = (trade['entry_price'] - current_price) * trade['quantity']
-
-                    if current_profit >= MINIMUM_PROFIT_USD:
-                        await send_telegram_alert(bot, f"⏰ TIME STOP HIT (PROFITABLE) ⏰\nSymbol: {symbol}\nSide: {trade['side']}\nReason: Trade in profit after {max_candles} candles.")
-                        if live_mode:
-                            close_side = 'SELL' if trade['side'] == 'long' else 'BUY'
-                            await cancel_order(client, symbol, trade['sl_order_id'])
-                            await cancel_order(client, symbol, trade['tp_order_id'])
-                            await place_new_order(client, symbol_info, close_side, 'MARKET', trade['quantity'], reduce_only=True, position_side=pos_side)
-                        
-                        trade['status'] = 'time_stop_profit'
-                        if symbol in virtual_orders: del virtual_orders[symbol]
-            # --- End of Time-Based Stop ---
 
             for symbol in symbols:
                 try:
@@ -1714,47 +1504,21 @@ async def main():
                             continue
 
                     print(f"Scanning {symbol}...")
-                    # --- Multi-Timeframe Analysis ---
-                    htf_bias = get_higher_timeframe_bias(client, symbol)
-                    print(f"  - Higher Timeframe (4H) Bias for {symbol}: {htf_bias.upper()}")
-                    # --------------------------------
-
                     klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles)
                     if not klines:
                         continue
 
-                    klines_df = pd.DataFrame(klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-                    klines_df[['open', 'high', 'low', 'close', 'volume']] = klines_df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
-                    klines_df['dt'] = pd.to_datetime(klines_df['dt'], unit='ms')
-                    klines_df.set_index('dt', inplace=True)
-
-                    _, swing_points, trend, _, _, _, _ = detect_swing_points_and_trend(klines_df.copy(), swing_window)
-                    swing_highs = [p for p in swing_points if p['type'] in ['HH', 'LH']]
-                    swing_lows = [p for p in swing_points if p['type'] in ['LL', 'HL']]
-                    
-                    print(f"  - Lower Timeframe (15M) Trend for {symbol}: {trend.upper()}")
+                    swing_highs, swing_lows = get_swing_points(klines, swing_window)
+                    trend = get_trend(swing_highs, swing_lows)
 
                     current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-                    if trend == "downtrend" and htf_bias == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                        if time.time() * 1000 - klines_df.index[swing_highs[-1]['index']].timestamp() * 1000 > 4 * 60 * 60 * 1000:
+                    if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+                        if time.time() * 1000 - swing_highs[-1][0] > 4 * 60 * 60 * 1000:
                             continue
-                        last_swing_high = swing_highs[-1]['price']
-                        last_swing_low = swing_lows[-1]['price']
-                        
-                        atr = get_atr(klines)
-                        atr_multiplier = 1.0
-                        if len(atr) > 1:
-                            latest_atr = atr[-1]
-                            baseline_atr = np.mean(atr[-20:-1]) if len(atr) > 20 else np.mean(atr)
-                            atr_multiplier = latest_atr / baseline_atr if baseline_atr > 0 else 1.0
-                        
-                        entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend, atr_multiplier)
+                        last_swing_high = swing_highs[-1][1]
+                        last_swing_low = swing_lows[-1][1]
+                        entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
                         if current_price < entry_price:
-                            continue
-
-                        is_valid, confluence_score, reason = analyze_trade_signal(klines, trend, swing_points, entry_price)
-                        if not is_valid:
-                            await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Rejected', reason, {'Confluence Score': confluence_score})
                             continue
 
                         sl = last_swing_high
@@ -1768,19 +1532,18 @@ async def main():
                                 pred_prob = ml_model.predict(features)[0][0]
                                 if pred_prob < model_confidence_threshold:
                                     log_ml_decision(symbol, 'short', 0, pred_prob, 'rejected')
-                                    await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Rejected', 'ML Model rejected trade', {'Confidence': f"{pred_prob:.2f}", 'Threshold': model_confidence_threshold})
+                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Short\nReason: Confidence {pred_prob:.2f} < {model_confidence_threshold:.2f}")
                                     rejected_symbols[symbol] = time.time()
                                     continue
                                 else:
                                     log_ml_decision(symbol, 'short', 1, pred_prob)
                                     print(f"  - ML Model ACCEPTED signal for {symbol} Short with confidence {pred_prob:.2f}")
-                                    confluence_score += 1 # Add score for ML model acceptance
                             else:
                                 print(f"Could not generate features for {symbol}. Skipping ML check.")
                         # -------------------------- # ML Model Integration End
                         
                         symbol_info = symbols_info[symbol]
-                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount, confluence_score)
+                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
                         if quantity is None or quantity == 0:
                             continue
                         
@@ -1788,15 +1551,13 @@ async def main():
                         ml_info = f"🧠 ML Prediction: Win (Conf: {pred_prob:.1%})"
                         
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                        await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Accepted', 'All conditions met', {'Confluence Score': confluence_score, 'ML Confidence': pred_prob})
                         caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
                                    f"Symbol: {symbol}\nSide: Short\nLeverage: {leverage}x\n"
-                                   f"HTF Bias: {htf_bias.upper()}\n"
                                    f"Risk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\n"
                                    f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
                         await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
-                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'entry_time': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
+                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
                                      'ml_prediction': pred_label,
                                      'ml_confidence': pred_prob
                                      }
@@ -1806,26 +1567,13 @@ async def main():
                         virtual_orders[symbol] = new_trade
                         update_trade_report(trades)
 
-                    elif trend == "uptrend" and htf_bias == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                        if time.time() * 1000 - klines_df.index[swing_lows[-1]['index']].timestamp() * 1000 > 4 * 60 * 60 * 1000:
+                    elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+                        if time.time() * 1000 - swing_lows[-1][0] > 4 * 60 * 60 * 1000:
                             continue
-                        last_swing_high = swing_highs[-1]['price']
-                        last_swing_low = swing_lows[-1]['price']
-
-                        atr = get_atr(klines)
-                        atr_multiplier = 1.0
-                        if len(atr) > 1:
-                            latest_atr = atr[-1]
-                            baseline_atr = np.mean(atr[-20:-1]) if len(atr) > 20 else np.mean(atr)
-                            atr_multiplier = latest_atr / baseline_atr if baseline_atr > 0 else 1.0
-                        
-                        entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend, atr_multiplier)
+                        last_swing_high = swing_highs[-1][1]
+                        last_swing_low = swing_lows[-1][1]
+                        entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
                         if current_price > entry_price:
-                            continue
-
-                        is_valid, confluence_score, reason = analyze_trade_signal(klines, trend, swing_points, entry_price)
-                        if not is_valid:
-                            await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Rejected', reason, {'Confluence Score': confluence_score})
                             continue
 
                         sl = last_swing_low
@@ -1839,35 +1587,32 @@ async def main():
                                 pred_prob = ml_model.predict(features)[0][0]
                                 if pred_prob < model_confidence_threshold:
                                     log_ml_decision(symbol, 'long', 0, pred_prob, 'rejected')
-                                    await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Rejected', 'ML Model rejected trade', {'Confidence': f"{pred_prob:.2f}", 'Threshold': model_confidence_threshold})
+                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Long\nReason: Confidence {pred_prob:.2f} < {model_confidence_threshold:.2f}")
                                     rejected_symbols[symbol] = time.time()
                                     continue
                                 else:
                                     log_ml_decision(symbol, 'long', 1, pred_prob)
                                     print(f"  - ML Model ACCEPTED signal for {symbol} Long with confidence {pred_prob:.2f}")
-                                    confluence_score += 1
                             else:
                                 print(f"Could not generate features for {symbol}. Skipping ML check.")
                         # -------------------------- # ML Model Integration End
                         
                         symbol_info = symbols_info[symbol]
-                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount, confluence_score)
+                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
                         if quantity is None or quantity == 0:
                             continue
-                        
+
                         pred_label = 1 if pred_prob > 0.5 else 0
                         ml_info = f"🧠 ML Prediction: Win (Conf: {pred_prob:.1%})"
 
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                        await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Accepted', 'All conditions met', {'Confluence Score': confluence_score, 'ML Confidence': pred_prob})
                         caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
                                    f"Symbol: {symbol}\nSide: Long\nLeverage: {leverage}x\n"
-                                   f"HTF Bias: {htf_bias.upper()}\n"
                                    f"Risk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\n"
                                    f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
                         await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
-                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'entry_time': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
+                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
                                      'ml_prediction': pred_label,
                                      'ml_confidence': pred_prob
                                      }
@@ -1876,17 +1621,11 @@ async def main():
                         virtual_orders[symbol] = new_trade
                         update_trade_report(trades)
                 except Exception as e:
-                    await send_developer_message(bot, keys.telegram_chat_id, symbol, 'Rejected', 'Exception occurred', {'Exception': str(e)})
                     print(f"Error scanning {symbol}: {e}")
                     rejected_symbols[symbol] = time.time()
-
-            # Generate live report
-            with trades_lock:
-                generate_live_report(trades)
 
             print("Scan cycle complete. Cooling down for 2 minutes...")
             await asyncio.sleep(120)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
