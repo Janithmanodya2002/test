@@ -853,7 +853,7 @@ def update_trade_report(trades, backtest_mode=False):
     """
     if not backtest_mode:
         with open('trades.json', 'w') as f:
-            json.dump(trades, f, indent=4, default=lambda o: o.__dict__ if hasattr(o, '__dict__') else o)
+            json.dump(trades, f, indent=4, default=lambda o: o.__dict__ if hasattr(o, '__dict__') else str(o))
 
 async def place_new_order(client, symbol_info, side, order_type, quantity, price=None, stop_price=None, reduce_only=None, position_side=None, is_closing_order=False):
     symbol = symbol_info['symbol']
