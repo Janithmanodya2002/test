@@ -8,7 +8,7 @@ from binance.client import Client
 import keys
 import asyncio
 import telegram
-from telegram.ext import ApplicationBuilder, CommandHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, JobQueue
 import numpy as np
 import json
 import pytz
@@ -23,7 +23,7 @@ import requests
 import logging
 from binance.exceptions import BinanceAPIException
 import ML
-from tensorflow.keras.models import load_model
+from keras.models import load_model
 from pandas_ta import rsi, macd, bbands
 try:
     import mplfinance as mpf
@@ -250,14 +250,18 @@ def get_fib_retracement(p1, p2, trend):
 
     return entry_price
 
-def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_price, leverage, risk_amount_usd=0, use_fixed_risk_amount=False):
+def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_price, leverage, risk_amount_usd=0, use_fixed_risk_amount=False, backtest_balance=None):
     """
     Calculate the order quantity based on risk and leverage.
+    If backtest_balance is provided, it will be used instead of fetching the live account balance.
     """
     try:
-        # Get account balance
-        account_info = client.futures_account()
-        balance = float(account_info['totalWalletBalance'])
+        if backtest_balance is not None:
+            balance = backtest_balance
+        else:
+            # Get account balance for live trading
+            account_info = client.futures_account()
+            balance = float(account_info['totalWalletBalance'])
 
         # Calculate the maximum position size allowed by leverage
         max_position_size = balance * leverage
@@ -640,24 +644,38 @@ Trade Log:
     generate_json_report(backtest_trades, metrics, strategy_analysis)
     generate_summary_report(backtest_trades, metrics, strategy_analysis, config, starting_balance)
 
-def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
+def get_model_prediction(klines, model, feature_columns):
+    """
+    Generates features for a given set of klines and returns a model prediction.
+    """
+    features = generate_live_features(klines, feature_columns)
+    
+    if features is None:
+        # Not enough data to generate features
+        return None, None
+
+    try:
+        # Get the prediction probability from the model
+        confidence = model.predict(features)[0][0]
+        # Convert probability to a binary prediction (0 for loss, 1 for win)
+        prediction = 1 if confidence > 0.5 else 0
+        return prediction, confidence
+    except Exception as e:
+        print(f"Error during model prediction: {e}")
+        return None, None
+
+def run_backtest(client, symbols, days_to_backtest, config, symbols_info, loaded_ml_model=None, ml_feature_columns=None):
     """
     Run the backtesting simulation and generate data for the ML model.
     """
     print("Starting backtest...")
 
-    # Load the ML model
-    try:
-        model_data = joblib.load('models/trading_model.joblib')
-        loaded_ml_model = model_data['model']
-        ml_feature_columns = model_data['feature_columns']
-        print("ML model loaded for backtesting.")
-    except FileNotFoundError:
+    # The ML model is now passed in as an argument.
+    if loaded_ml_model and ml_feature_columns:
+        print("ML model and feature columns loaded for backtesting.")
+    else:
         print("ML model not found. Backtest will run without ML filtering.")
-        ml_model = None
-    except Exception as e:
-        print(f"Error loading ML model: {e}. Backtest will run without ML filtering.")
-        ml_model = None
+        loaded_ml_model = None # Ensure model is None if features are missing
 
     end_date = datetime.datetime.now(pytz.utc)
     start_date = end_date - datetime.timedelta(days=days_to_backtest)
@@ -703,14 +721,14 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                         'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                         'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'short'
                     }
-                    ml_prediction, ml_confidence = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, loaded_ml_model, ml_feature_columns)
+                    ml_prediction, ml_confidence = get_model_prediction(current_klines, loaded_ml_model, ml_feature_columns)
                     if ml_prediction == 0 or (ml_confidence is not None and ml_confidence < config.get('model_confidence_threshold', 0.0)): # Apply threshold if configured for backtest
                         continue
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) > entry_price:
                     entry_timestamp = current_klines[-1][0]
-                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'])
+                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'], backtest_balance=balance)
                     if quantity is None or quantity == 0:
                         continue
 
@@ -781,16 +799,14 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                         'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                         'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'long'
                     }
-                    ml_prediction, ml_confidence = get_model_prediction(
-                        [dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines],
-                        setup_info, loaded_ml_model, ml_feature_columns)
+                    ml_prediction, ml_confidence = get_model_prediction(current_klines, loaded_ml_model, ml_feature_columns)
                     if ml_prediction == 0 or (ml_confidence is not None and ml_confidence < config.get('model_confidence_threshold', 0.0)): # Apply threshold if configured for backtest
                         continue
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) < entry_price:
                     entry_timestamp = current_klines[-1][0]
-                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'])
+                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'], backtest_balance=balance)
                     if quantity is None or quantity == 0:
                         continue
 
@@ -1436,7 +1452,7 @@ async def main():
         monitor_thread.start()
 
     if backtest_mode:
-        backtest_trades = run_backtest(client, symbols, days_to_backtest, config, symbols_info)
+        backtest_trades = run_backtest(client, symbols, days_to_backtest, config, symbols_info, ml_model, ml_feature_columns)
         if backtest_trades:
             metrics = calculate_performance_metrics(backtest_trades, starting_balance)
             strategy_analysis = analyze_strategy_behavior(backtest_trades)
