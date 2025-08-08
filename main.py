@@ -32,6 +32,18 @@ except ImportError:
     exit()
 from tabulate import tabulate
 
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, (np.integer, np.floating)):
+            return float(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        if isinstance(o, datetime.datetime):
+            return o.isoformat()
+        if hasattr(o, '__dict__'):
+            return o.__dict__
+        return super().default(o)
+
 def install_dependencies():
     """
     Installs all required libraries from requirements.txt.
@@ -46,19 +58,23 @@ def install_dependencies():
 
 install_dependencies()
 
-def is_session_valid(client):
+def is_session_valid(client, retries=3, delay=5):
     """
-    Check if the current Binance session is valid.
+    Check if the current Binance session is valid, with retries.
     """
-    try:
-        client.futures_account()
-        return True
-    except BinanceAPIException as e:
-        print(f"Session check failed: {e}")
-        return False
-    except Exception as e:
-        print(f"An unexpected error occurred during session check: {e}")
-        return False
+    for i in range(retries):
+        try:
+            client.futures_account()
+            return True
+        except BinanceAPIException as e:
+            print(f"Session check failed (attempt {i+1}/{retries}): {e}")
+            if i < retries - 1:
+                time.sleep(delay)
+        except Exception as e:
+            print(f"An unexpected error occurred during session check (attempt {i+1}/{retries}): {e}")
+            if i < retries - 1:
+                time.sleep(delay)
+    return False
 
 class TradeResult:
     def __init__(self, symbol, side, entry_price, exit_price, entry_timestamp, exit_timestamp, status, pnl_usd, pnl_pct, drawdown, reason_for_entry, reason_for_exit, fib_levels, ml_prediction=None, ml_confidence=None):
@@ -492,7 +508,7 @@ def generate_json_report(backtest_trades, metrics, strategy_analysis):
         'trades': [{k: v for k, v in vars(t).items() if k != 'balance'} for t in backtest_trades]
     }
     with open('backtest/backtest_report.json', 'w') as f:
-        json.dump(report, f, indent=4)
+        json.dump(report, f, indent=4, cls=CustomJSONEncoder)
     print("Backtest report saved to backtest/backtest_report.json")
 
 def generate_summary_report(backtest_trades, metrics, strategy_analysis, config, starting_balance):
@@ -656,7 +672,7 @@ def get_model_prediction(klines, model, feature_columns):
 
     try:
         # Get the prediction probability from the model
-        confidence = model.predict(features)[0][0]
+        confidence = float(model.predict(features)[0][0])
         # Convert probability to a binary prediction (0 for loss, 1 for win)
         prediction = 1 if confidence > 0.5 else 0
         return prediction, confidence
@@ -871,7 +887,7 @@ def update_trade_report(trades, backtest_mode=False):
     """
     if not backtest_mode:
         with open('trades.json', 'w') as f:
-            json.dump(trades, f, indent=4, default=lambda o: o.__dict__ if hasattr(o, '__dict__') else o)
+            json.dump(trades, f, indent=4, cls=CustomJSONEncoder)
 
 async def place_new_order(client, symbol_info, side, order_type, quantity, price=None, stop_price=None, reduce_only=None, position_side=None, is_closing_order=False):
     symbol = symbol_info['symbol']
@@ -1189,6 +1205,41 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                             continue
 
                     current_price = float((await loop.run_in_executor(None, lambda: client.get_symbol_ticker(symbol=symbol)))['price'])
+                    # New profit-securing SL logic
+                    if trade.get('sl_to_be_updated', False):
+                        if trade['side'] == 'long':
+                            halfway_to_tp1 = trade['entry_price'] + (trade['tp1'] - trade['entry_price']) * 0.5
+                            if current_price >= halfway_to_tp1:
+                                new_sl = trade['entry_price'] + (trade['tp1'] - trade['entry_price']) * 0.2
+                                if new_sl > trade['sl']:
+                                    if live_mode:
+                                        ok, err = await cancel_order(client, symbol, trade['sl_order_id'])
+                                        if ok:
+                                            new_sl_order, sl_err = await place_new_order(client, symbol_info, 'SELL', 'STOP_MARKET', trade['quantity'], stop_price=new_sl, reduce_only=True, position_side=pos_side)
+                                            if not sl_err:
+                                                trade['sl'] = new_sl
+                                                trade['sl_order_id'] = new_sl_order['orderId']
+                                                trade['sl_to_be_updated'] = False
+                                                await send_telegram_alert(bot, f"🔒 PROFIT SECURED 🔒\nSymbol: {symbol}\nSide: Long\nNew SL: {new_sl:.8f}")
+                                            else:
+                                                await send_telegram_alert(bot, f"Warning: Failed to update SL for profit securing on {symbol}. Original SL may be active or filled.")
+                        elif trade['side'] == 'short':
+                            halfway_to_tp1 = trade['entry_price'] - (trade['entry_price'] - trade['tp1']) * 0.5
+                            if current_price <= halfway_to_tp1:
+                                new_sl = trade['entry_price'] - (trade['entry_price'] - trade['tp1']) * 0.2
+                                if new_sl < trade['sl']:
+                                    if live_mode:
+                                        ok, err = await cancel_order(client, symbol, trade['sl_order_id'])
+                                        if ok:
+                                            new_sl_order, sl_err = await place_new_order(client, symbol_info, 'BUY', 'STOP_MARKET', trade['quantity'], stop_price=new_sl, reduce_only=True, position_side=pos_side)
+                                            if not sl_err:
+                                                trade['sl'] = new_sl
+                                                trade['sl_order_id'] = new_sl_order['orderId']
+                                                trade['sl_to_be_updated'] = False
+                                                await send_telegram_alert(bot, f"🔒 PROFIT SECURED 🔒\nSymbol: {symbol}\nSide: Short\nNew SL: {new_sl:.8f}")
+                                            else:
+                                                await send_telegram_alert(bot, f"Warning: Failed to update SL for profit securing on {symbol}. Original SL may be active or filled.")
+
                     if (trade['side'] == 'long' and current_price >= trade['entry_price'] * 1.20) or \
                        (trade['side'] == 'short' and current_price <= trade['entry_price'] * 0.80):
                         new_sl = trade['entry_price']
@@ -1545,7 +1596,7 @@ async def main():
                         if ml_model and ml_feature_columns:
                             features = generate_live_features(klines, ml_feature_columns)
                             if features is not None:
-                                pred_prob = ml_model.predict(features)[0][0]
+                                pred_prob = float(ml_model.predict(features)[0][0])
                                 if pred_prob < model_confidence_threshold:
                                     log_ml_decision(symbol, 'short', 0, pred_prob, 'rejected')
                                     await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Short\nReason: Confidence {pred_prob:.2f} < {model_confidence_threshold:.2f}")
@@ -1575,7 +1626,8 @@ async def main():
 
                         new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
                                      'ml_prediction': pred_label,
-                                     'ml_confidence': pred_prob
+                                     'ml_confidence': pred_prob,
+                                     'sl_to_be_updated': True
                                      }
 
                         with trades_lock:
@@ -1600,7 +1652,7 @@ async def main():
                         if ml_model and ml_feature_columns:
                             features = generate_live_features(klines, ml_feature_columns)
                             if features is not None:
-                                pred_prob = ml_model.predict(features)[0][0]
+                                pred_prob = float(ml_model.predict(features)[0][0])
                                 if pred_prob < model_confidence_threshold:
                                     log_ml_decision(symbol, 'long', 0, pred_prob, 'rejected')
                                     await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Long\nReason: Confidence {pred_prob:.2f} < {model_confidence_threshold:.2f}")
@@ -1630,7 +1682,8 @@ async def main():
 
                         new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
                                      'ml_prediction': pred_label,
-                                     'ml_confidence': pred_prob
+                                     'ml_confidence': pred_prob,
+                                     'sl_to_be_updated': True
                                      }
                         with trades_lock:
                             trades.append(new_trade)
