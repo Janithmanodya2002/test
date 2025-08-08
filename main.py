@@ -726,7 +726,8 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info, loaded
                 last_swing_high = swing_highs[-1][1]
                 last_swing_low = swing_lows[-1][1]
                 entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
-                sl = last_swing_high
+                sl_buffer = last_swing_high * 0.001
+                sl = last_swing_high + sl_buffer
                 tp1 = entry_price - (sl - entry_price)
                 tp2 = entry_price - (sl - entry_price) * 2
 
@@ -804,9 +805,10 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info, loaded
                 last_swing_high = swing_highs[-1][1]
                 last_swing_low = swing_lows[-1][1]
                 entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
-                sl = last_swing_low
-                tp1 = entry_price + (entry_price - last_swing_low)
-                tp2 = entry_price + (entry_price - last_swing_low) * 2
+                sl_buffer = last_swing_low * 0.001
+                sl = last_swing_low - sl_buffer
+                tp1 = entry_price + (entry_price - sl)
+                tp2 = entry_price + (entry_price - sl) * 2
 
                 ml_prediction = None
                 ml_confidence = None
@@ -1588,7 +1590,8 @@ async def main():
                         if current_price < entry_price:
                             continue
 
-                        sl = last_swing_high
+                        sl_buffer = last_swing_high * 0.001
+                        sl = last_swing_high + sl_buffer
                         tp1 = entry_price - (sl - entry_price)
                         tp2 = entry_price - (sl - entry_price) * 2
 
@@ -1644,9 +1647,10 @@ async def main():
                         if current_price > entry_price:
                             continue
 
-                        sl = last_swing_low
-                        tp1 = entry_price + (entry_price - last_swing_low)
-                        tp2 = entry_price + (entry_price - last_swing_low) * 2
+                        sl_buffer = last_swing_low * 0.001
+                        sl = last_swing_low - sl_buffer
+                        tp1 = entry_price + (entry_price - sl)
+                        tp2 = entry_price + (entry_price - sl) * 2
 
                         # --- ML Model Integration ---
                         if ml_model and ml_feature_columns:
