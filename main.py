@@ -25,6 +25,7 @@ from binance.exceptions import BinanceAPIException
 import ML
 from keras.models import load_model
 from pandas_ta import rsi, macd, bbands, ema, psar, atr
+from scipy.signal import find_peaks
 try:
     import mplfinance as mpf
 except ImportError:
@@ -200,6 +201,121 @@ def get_public_ip():
     except requests.exceptions.RequestException as e:
         print(f"Error getting public IP address: {e}")
         return None
+
+def check_for_divergence(klines, lookback=60, rsi_period=14):
+    """
+    Checks for regular RSI divergence over the last `lookback` candles.
+    Returns 'bearish', 'bullish', or 'none'.
+    """
+    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    df['high'] = pd.to_numeric(df['high'])
+    df['low'] = pd.to_numeric(df['low'])
+    df['close'] = pd.to_numeric(df['close'])
+
+    # Calculate RSI
+    rsi_series = rsi(df['close'], length=rsi_period)
+    if rsi_series is None or rsi_series.empty or rsi_series.isnull().all():
+        return 'none'
+    
+    df['rsi'] = rsi_series
+    
+    # We need enough data for lookback
+    if len(df) < lookback:
+        return 'none'
+        
+    df_lookback = df.tail(lookback).copy()
+
+    # Calculate prominence for price peaks
+    price_range = df_lookback['high'].max() - df_lookback['low'].min()
+    price_prominence = price_range * 0.05 # 5% of price range
+
+    # Find price peaks
+    price_peaks_indices, _ = find_peaks(df_lookback['high'], distance=5, prominence=price_prominence)
+
+    # Check for Bearish Divergence
+    if len(price_peaks_indices) >= 2:
+        p_peak1_idx = price_peaks_indices[-2]
+        p_peak2_idx = price_peaks_indices[-1]
+        
+        p_peak1_val = df_lookback['high'].iloc[p_peak1_idx]
+        p_peak2_val = df_lookback['high'].iloc[p_peak2_idx]
+        
+        rsi_at_p_peak1 = df_lookback['rsi'].iloc[p_peak1_idx]
+        rsi_at_p_peak2 = df_lookback['rsi'].iloc[p_peak2_idx]
+        
+        if p_peak2_val > p_peak1_val and rsi_at_p_peak2 < rsi_at_p_peak1:
+            return 'bearish'
+            
+    # Find price troughs
+    price_troughs_indices, _ = find_peaks(-df_lookback['low'], distance=5, prominence=price_prominence)
+
+    # Check for Bullish Divergence
+    if len(price_troughs_indices) >= 2:
+        p_trough1_idx = price_troughs_indices[-2]
+        p_trough2_idx = price_troughs_indices[-1]
+        
+        p_trough1_val = df_lookback['low'].iloc[p_trough1_idx]
+        p_trough2_val = df_lookback['low'].iloc[p_trough2_idx]
+        
+        rsi_at_p_trough1 = df_lookback['rsi'].iloc[p_trough1_idx]
+        rsi_at_p_trough2 = df_lookback['rsi'].iloc[p_trough2_idx]
+        
+        if p_trough2_val < p_trough1_val and rsi_at_p_trough2 > rsi_at_p_trough1:
+            return 'bullish'
+
+    return 'none'
+
+def get_volume_profile(klines, bins=20):
+    """
+    Calculates the Volume Profile for a given set of klines.
+    Returns a pandas Series with IntervalIndex.
+    """
+    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    for col in ['high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col])
+
+    min_price = df['low'].min()
+    max_price = df['high'].max()
+    
+    # Ensure there's a price range to bin
+    if min_price == max_price:
+        return pd.Series(dtype='float64')
+
+    price_bins = np.linspace(min_price, max_price, bins + 1)
+    df['price_bin'] = pd.cut(df['close'], bins=price_bins, right=False)
+    
+    volume_profile = df.groupby('price_bin')['volume'].sum()
+    
+    return volume_profile
+
+def check_for_high_volume_node(volume_profile, entry_price):
+    """
+    Checks if an entry price is inside a High-Volume Node (HVN) bin.
+    HVNs are defined as bins with volume > 1.5 * average volume.
+    POC (Point of Control) is the highest volume node.
+    """
+    if volume_profile is None or volume_profile.empty:
+        return False
+
+    avg_volume = volume_profile.mean()
+    poc_bin = volume_profile.idxmax()
+    
+    # Check if entry is in POC bin
+    if entry_price in poc_bin:
+        return True
+        
+    # Find other HVNs
+    hvns = volume_profile[volume_profile > avg_volume * 1.5]
+    
+    if hvns.empty:
+        return False
+        
+    # Check if entry is in any HVN bin
+    for hvn_bin in hvns.index:
+        if entry_price in hvn_bin:
+            return True
+            
+    return False
 
 def get_swing_points(klines, window=5):
     """
@@ -986,10 +1102,9 @@ async def send_market_analysis_image(bot, image_buffer, caption, backtest_mode=F
             # Fallback to text message
             await bot.send_message(chat_id=chat_id, text=f"Error generating chart. {caption}")
 
-def update_trailing_stop(klines, current_stop_loss, position_type, atr_period, atr_multiplier):
+def update_trailing_stop(klines, position_type, current_stop_loss, atr_multiplier, atr_period=14):
     """
-    Update the trailing stop loss based on ATR and Parabolic SAR.
-    Returns a tuple: (new_stop_loss, should_exit)
+    Calculates the new trailing stop loss based on ATR and checks for a PSAR exit signal.
     """
     df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
     df['high'] = pd.to_numeric(df['high'])
@@ -1002,35 +1117,30 @@ def update_trailing_stop(klines, current_stop_loss, position_type, atr_period, a
         return current_stop_loss, False
     latest_atr = atr_series.iloc[-1]
 
-    # Calculate Parabolic SAR
-    psar_df = psar(df['high'], df['low'], df['close'])
-    if psar_df is None or psar_df.empty or len(psar_df) < 2:
-        return current_stop_loss, False
-    
-    # Extract the main PSAR value column (e.g., 'PSAR_0.02_0.2')
-    psar_col_name = next((col for col in psar_df.columns if 'PSAR' in col), None)
-    if not psar_col_name: return current_stop_loss, False
-    
-    latest_psar = psar_df[psar_col_name].iloc[-1]
-    prev_psar = psar_df[psar_col_name].iloc[-2]
+    # Calculate new ATR-based stop loss
     latest_price = df['close'].iloc[-1]
-    prev_price = df['close'].iloc[-2]
-
-    should_exit = False
     if position_type == 'long':
-        if latest_psar > latest_price and prev_psar < prev_price:
-            should_exit = True
-        atr_stop = latest_price - (atr_multiplier * latest_atr)
-        new_stop_loss = max(current_stop_loss, atr_stop)
+        new_stop = latest_price - (latest_atr * atr_multiplier)
+        trailing_sl = max(current_stop_loss, new_stop)
     elif position_type == 'short':
-        if latest_psar < latest_price and prev_psar > prev_price:
-            should_exit = True
-        atr_stop = latest_price + (atr_multiplier * latest_atr)
-        new_stop_loss = min(current_stop_loss, atr_stop)
+        new_stop = latest_price + (latest_atr * atr_multiplier)
+        trailing_sl = min(current_stop_loss, new_stop)
     else:
-        new_stop_loss = current_stop_loss
+        trailing_sl = current_stop_loss
 
-    return new_stop_loss, should_exit
+    # PSAR Exit Check
+    psar_df = psar(df['high'], df['low'], df['close'])
+    psar_exit = False
+    if psar_df is not None and not psar_df.empty:
+        psar_col_name = next((col for col in psar_df.columns if 'PSAR' in col), None)
+        if psar_col_name:
+            latest_psar = psar_df[psar_col_name].iloc[-1]
+            if position_type == 'long' and latest_psar > latest_price:
+                psar_exit = True
+            elif position_type == 'short' and latest_psar < latest_price:
+                psar_exit = True
+    
+    return trailing_sl, psar_exit
 
 async def op_command(update, context):
     """
@@ -1096,7 +1206,7 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
         try:
             active_trades = []
             with trades_lock:
-                active_trades = [t for t in trades if t['status'] in ['pending', 'running']]
+                active_trades = [t for t in trades if t['status'] in ['pending', 'running', 'tp1_hit']]
 
             if not active_trades:
                 await asyncio.sleep(5)
@@ -1171,13 +1281,11 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                 else:
                                     await send_telegram_alert(bot, f"Warning: Failed to place TP1 for {symbol}. SL is active. Error: {tp_err}")
                             
-                            # No TP2 order needed as the rest will be handled by trailing stop
-
                         trade['status'] = 'running'
                         await send_telegram_alert(bot, f"✅ TRADE TRIGGERED & PROTECTED ✅\nSymbol: {symbol}\nEntry: {trade['entry_price']:.8f}\nSide: {trade['side']}\nSL: {trade['sl']:.8f}\nTP1: {trade['tp1']:.8f}", message_type='signal')
 
-                elif trade['status'] == 'running' or trade['status'] == 'trailing_stop_active':
-                    # Check for SL hit first
+                elif trade['status'] == 'running':
+                    # Check for SL hit
                     sl_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['sl_order_id']))
                     if sl_order['status'] == 'FILLED':
                         await send_telegram_alert(bot, f"🛑 STOP LOSS HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {sl_order['avgPrice']}", message_type='signal')
@@ -1187,13 +1295,13 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                         continue
 
                     # Check for TP1 hit
-                    if trade['status'] == 'running' and trade.get('tp_order_id'):
+                    if trade.get('tp_order_id'):
                         tp_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['tp_order_id']))
                         if tp_order['status'] == 'FILLED':
                             await send_telegram_alert(bot, f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {tp_order['avgPrice']}\nClosing {tp1_close_percentage*100}% of the position.", message_type='signal')
                             await cancel_order(client, symbol, trade['sl_order_id'])
                             
-                            trade['status'] = 'trailing_stop_active'
+                            trade['status'] = 'tp1_hit'
                             trade['sl'] = trade['entry_price'] # Move SL to entry
                             
                             step_size = next((float(f['stepSize']) for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
@@ -1212,36 +1320,45 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                     continue
                                 trade['sl_order_id'] = new_sl_order['orderId']
                             continue
+                
+                elif trade['status'] == 'tp1_hit':
+                    # Check for SL hit
+                    sl_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['sl_order_id']))
+                    if sl_order['status'] == 'FILLED':
+                        await send_telegram_alert(bot, f"🛑 TRAILING STOP HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {sl_order['avgPrice']}", message_type='signal')
+                        trade['status'] = 'trailing_sl_hit'
+                        if symbol in virtual_orders: del virtual_orders[symbol]
+                        continue
+
+                    # Trailing stop logic
+                    klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles_long)
+                    if not klines: continue
                     
-                    if trade['status'] == 'trailing_stop_active':
-                        klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles_long)
-                        if not klines: continue
-                        
-                        new_sl, should_exit = update_trailing_stop(klines, trade['sl'], trade['side'], atr_period, atr_multiplier)
-                        
-                        if should_exit:
-                            await send_telegram_alert(bot, f"🏃 PSAR FLIP EXIT 🏃\nSymbol: {symbol}\nSide: {trade['side']}\nClosing remaining position.", message_type='signal')
-                            if live_mode:
-                                sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
-                                await place_new_order(client, symbol_info, sl_tp_side, 'MARKET', trade['quantity'], reduce_only=True, position_side=pos_side)
-                                await cancel_order(client, symbol, trade['sl_order_id'])
-                            trade['status'] = 'psar_exit'
-                            if symbol in virtual_orders: del virtual_orders[symbol]
-                            continue
-                        
-                        if new_sl > trade['sl'] if trade['side'] == 'long' else new_sl < trade['sl']:
-                            if live_mode:
-                                sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
-                                ok, err = await cancel_order(client, symbol, trade['sl_order_id'])
-                                if ok:
-                                    new_sl_order, sl_err = await place_new_order(client, symbol_info, sl_tp_side, 'STOP_MARKET', trade['quantity'], stop_price=new_sl, reduce_only=True, position_side=pos_side)
-                                    if not sl_err:
-                                        trade['sl'] = new_sl
-                                        trade['sl_order_id'] = new_sl_order['orderId']
-                                        await send_telegram_alert(bot, f"🔒 TRAILING STOP UPDATED 🔒\nSymbol: {symbol}\nSide: {trade['side']}\nNew SL: {new_sl:.8f}", message_type='signal')
-                                    else:
-                                        # Handle failure to place new SL
-                                        await send_telegram_alert(bot, f"Warning: Failed to update trailing SL for {symbol}. Original SL may be active or filled.")
+                    new_sl, should_exit = update_trailing_stop(klines, trade['side'], trade['sl'], atr_multiplier, atr_period)
+                    
+                    if should_exit:
+                        await send_telegram_alert(bot, f"🏃 PSAR FLIP EXIT 🏃\nSymbol: {symbol}\nSide: {trade['side']}\nClosing remaining position.", message_type='signal')
+                        if live_mode:
+                            sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
+                            await place_new_order(client, symbol_info, sl_tp_side, 'MARKET', trade['quantity'], reduce_only=True, position_side=pos_side)
+                            await cancel_order(client, symbol, trade['sl_order_id'])
+                        trade['status'] = 'psar_exit'
+                        if symbol in virtual_orders: del virtual_orders[symbol]
+                        continue
+                    
+                    if (trade['side'] == 'long' and new_sl > trade['sl']) or \
+                       (trade['side'] == 'short' and new_sl < trade['sl']):
+                        if live_mode:
+                            sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
+                            ok, err = await cancel_order(client, symbol, trade['sl_order_id'])
+                            if ok:
+                                new_sl_order, sl_err = await place_new_order(client, symbol_info, sl_tp_side, 'STOP_MARKET', trade['quantity'], stop_price=new_sl, reduce_only=True, position_side=pos_side)
+                                if not sl_err:
+                                    trade['sl'] = new_sl
+                                    trade['sl_order_id'] = new_sl_order['orderId']
+                                    await send_telegram_alert(bot, f"🔒 TRAILING STOP UPDATED 🔒\nSymbol: {symbol}\nSide: {trade['side']}\nNew SL: {new_sl:.8f}", message_type='info')
+                                else:
+                                    await send_telegram_alert(bot, f"Warning: Failed to update trailing SL for {symbol}. Original SL may be active or filled.")
 
             with trades_lock:
                 update_trade_report(trades)
@@ -1606,6 +1723,18 @@ async def main():
                             if current_price < entry_price: continue
                             sl = last_swing_high * 1.001; tp1 = entry_price - (sl - entry_price) * tp1_rr_ratio
 
+                            # Divergence Check
+                            divergence = check_for_divergence(klines_15m)
+                            if divergence == 'bullish':
+                                await send_telegram_alert(bot, f"❌ Signal Rejected by Divergence Check ❌\nSymbol: {symbol}\nSide: Short\nReason: Bullish divergence found.")
+                                continue
+                            
+                            # Volume Profile Check
+                            volume_profile = get_volume_profile(klines_15m)
+                            if not check_for_high_volume_node(volume_profile, entry_price):
+                                await send_telegram_alert(bot, f"❌ Signal Rejected by Volume Profile ❌\nSymbol: {symbol}\nSide: Short\nReason: Entry price not at a high-volume node.")
+                                continue
+
                             if ml_model and ml_feature_columns:
                                 klines_short = klines_15m[-lookback_candles_short:]
                                 features_short = generate_live_features(klines_short, ml_feature_columns)
@@ -1625,7 +1754,7 @@ async def main():
                             if quantity is None or quantity == 0: continue
                             
                             image_buffer = generate_fib_chart(symbol, klines_15m, trend_15m, last_swing_high, last_swing_low, entry_price, sl, tp1, tp1) # Pass tp1 for tp2 placeholder
-                            caption = f"🚀 NEW SIGNAL (ML & EMA) 🚀\n{ml_info}\nSymbol: {symbol}\nSide: Short\nLeverage: {leverage}x\nRisk: {risk_per_trade}%\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nLIMIT ORDER ONLY VALID 4 HOURS"
+                            caption = f"🚀 NEW SIGNAL (ML, EMA, Divergence, Volume) 🚀\n{ml_info}\nSymbol: {symbol}\nSide: Short\nLeverage: {leverage}x\nRisk: {risk_per_trade}%\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nLIMIT ORDER ONLY VALID 4 HOURS"
                             await send_market_analysis_image(bot, image_buffer, caption)
                             new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': None, 'status': 'pending', 'quantity': quantity, 'original_quantity': quantity, 'timestamp': klines_15m[-1][0], 'sl_order_id': None, 'tp_order_id': None, 'ml_prediction': pred_label, 'ml_confidence': pred_prob, 'sl_to_be_updated': True}
                             with trades_lock: trades.append(new_trade)
@@ -1638,6 +1767,18 @@ async def main():
                             entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend_15m)
                             if current_price > entry_price: continue
                             sl = last_swing_low * 0.999; tp1 = entry_price + (entry_price - sl) * tp1_rr_ratio
+
+                            # Divergence Check
+                            divergence = check_for_divergence(klines_15m)
+                            if divergence == 'bearish':
+                                await send_telegram_alert(bot, f"❌ Signal Rejected by Divergence Check ❌\nSymbol: {symbol}\nSide: Long\nReason: Bearish divergence found.")
+                                continue
+
+                            # Volume Profile Check
+                            volume_profile = get_volume_profile(klines_15m)
+                            if not check_for_high_volume_node(volume_profile, entry_price):
+                                await send_telegram_alert(bot, f"❌ Signal Rejected by Volume Profile ❌\nSymbol: {symbol}\nSide: Long\nReason: Entry price not at a high-volume node.")
+                                continue
 
                             if ml_model and ml_feature_columns:
                                 klines_short = klines_15m[-lookback_candles_short:]
@@ -1658,7 +1799,7 @@ async def main():
                             if quantity is None or quantity == 0: continue
                             
                             image_buffer = generate_fib_chart(symbol, klines_15m, trend_15m, last_swing_high, last_swing_low, entry_price, sl, tp1, tp1) # Pass tp1 for tp2 placeholder
-                            caption = f"🚀 NEW SIGNAL (ML & EMA) 🚀\n{ml_info}\nSymbol: {symbol}\nSide: Long\nLeverage: {leverage}x\nRisk: {risk_per_trade}%\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nLIMIT ORDER ONLY VALID 4 HOURS"
+                            caption = f"🚀 NEW SIGNAL (ML, EMA, Divergence, Volume) 🚀\n{ml_info}\nSymbol: {symbol}\nSide: Long\nLeverage: {leverage}x\nRisk: {risk_per_trade}%\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nLIMIT ORDER ONLY VALID 4 HOURS"
                             await send_market_analysis_image(bot, image_buffer, caption)
                             new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': None, 'status': 'pending', 'quantity': quantity, 'original_quantity': quantity, 'timestamp': klines_15m[-1][0], 'sl_order_id': None, 'tp_order_id': None, 'ml_prediction': pred_label, 'ml_confidence': pred_prob, 'sl_to_be_updated': True}
                             with trades_lock: trades.append(new_trade)
