@@ -24,7 +24,7 @@ import logging
 from binance.exceptions import BinanceAPIException
 import ML
 from keras.models import load_model
-from pandas_ta import rsi, macd, bbands
+from pandas_ta import rsi, macd, bbands, ema, psar, atr
 try:
     import mplfinance as mpf
 except ImportError:
@@ -698,17 +698,27 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info, loaded
     end_date = datetime.datetime.now(pytz.utc)
     start_date = end_date - datetime.timedelta(days=days_to_backtest)
 
-    all_klines = {}
+    all_klines_15m = {}
+    all_klines_htf = {}
+    higher_timeframe = config['higher_timeframe']
+
     for symbol in symbols:
-        print(f"Fetching historical data for {symbol}...")
-        klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE,
-                              start_str=start_date.strftime("%Y-%m-%d %H:%M:%S"),
-                              end_str=end_date.strftime("%Y-%m-%d %H:%M:%S"))
-        if klines:
-            all_klines[symbol] = klines
+        print(f"Fetching historical data for {symbol} (15m)...")
+        klines_15m = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE,
+                                start_str=start_date.strftime("%Y-%m-%d %H:%M:%S"),
+                                end_str=end_date.strftime("%Y-%m-%d %H:%M:%S"))
+        if klines_15m:
+            all_klines_15m[symbol] = klines_15m
+            print(f"Fetching historical data for {symbol} ({higher_timeframe})...")
+            klines_htf = get_klines(client, symbol, interval=higher_timeframe,
+                                    start_str=start_date.strftime("%Y-%m-%d %H:%M:%S"),
+                                    end_str=end_date.strftime("%Y-%m-%d %H:%M:%S"))
+            if klines_htf:
+                all_klines_htf[symbol] = klines_htf
+
             # --- ML Data Generation ---
             print(f"  - Saving data for ML pipeline for {symbol}...")
-            ML.process_and_save_kline_data(klines, symbol)
+            ML.process_and_save_kline_data(klines_15m, symbol)
             # --------------------------
 
     print("Backtest data fetched.")
@@ -716,203 +726,111 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info, loaded
     backtest_trades = []
     balance = config['starting_balance']
 
-    for symbol in all_klines:
+    for symbol in all_klines_15m:
         print(f"Backtesting {symbol}...")
-        klines = all_klines[symbol]
-        for i in range(config['lookback_candles_long'], len(klines)):
-            current_klines = klines[i-config['lookback_candles_long']:i]
-            swing_highs, swing_lows = get_swing_points(current_klines, config['swing_window'])
-            trend = get_trend(swing_highs, swing_lows)
+        klines_15m = all_klines_15m[symbol]
+        klines_htf = all_klines_htf.get(symbol)
+        if not klines_htf:
+            print(f"Skipping {symbol} due to missing higher timeframe data.")
+            continue
 
-            if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                last_swing_high = swing_highs[-1][1]
-                last_swing_low = swing_lows[-1][1]
-                entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
-                sl_buffer = last_swing_high * 0.001
-                sl = last_swing_high + sl_buffer
-                tp1 = entry_price - (sl - entry_price)
-                tp2 = entry_price - (sl - entry_price) * 2
+        i = config['lookback_candles_long']
+        while i < len(klines_15m):
+            current_klines_15m = klines_15m[i-config['lookback_candles_long']:i]
+            swing_highs_15m, swing_lows_15m = get_swing_points(current_klines_15m, config['swing_window'])
+            trend_15m = get_trend(swing_highs_15m, swing_lows_15m)
 
-                if loaded_ml_model:
-                    # Short-term prediction
-                    klines_short = current_klines[-config['lookback_candles_short']:]
-                    _, ml_confidence_short = get_model_prediction(klines_short, loaded_ml_model, ml_feature_columns)
+            current_timestamp = current_klines_15m[-1][0]
+            relevant_klines_htf = [k for k in klines_htf if k[0] <= current_timestamp][-200:]
+            swing_highs_htf, swing_lows_htf = get_swing_points(relevant_klines_htf, config['swing_window'])
+            trend_htf = get_trend(swing_highs_htf, swing_lows_htf)
 
-                    # Long-term prediction
-                    _, ml_confidence_long = get_model_prediction(current_klines, loaded_ml_model, ml_feature_columns)
+            entry_price = 0
+            if trend_15m == trend_htf and trend_15m != "undetermined":
+                df_15m = pd.DataFrame(current_klines_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+                df_15m['close'] = pd.to_numeric(df_15m['close'])
+                ema_series = ema(df_15m['close'], length=config['ema_period'])
+                if ema_series is not None and not ema_series.empty:
+                    ema_value = ema_series.iloc[-1]
+                    current_price = float(current_klines_15m[-1][4])
+                    if ((trend_15m == "downtrend" and current_price < ema_value) or (trend_15m == "uptrend" and current_price > ema_value)):
+                        if trend_15m == "downtrend" and len(swing_highs_15m) > 1 and len(swing_lows_15m) > 1:
+                            last_swing_high, last_swing_low = swing_highs_15m[-1][1], swing_lows_15m[-1][1]
+                            entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend_15m)
+                            if current_price < entry_price: entry_price = 0
+                        elif trend_15m == "uptrend" and len(swing_highs_15m) > 1 and len(swing_lows_15m) > 1:
+                            last_swing_high, last_swing_low = swing_highs_15m[-1][1], swing_lows_15m[-1][1]
+                            entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend_15m)
+                            if current_price > entry_price: entry_price = 0
+            
+            if entry_price > 0:
+                side = trend_15m.replace('trend', '')
+                sl = last_swing_high * 1.001 if side == 'short' else last_swing_low * 0.999
+                tp1 = entry_price - (sl - entry_price) * config['tp1_rr_ratio'] if side == 'short' else entry_price + (entry_price - sl) * config['tp1_rr_ratio']
+                
+                original_quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'], backtest_balance=balance)
+                if original_quantity is None or original_quantity == 0: i += 1; continue
 
-                    if ml_confidence_short is None or ml_confidence_long is None:
-                        continue
-
-                    prediction_short = 1 if ml_confidence_short > 0.5 else 0
-                    prediction_long = 1 if ml_confidence_long > 0.5 else 0
+                # --- SIMULATE THE TRADE ---
+                entry_timestamp = current_klines_15m[-1][0]
+                pnl_part1, pnl_part2 = 0, 0
+                exit_price_part1, exit_price_part2 = 0, 0
+                
+                # Stage 1: Wait for TP1 or SL
+                exit_loop = False
+                for j in range(i, len(klines_15m)):
+                    future_kline = klines_15m[j]
+                    high_price, low_price = float(future_kline[2]), float(future_kline[3])
                     
-                    model_confidence_threshold = config.get('model_confidence_threshold', 0.0)
+                    if (side == 'long' and high_price >= tp1) or (side == 'short' and low_price <= tp1):
+                        # TP1 Hit
+                        close_qty_part1 = original_quantity * config['tp1_close_percentage']
+                        pnl_part1 = (tp1 - entry_price) * close_qty_part1 if side == 'long' else (entry_price - tp1) * close_qty_part1
+                        exit_price_part1 = tp1
+                        
+                        # Stage 2: Trail the remaining position
+                        remaining_qty = original_quantity - close_qty_part1
+                        trailing_sl = entry_price # Move to breakeven
+                        
+                        for k in range(j + 1, len(klines_15m)):
+                            trailing_klines = klines_15m[k-config['lookback_candles_long']:k]
+                            trailing_sl, should_exit = update_trailing_stop(trailing_klines, trailing_sl, side, config['atr_period'], config['atr_multiplier'])
+                            
+                            future_kline_trail = klines_15m[k]
+                            high_trail, low_trail = float(future_kline_trail[2]), float(future_kline_trail[3])
 
-                    if not (prediction_short == 1 and prediction_long == 1 and
-                            ml_confidence_short >= model_confidence_threshold and
-                            ml_confidence_long >= model_confidence_threshold):
-                        continue
-                    
-                    ml_prediction = 1 # Both are 1
-                    ml_confidence = (ml_confidence_short + ml_confidence_long) / 2
-                else:
-                    ml_prediction = None
-                    ml_confidence = None
+                            if should_exit:
+                                exit_price_part2 = float(future_kline_trail[4]) # Exit at close
+                                reason_for_exit = "PSAR Exit"
+                                break
+                            if (side == 'long' and low_trail <= trailing_sl) or (side == 'short' and high_trail >= trailing_sl):
+                                exit_price_part2 = trailing_sl
+                                reason_for_exit = "Trailing SL Hit"
+                                break
+                        
+                        pnl_part2 = (exit_price_part2 - entry_price) * remaining_qty if side == 'long' else (entry_price - exit_price_part2) * remaining_qty
+                        i = k # Move main loop forward
+                        exit_loop = True
+                        break
 
-                # Simulate trade entry
-                if float(current_klines[-1][4]) > entry_price:
-                    entry_timestamp = current_klines[-1][0]
-                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'], backtest_balance=balance)
-                    if quantity is None or quantity == 0:
-                        continue
-
-                    # Simulate trade exit
-                    exit_timestamp = 0
-                    exit_price = 0
-                    status = ''
-                    reason_for_exit = ''
-
-                    for j in range(i, len(klines)):
-                        future_kline = klines[j]
-                        high_price = float(future_kline[2])
-                        low_price = float(future_kline[3])
-
-                        if low_price <= tp1:
-                            exit_price = tp1
-                            status = 'win'
-                            reason_for_exit = 'TP1 Hit'
-                            exit_timestamp = future_kline[0]
-                            break
-                        elif high_price >= sl:
-                            exit_price = sl
-                            status = 'loss'
-                            reason_for_exit = 'SL Hit'
-                            exit_timestamp = future_kline[0]
-                            break
-
-                    if status == '':
-                        continue
-
-                    pnl_usd = (entry_price - exit_price) * quantity if status == 'win' else (entry_price - exit_price) * quantity
-                    pnl_pct = (pnl_usd / (entry_price * quantity)) * 100
-                    balance += pnl_usd
-
-                    trade = TradeResult(
-                        symbol=symbol,
-                        side='short',
-                        entry_price=entry_price,
-                        exit_price=exit_price,
-                        entry_timestamp=entry_timestamp,
-                        exit_timestamp=exit_timestamp,
-                        status=status,
-                        pnl_usd=pnl_usd,
-                        pnl_pct=pnl_pct,
-                        drawdown=0, # Simplified for now
-                        reason_for_entry=f"Fib retracement in downtrend",
-                        reason_for_exit=reason_for_exit,
-                        fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0] # Simplified for now
- ,
- ml_prediction=ml_prediction,
- ml_confidence=ml_confidence)
+                    elif (side == 'long' and low_price <= sl) or (side == 'short' and high_price >= sl):
+                        # SL Hit before TP1
+                        pnl_part1 = (sl - entry_price) * original_quantity if side == 'long' else (entry_price - sl) * original_quantity
+                        exit_price_part1 = sl
+                        reason_for_exit = "SL Hit"
+                        i = j # Move main loop forward
+                        exit_loop = True
+                        break
+                
+                if exit_loop:
+                    total_pnl = pnl_part1 + pnl_part2
+                    avg_exit_price = (exit_price_part1 * (original_quantity * config['tp1_close_percentage']) + exit_price_part2 * (original_quantity * (1-config['tp1_close_percentage']))) / original_quantity if exit_price_part2 > 0 else exit_price_part1
+                    status = 'win' if total_pnl > 0 else 'loss'
+                    balance += total_pnl
+                    trade = TradeResult(symbol=symbol, side=side, entry_price=entry_price, exit_price=avg_exit_price, entry_timestamp=entry_timestamp, exit_timestamp=klines_15m[i][0], status=status, pnl_usd=total_pnl, pnl_pct=(total_pnl / (entry_price * original_quantity)) * 100, drawdown=0, reason_for_entry="MTF Fib", reason_for_exit=reason_for_exit, fib_levels=[], ml_prediction=1, ml_confidence=1)
                     trade.balance = balance
                     backtest_trades.append(trade)
-                    i += (j - i) # Move to the next candle after the trade is closed
-
-            elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                last_swing_high = swing_highs[-1][1]
-                last_swing_low = swing_lows[-1][1]
-                entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
-                sl_buffer = last_swing_low * 0.001
-                sl = last_swing_low - sl_buffer
-                tp1 = entry_price + (entry_price - sl)
-                tp2 = entry_price + (entry_price - sl) * 2
-
-                if loaded_ml_model:
-                    # Short-term prediction
-                    klines_short = current_klines[-config['lookback_candles_short']:]
-                    _, ml_confidence_short = get_model_prediction(klines_short, loaded_ml_model, ml_feature_columns)
-
-                    # Long-term prediction
-                    _, ml_confidence_long = get_model_prediction(current_klines, loaded_ml_model, ml_feature_columns)
-
-                    if ml_confidence_short is None or ml_confidence_long is None:
-                        continue
-
-                    prediction_short = 1 if ml_confidence_short > 0.5 else 0
-                    prediction_long = 1 if ml_confidence_long > 0.5 else 0
-                    
-                    model_confidence_threshold = config.get('model_confidence_threshold', 0.0)
-
-                    if not (prediction_short == 1 and prediction_long == 1 and
-                            ml_confidence_short >= model_confidence_threshold and
-                            ml_confidence_long >= model_confidence_threshold):
-                        continue
-                    
-                    ml_prediction = 1 # Both are 1
-                    ml_confidence = (ml_confidence_short + ml_confidence_long) / 2
-                else:
-                    ml_prediction = None
-                    ml_confidence = None
-
-                # Simulate trade entry
-                if float(current_klines[-1][4]) < entry_price:
-                    entry_timestamp = current_klines[-1][0]
-                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'], backtest_balance=balance)
-                    if quantity is None or quantity == 0:
-                        continue
-
-                    # Simulate trade exit
-                    exit_timestamp = 0
-                    exit_price = 0
-                    status = ''
-                    reason_for_exit = ''
-
-                    for j in range(i, len(klines)):
-                        future_kline = klines[j]
-                        high_price = float(future_kline[2])
-                        low_price = float(future_kline[3])
-
-                        if high_price >= tp1:
-                            exit_price = tp1
-                            status = 'win'
-                            reason_for_exit = 'TP1 Hit'
-                            exit_timestamp = future_kline[0]
-                            break
-                        elif low_price <= sl:
-                            exit_price = sl
-                            status = 'loss'
-                            reason_for_exit = 'SL Hit'
-                            exit_timestamp = future_kline[0]
-                            break
-
-                    if status == '':
-                        continue
-
-                    pnl_usd = (exit_price - entry_price) * quantity if status == 'win' else (exit_price - entry_price) * quantity
-                    pnl_pct = (pnl_usd / (entry_price * quantity)) * 100
-                    balance += pnl_usd
-
-                    trade = TradeResult(
-                        symbol=symbol,
-                        side='long',
-                        entry_price=entry_price,
-                        exit_price=exit_price,
-                        entry_timestamp=entry_timestamp,
-                        exit_timestamp=exit_timestamp,
-                        status=status,
-                        pnl_usd=pnl_usd,
-                        pnl_pct=pnl_pct,
-                        drawdown=0, # Simplified for now
-                        reason_for_entry=f"Fib retracement in uptrend",
-                        reason_for_exit=reason_for_exit,
-                        fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0] # Simplified for now
- ,
- ml_prediction=ml_prediction,
- ml_confidence=ml_confidence)
-                    trade.balance = balance
-                    backtest_trades.append(trade)
-                    i += (j - i) # Move to the next candle after the trade is closed
+            i += 1
 
     print(f"Backtest complete. Found {len(backtest_trades)} potential trades.")
     return backtest_trades
@@ -1068,6 +986,52 @@ async def send_market_analysis_image(bot, image_buffer, caption, backtest_mode=F
             # Fallback to text message
             await bot.send_message(chat_id=chat_id, text=f"Error generating chart. {caption}")
 
+def update_trailing_stop(klines, current_stop_loss, position_type, atr_period, atr_multiplier):
+    """
+    Update the trailing stop loss based on ATR and Parabolic SAR.
+    Returns a tuple: (new_stop_loss, should_exit)
+    """
+    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    df['high'] = pd.to_numeric(df['high'])
+    df['low'] = pd.to_numeric(df['low'])
+    df['close'] = pd.to_numeric(df['close'])
+
+    # Calculate ATR
+    atr_series = atr(df['high'], df['low'], df['close'], length=atr_period)
+    if atr_series is None or atr_series.empty:
+        return current_stop_loss, False
+    latest_atr = atr_series.iloc[-1]
+
+    # Calculate Parabolic SAR
+    psar_df = psar(df['high'], df['low'], df['close'])
+    if psar_df is None or psar_df.empty or len(psar_df) < 2:
+        return current_stop_loss, False
+    
+    # Extract the main PSAR value column (e.g., 'PSAR_0.02_0.2')
+    psar_col_name = next((col for col in psar_df.columns if 'PSAR' in col), None)
+    if not psar_col_name: return current_stop_loss, False
+    
+    latest_psar = psar_df[psar_col_name].iloc[-1]
+    prev_psar = psar_df[psar_col_name].iloc[-2]
+    latest_price = df['close'].iloc[-1]
+    prev_price = df['close'].iloc[-2]
+
+    should_exit = False
+    if position_type == 'long':
+        if latest_psar > latest_price and prev_psar < prev_price:
+            should_exit = True
+        atr_stop = latest_price - (atr_multiplier * latest_atr)
+        new_stop_loss = max(current_stop_loss, atr_stop)
+    elif position_type == 'short':
+        if latest_psar < latest_price and prev_psar > prev_price:
+            should_exit = True
+        atr_stop = latest_price + (atr_multiplier * latest_atr)
+        new_stop_loss = min(current_stop_loss, atr_stop)
+    else:
+        new_stop_loss = current_stop_loss
+
+    return new_stop_loss, should_exit
+
 async def op_command(update, context):
     """
     Send the latest chart for all open trades.
@@ -1118,7 +1082,7 @@ async def cancel_order(client, symbol, order_id):
         print(error_msg)
         return False, str(e)
 
-async def order_status_monitor(client, application, backtest_mode=False, live_mode=False, symbols_info=None, is_hedge_mode=False):
+async def order_status_monitor(client, application, backtest_mode=False, live_mode=False, symbols_info=None, is_hedge_mode=False, tp1_close_percentage=0.5, lookback_candles_long=200, atr_period=14, atr_multiplier=1.5):
     """
     Continuously monitor the status of open and pending trades using order status polling.
     """
@@ -1198,134 +1162,74 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
 
                             step_size = next((float(f['stepSize']) for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
 
-                            qty_tp1 = (trade['quantity'] * 0.5 // step_size) * step_size if step_size else 0
-                            qty_tp2 = trade['quantity'] - qty_tp1
+                            qty_tp1 = (trade['quantity'] * tp1_close_percentage // step_size) * step_size if step_size else 0
 
                             if qty_tp1 > 0:
-                                tp_order, tp_err = await place_new_order(client, symbol_info, sl_tp_side, 'TAKE_PROFIT_MARKET', qty_tp1, stop_price=trade['tp1'], is_closing_order=True, position_side=pos_side)
+                                tp_order, tp_err = await place_new_order(client, symbol_info, sl_tp_side, 'TAKE_PROFIT_MARKET', qty_tp1, stop_price=trade['tp1'], reduce_only=True, position_side=pos_side)
                                 if not tp_err:
                                     trade['tp_order_id'] = tp_order['orderId']
                                 else:
                                     await send_telegram_alert(bot, f"Warning: Failed to place TP1 for {symbol}. SL is active. Error: {tp_err}")
-
-                            if qty_tp2 > 0:
-                                tp2_order, tp2_err = await place_new_order(client, symbol_info, sl_tp_side, 'TAKE_PROFIT_MARKET', qty_tp2, stop_price=trade['tp2'], is_closing_order=True, position_side=pos_side)
-                                if tp2_err:
-                                    await send_telegram_alert(bot, f"Warning: Failed to place TP2 for {symbol}. Error: {tp2_err}")
+                            
+                            # No TP2 order needed as the rest will be handled by trailing stop
 
                         trade['status'] = 'running'
                         await send_telegram_alert(bot, f"✅ TRADE TRIGGERED & PROTECTED ✅\nSymbol: {symbol}\nEntry: {trade['entry_price']:.8f}\nSide: {trade['side']}\nSL: {trade['sl']:.8f}\nTP1: {trade['tp1']:.8f}", message_type='signal')
 
-                elif trade['status'] == 'running':
+                elif trade['status'] == 'running' or trade['status'] == 'trailing_stop_active':
+                    # Check for SL hit first
                     sl_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['sl_order_id']))
                     if sl_order['status'] == 'FILLED':
                         await send_telegram_alert(bot, f"🛑 STOP LOSS HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {sl_order['avgPrice']}", message_type='signal')
-                        await cancel_order(client, symbol, trade['tp_order_id'])
+                        if trade.get('tp_order_id'): await cancel_order(client, symbol, trade['tp_order_id'])
                         trade['status'] = 'sl_hit'
                         if symbol in virtual_orders: del virtual_orders[symbol]
                         continue
 
-                    if trade['tp_order_id']:
+                    # Check for TP1 hit
+                    if trade['status'] == 'running' and trade.get('tp_order_id'):
                         tp_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['tp_order_id']))
                         if tp_order['status'] == 'FILLED':
-                            await send_telegram_alert(bot, f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {tp_order['avgPrice']}\nClosing 50% of the position.", message_type='signal')
+                            await send_telegram_alert(bot, f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {tp_order['avgPrice']}\nClosing {tp1_close_percentage*100}% of the position.", message_type='signal')
                             await cancel_order(client, symbol, trade['sl_order_id'])
-
-                            trade['status'] = 'tp1_hit'
-                            trade['sl'] = trade['entry_price']
-
+                            
+                            trade['status'] = 'trailing_stop_active'
+                            trade['sl'] = trade['entry_price'] # Move SL to entry
+                            
                             step_size = next((float(f['stepSize']) for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-                            remaining_quantity = (trade['quantity'] * 0.5 // step_size) * step_size if step_size else 0
+                            remaining_quantity = (trade['original_quantity'] * (1 - tp1_close_percentage) // step_size) * step_size if step_size else 0
                             trade['quantity'] = remaining_quantity
-
+                            trade['tp_order_id'] = None # TP1 is done
+                            
                             if live_mode and remaining_quantity > 0:
                                 sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
-
                                 new_sl_order, sl_err = await place_new_order(client, symbol_info, sl_tp_side, 'STOP_MARKET', remaining_quantity, stop_price=trade['sl'], reduce_only=True, position_side=pos_side)
                                 if sl_err:
-                                    await send_telegram_alert(bot, f"CRITICAL: Failed to place new SL for {symbol} after TP1. Closing position.")
+                                    await send_telegram_alert(bot, f"CRITICAL: Failed to place new SL at breakeven for {symbol} after TP1. Closing position.")
                                     await place_new_order(client, symbol_info, sl_tp_side, 'MARKET', remaining_quantity, reduce_only=True, position_side=pos_side)
                                     trade['status'] = 'error'
                                     if symbol in virtual_orders: del virtual_orders[symbol]
                                     continue
                                 trade['sl_order_id'] = new_sl_order['orderId']
-
-                                # Placeholder for TP2 logic
-                                trade['tp_order_id'] = None
                             continue
-
-                    current_price = float((await loop.run_in_executor(None, lambda: client.get_symbol_ticker(symbol=symbol)))['price'])
-                    # New profit-securing SL logic
-                    if trade.get('sl_to_be_updated', False):
-                        if trade['side'] == 'long':
-                            halfway_to_tp1 = trade['entry_price'] + (trade['tp1'] - trade['entry_price']) * 0.5
-                            if current_price >= halfway_to_tp1:
-                                new_sl = trade['entry_price'] + (trade['tp1'] - trade['entry_price']) * 0.2
-                                if new_sl > trade['sl']:
-                                    if live_mode:
-                                        ok, err = await cancel_order(client, symbol, trade['sl_order_id'])
-                                        if ok:
-                                            new_sl_order, sl_err = await place_new_order(client, symbol_info, 'SELL', 'STOP_MARKET', trade['quantity'], stop_price=new_sl, reduce_only=True, position_side=pos_side)
-                                            if not sl_err:
-                                                trade['sl'] = new_sl
-                                                trade['sl_order_id'] = new_sl_order['orderId']
-                                                trade['sl_to_be_updated'] = False
-                                                await send_telegram_alert(bot, f"🔒 PROFIT SECURED 🔒\nSymbol: {symbol}\nSide: Long\nNew SL: {new_sl:.8f}", message_type='signal')
-                                            else:
-                                                await send_telegram_alert(bot, f"⚠️ Failed to place new SL for {symbol}. Error: {sl_err}. Checking current status...")
-                                                try:
-                                                    positions = await loop.run_in_executor(None, lambda: client.futures_position_information(symbol=symbol))
-                                                    position_open = any(float(p['positionAmt']) > 0 for p in positions if p['symbol'] == symbol)
-                                                    
-                                                    if not position_open:
-                                                        await send_telegram_alert(bot, f"✅ Position for {symbol} appears to be closed. No further action needed.")
-                                                        trade['status'] = 'closed_during_sl_update'
-                                                    else:
-                                                        old_sl_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['sl_order_id']))
-                                                        if old_sl_order['status'] == 'NEW':
-                                                            await send_telegram_alert(bot, f"Warning: Failed to update SL for {symbol}. The original SL is still active. Please monitor manually.")
-                                                        else:
-                                                            await send_telegram_alert(bot, f"CRITICAL: Failed to update SL for {symbol} and the original SL is NOT active. Position is unprotected! Please intervene manually. Status: {old_sl_order['status']}")
-                                                except Exception as e:
-                                                    await send_telegram_alert(bot, f"CRITICAL: Error while checking status after failed SL update for {symbol}: {e}. Please check manually.")
-                        elif trade['side'] == 'short':
-                            halfway_to_tp1 = trade['entry_price'] - (trade['entry_price'] - trade['tp1']) * 0.5
-                            if current_price <= halfway_to_tp1:
-                                new_sl = trade['entry_price'] - (trade['entry_price'] - trade['tp1']) * 0.2
-                                if new_sl < trade['sl']:
-                                    if live_mode:
-                                        ok, err = await cancel_order(client, symbol, trade['sl_order_id'])
-                                        if ok:
-                                            new_sl_order, sl_err = await place_new_order(client, symbol_info, 'BUY', 'STOP_MARKET', trade['quantity'], stop_price=new_sl, reduce_only=True, position_side=pos_side)
-                                            if not sl_err:
-                                                trade['sl'] = new_sl
-                                                trade['sl_order_id'] = new_sl_order['orderId']
-                                                trade['sl_to_be_updated'] = False
-                                                await send_telegram_alert(bot, f"🔒 PROFIT SECURED 🔒\nSymbol: {symbol}\nSide: Short\nNew SL: {new_sl:.8f}", message_type='signal')
-                                            else:
-                                                await send_telegram_alert(bot, f"⚠️ Failed to place new SL for {symbol}. Error: {sl_err}. Checking current status...")
-                                                try:
-                                                    positions = await loop.run_in_executor(None, lambda: client.futures_position_information(symbol=symbol))
-                                                    position_open = any(float(p['positionAmt']) < 0 for p in positions if p['symbol'] == symbol)
-                                                    
-                                                    if not position_open:
-                                                        await send_telegram_alert(bot, f"✅ Position for {symbol} appears to be closed. No further action needed.")
-                                                        trade['status'] = 'closed_during_sl_update'
-                                                    else:
-                                                        old_sl_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['sl_order_id']))
-                                                        if old_sl_order['status'] == 'NEW':
-                                                            await send_telegram_alert(bot, f"Warning: Failed to update SL for {symbol}. The original SL is still active. Please monitor manually.")
-                                                        else:
-                                                            await send_telegram_alert(bot, f"CRITICAL: Failed to update SL for {symbol} and the original SL is NOT active. Position is unprotected! Please intervene manually. Status: {old_sl_order['status']}")
-                                                except Exception as e:
-                                                    await send_telegram_alert(bot, f"CRITICAL: Error while checking status after failed SL update for {symbol}: {e}. Please check manually.")
-
-                    if (trade['side'] == 'long' and current_price >= trade['entry_price'] * 1.20) or \
-                       (trade['side'] == 'short' and current_price <= trade['entry_price'] * 0.80):
-                        new_sl = trade['entry_price']
-                        if (trade['side'] == 'long' and new_sl > trade['sl']) or \
-                           (trade['side'] == 'short' and new_sl < trade['sl']):
-
+                    
+                    if trade['status'] == 'trailing_stop_active':
+                        klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles_long)
+                        if not klines: continue
+                        
+                        new_sl, should_exit = update_trailing_stop(klines, trade['sl'], trade['side'], atr_period, atr_multiplier)
+                        
+                        if should_exit:
+                            await send_telegram_alert(bot, f"🏃 PSAR FLIP EXIT 🏃\nSymbol: {symbol}\nSide: {trade['side']}\nClosing remaining position.", message_type='signal')
+                            if live_mode:
+                                sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
+                                await place_new_order(client, symbol_info, sl_tp_side, 'MARKET', trade['quantity'], reduce_only=True, position_side=pos_side)
+                                await cancel_order(client, symbol, trade['sl_order_id'])
+                            trade['status'] = 'psar_exit'
+                            if symbol in virtual_orders: del virtual_orders[symbol]
+                            continue
+                        
+                        if new_sl > trade['sl'] if trade['side'] == 'long' else new_sl < trade['sl']:
                             if live_mode:
                                 sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
                                 ok, err = await cancel_order(client, symbol, trade['sl_order_id'])
@@ -1334,9 +1238,10 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                     if not sl_err:
                                         trade['sl'] = new_sl
                                         trade['sl_order_id'] = new_sl_order['orderId']
-                                        await send_telegram_alert(bot, f"🔒 STOP LOSS UPDATED 🔒\nSymbol: {symbol}\nSide: {trade['side']}\nNew SL: {new_sl:.8f}", message_type='signal')
+                                        await send_telegram_alert(bot, f"🔒 TRAILING STOP UPDATED 🔒\nSymbol: {symbol}\nSide: {trade['side']}\nNew SL: {new_sl:.8f}", message_type='signal')
                                     else:
-                                        await send_telegram_alert(bot, f"Warning: Failed to update SL for {symbol}. Original SL may be active or filled.")
+                                        # Handle failure to place new SL
+                                        await send_telegram_alert(bot, f"Warning: Failed to update trailing SL for {symbol}. Original SL may be active or filled.")
 
             with trades_lock:
                 update_trade_report(trades)
@@ -1424,11 +1329,12 @@ def log_ml_decision(symbol, side, prediction, confidence, outcome='pending'):
         writer = pd.DataFrame([log_entry])
         writer.to_csv(f, header=not file_exists, index=False)
 
-def start_order_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode):
+def start_order_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, tp1_close_percentage, lookback_candles_long, atr_period, atr_multiplier):
     """Wrapper to run the async order_status_monitor in a separate thread."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(order_status_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode))
+    monitor_coro = order_status_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, tp1_close_percentage, lookback_candles_long, atr_period, atr_multiplier)
+    loop.run_until_complete(monitor_coro)
 
 
 async def main():
@@ -1459,6 +1365,10 @@ async def main():
         lookback_candles_short = int(config['lookback_candles_short'])
         lookback_candles_long = int(config['lookback_candles_long'])
         swing_window = int(config['swing_window'])
+        higher_timeframe = config['higher_timeframe']
+        ema_period = int(config['ema_period'])
+        tp1_rr_ratio = float(config['tp1_rr_ratio'])
+        tp1_close_percentage = float(config['tp1_close_percentage'])
         starting_balance = int(config['starting_balance'])
         chart_image_candles = int(config['chart_image_candles'])
         max_open_positions = int(config['max_open_positions'])
@@ -1581,7 +1491,10 @@ async def main():
                 pass
 
     if not backtest_mode:
-        monitor_thread = threading.Thread(target=start_order_monitor, args=(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode), daemon=True)
+        monitor_args = (client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, 
+                        config.get('tp1_close_percentage', 0.5), lookback_candles_long, 
+                        config.get('atr_period', 14), config.get('atr_multiplier', 1.5))
+        monitor_thread = threading.Thread(target=start_order_monitor, args=monitor_args, daemon=True)
         monitor_thread.start()
 
     if backtest_mode:
@@ -1653,176 +1566,104 @@ async def main():
                             continue
 
                     print(f"Scanning {symbol}...")
-                    klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles_long)
-                    if not klines:
+                    klines_15m = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles_long)
+                    if not klines_15m:
+                        continue
+                    
+                    klines_htf = get_klines(client, symbol, interval=higher_timeframe, limit=200)
+                    if not klines_htf:
                         continue
 
-                    swing_highs, swing_lows = get_swing_points(klines, swing_window)
-                    trend = get_trend(swing_highs, swing_lows)
+                    # 15m trend
+                    swing_highs_15m, swing_lows_15m = get_swing_points(klines_15m, swing_window)
+                    trend_15m = get_trend(swing_highs_15m, swing_lows_15m)
 
-                    current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-                    if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                        if time.time() * 1000 - swing_highs[-1][0] > 4 * 60 * 60 * 1000:
+                    # Higher timeframe trend
+                    swing_highs_htf, swing_lows_htf = get_swing_points(klines_htf, swing_window)
+                    trend_htf = get_trend(swing_highs_htf, swing_lows_htf)
+
+                    if trend_15m == trend_htf and trend_15m != "undetermined":
+                        print(f"  - Trend confirmed on 15m and {higher_timeframe}: {trend_15m}")
+                        
+                        # EMA Confirmation
+                        df_15m = pd.DataFrame(klines_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+                        df_15m['close'] = pd.to_numeric(df_15m['close'])
+                        ema_series = ema(df_15m['close'], length=ema_period)
+                        if ema_series is None or ema_series.empty: continue
+                        ema_value = ema_series.iloc[-1]
+                        current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+
+                        if not ((trend_15m == "downtrend" and current_price < ema_value) or (trend_15m == "uptrend" and current_price > ema_value)):
+                            await send_telegram_alert(bot, f"❌ Signal Rejected by EMA ❌\nSymbol: {symbol}\nSide: {trend_15m}\nReason: Price {current_price} is not on the correct side of the {ema_period} EMA ({ema_value:.2f}).")
                             continue
-                        last_swing_high = swing_highs[-1][1]
-                        last_swing_low = swing_lows[-1][1]
-                        entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
-                        if current_price < entry_price:
-                            continue
+                        
+                        print(f"  - EMA Confirmed for {symbol}. Price: {current_price}, EMA: {ema_value:.2f}")
 
-                        sl_buffer = last_swing_high * 0.001
-                        sl = last_swing_high + sl_buffer
-                        tp1 = entry_price - (sl - entry_price)
-                        tp2 = entry_price - (sl - entry_price) * 2
+                        if trend_15m == "downtrend" and len(swing_highs_15m) > 1 and len(swing_lows_15m) > 1:
+                            if time.time() * 1000 - swing_highs_15m[-1][0] > 4 * 60 * 60 * 1000: continue
+                            last_swing_high, last_swing_low = swing_highs_15m[-1][1], swing_lows_15m[-1][1]
+                            entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend_15m)
+                            if current_price < entry_price: continue
+                            sl = last_swing_high * 1.001; tp1 = entry_price - (sl - entry_price) * tp1_rr_ratio
 
-                        # --- ML Model Integration ---
-                        if ml_model and ml_feature_columns:
-                            # Short-term prediction
-                            klines_short = klines[-lookback_candles_short:]
-                            features_short = generate_live_features(klines_short, ml_feature_columns)
-                            pred_prob_short = None
-                            if features_short is not None:
-                                pred_prob_short = float(ml_model.predict(features_short)[0][0])
-
-                            # Long-term prediction
-                            features_long = generate_live_features(klines, ml_feature_columns) # klines is already lookback_candles_long
-                            pred_prob_long = None
-                            if features_long is not None:
-                                pred_prob_long = float(ml_model.predict(features_long)[0][0])
-
-                            if pred_prob_short is None or pred_prob_long is None:
-                                print(f"Could not generate features for {symbol}. Skipping ML check.")
-                                continue
-
-                            prediction_short = 1 if pred_prob_short > 0.5 else 0
-                            prediction_long = 1 if pred_prob_long > 0.5 else 0
-
-                            if (prediction_short == 1 and prediction_long == 1 and
-                                pred_prob_short >= model_confidence_threshold and
-                                pred_prob_long >= model_confidence_threshold):
-                                
-                                log_ml_decision(symbol, 'short', 1, (pred_prob_short + pred_prob_long) / 2)
-                                print(f"  - ML Model ACCEPTED signal for {symbol} Short with confidences Short:{pred_prob_short:.2f}, Long:{pred_prob_long:.2f}")
-                                ml_info = f"🧠 ML Prediction: Win (Conf Short: {pred_prob_short:.1%}, Conf Long: {pred_prob_long:.1%})"
-                                pred_prob = (pred_prob_short + pred_prob_long) / 2 # for logging
-                                pred_label = 1
-
+                            if ml_model and ml_feature_columns:
+                                klines_short = klines_15m[-lookback_candles_short:]
+                                features_short = generate_live_features(klines_short, ml_feature_columns)
+                                pred_prob_short = float(ml_model.predict(features_short)[0][0]) if features_short is not None else None
+                                features_long = generate_live_features(klines_15m, ml_feature_columns)
+                                pred_prob_long = float(ml_model.predict(features_long)[0][0]) if features_long is not None else None
+                                if pred_prob_short is None or pred_prob_long is None: print(f"Could not generate features for {symbol}. Skipping ML check."); continue
+                                prediction_short, prediction_long = (1 if p > 0.5 else 0 for p in [pred_prob_short, pred_prob_long])
+                                if not (prediction_short and prediction_long and pred_prob_short >= model_confidence_threshold and pred_prob_long >= model_confidence_threshold):
+                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Short\nReason: Short Pred: {prediction_short} ({pred_prob_short:.2f}), Long Pred: {prediction_long} ({pred_prob_long:.2f})"); continue
+                                ml_info = f"🧠 ML: Win (S:{pred_prob_short:.1%}, L:{pred_prob_long:.1%})"; pred_prob = (pred_prob_short + pred_prob_long) / 2; pred_label = 1
                             else:
-                                log_ml_decision(symbol, 'short', 0, (pred_prob_short + pred_prob_long) / 2, 'rejected')
-                                await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Short\nReason: Short Pred: {prediction_short} ({pred_prob_short:.2f}), Long Pred: {prediction_long} ({pred_prob_long:.2f})")
-                                rejected_symbols[symbol] = time.time()
-                                continue
-                        else:
-                             # Default behavior if no model
-                            ml_info = "🧠 ML Model not in use."
-                            pred_prob = 0.0
-                            pred_label = 0
-                        # -------------------------- # ML Model Integration End
-                        
-                        symbol_info = symbols_info[symbol]
-                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
-                        if quantity is None or quantity == 0:
-                            continue
-                        
-                        image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                        caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
-                                   f"Symbol: {symbol}\nSide: Short\nLeverage: {leverage}x\n"
-                                   f"Risk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\n"
-                                   f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\n\n"
-                                   f"LIMIT ORDER ONLY VALID 4 HOURS")
-                        await send_market_analysis_image(bot, image_buffer, caption)
+                                ml_info, pred_prob, pred_label = "🧠 ML Model not in use.", 0.0, 0
+                            
+                            symbol_info = symbols_info[symbol]
+                            quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
+                            if quantity is None or quantity == 0: continue
+                            
+                            image_buffer = generate_fib_chart(symbol, klines_15m, trend_15m, last_swing_high, last_swing_low, entry_price, sl, tp1, tp1) # Pass tp1 for tp2 placeholder
+                            caption = f"🚀 NEW SIGNAL (ML & EMA) 🚀\n{ml_info}\nSymbol: {symbol}\nSide: Short\nLeverage: {leverage}x\nRisk: {risk_per_trade}%\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nLIMIT ORDER ONLY VALID 4 HOURS"
+                            await send_market_analysis_image(bot, image_buffer, caption)
+                            new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': None, 'status': 'pending', 'quantity': quantity, 'original_quantity': quantity, 'timestamp': klines_15m[-1][0], 'sl_order_id': None, 'tp_order_id': None, 'ml_prediction': pred_label, 'ml_confidence': pred_prob, 'sl_to_be_updated': True}
+                            with trades_lock: trades.append(new_trade)
+                            virtual_orders[symbol] = new_trade
+                            update_trade_report(trades)
 
-                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
-                                     'ml_prediction': pred_label,
-                                     'ml_confidence': pred_prob,
-                                     'sl_to_be_updated': True
-                                     }
+                        elif trend_15m == "uptrend" and len(swing_highs_15m) > 1 and len(swing_lows_15m) > 1:
+                            if time.time() * 1000 - swing_lows_15m[-1][0] > 4 * 60 * 60 * 1000: continue
+                            last_swing_high, last_swing_low = swing_highs_15m[-1][1], swing_lows_15m[-1][1]
+                            entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend_15m)
+                            if current_price > entry_price: continue
+                            sl = last_swing_low * 0.999; tp1 = entry_price + (entry_price - sl) * tp1_rr_ratio
 
-                        with trades_lock:
-                            trades.append(new_trade)
-                        virtual_orders[symbol] = new_trade
-                        update_trade_report(trades)
-
-                    elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                        if time.time() * 1000 - swing_lows[-1][0] > 4 * 60 * 60 * 1000:
-                            continue
-                        last_swing_high = swing_highs[-1][1]
-                        last_swing_low = swing_lows[-1][1]
-                        entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
-                        if current_price > entry_price:
-                            continue
-
-                        sl_buffer = last_swing_low * 0.001
-                        sl = last_swing_low - sl_buffer
-                        tp1 = entry_price + (entry_price - sl)
-                        tp2 = entry_price + (entry_price - sl) * 2
-
-                        # --- ML Model Integration ---
-                        if ml_model and ml_feature_columns:
-                            # Short-term prediction
-                            klines_short = klines[-lookback_candles_short:]
-                            features_short = generate_live_features(klines_short, ml_feature_columns)
-                            pred_prob_short = None
-                            if features_short is not None:
-                                pred_prob_short = float(ml_model.predict(features_short)[0][0])
-
-                            # Long-term prediction
-                            features_long = generate_live_features(klines, ml_feature_columns) # klines is already lookback_candles_long
-                            pred_prob_long = None
-                            if features_long is not None:
-                                pred_prob_long = float(ml_model.predict(features_long)[0][0])
-
-                            if pred_prob_short is None or pred_prob_long is None:
-                                print(f"Could not generate features for {symbol}. Skipping ML check.")
-                                continue
-
-                            prediction_short = 1 if pred_prob_short > 0.5 else 0
-                            prediction_long = 1 if pred_prob_long > 0.5 else 0
-
-                            if (prediction_short == 1 and prediction_long == 1 and
-                                pred_prob_short >= model_confidence_threshold and
-                                pred_prob_long >= model_confidence_threshold):
-                                
-                                log_ml_decision(symbol, 'long', 1, (pred_prob_short + pred_prob_long) / 2)
-                                print(f"  - ML Model ACCEPTED signal for {symbol} Long with confidences Short:{pred_prob_short:.2f}, Long:{pred_prob_long:.2f}")
-                                ml_info = f"🧠 ML Prediction: Win (Conf Short: {pred_prob_short:.1%}, Conf Long: {pred_prob_long:.1%})"
-                                pred_prob = (pred_prob_short + pred_prob_long) / 2 # for logging
-                                pred_label = 1
-
+                            if ml_model and ml_feature_columns:
+                                klines_short = klines_15m[-lookback_candles_short:]
+                                features_short = generate_live_features(klines_short, ml_feature_columns)
+                                pred_prob_short = float(ml_model.predict(features_short)[0][0]) if features_short is not None else None
+                                features_long = generate_live_features(klines_15m, ml_feature_columns)
+                                pred_prob_long = float(ml_model.predict(features_long)[0][0]) if features_long is not None else None
+                                if pred_prob_short is None or pred_prob_long is None: print(f"Could not generate features for {symbol}. Skipping ML check."); continue
+                                prediction_short, prediction_long = (1 if p > 0.5 else 0 for p in [pred_prob_short, pred_prob_long])
+                                if not (prediction_short and prediction_long and pred_prob_short >= model_confidence_threshold and pred_prob_long >= model_confidence_threshold):
+                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Long\nReason: Short Pred: {prediction_short} ({pred_prob_short:.2f}), Long Pred: {prediction_long} ({pred_prob_long:.2f})"); continue
+                                ml_info = f"🧠 ML: Win (S:{pred_prob_short:.1%}, L:{pred_prob_long:.1%})"; pred_prob = (pred_prob_short + pred_prob_long) / 2; pred_label = 1
                             else:
-                                log_ml_decision(symbol, 'long', 0, (pred_prob_short + pred_prob_long) / 2, 'rejected')
-                                await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Long\nReason: Short Pred: {prediction_short} ({pred_prob_short:.2f}), Long Pred: {prediction_long} ({pred_prob_long:.2f})")
-                                rejected_symbols[symbol] = time.time()
-                                continue
-                        else:
-                             # Default behavior if no model
-                            ml_info = "🧠 ML Model not in use."
-                            pred_prob = 0.0
-                            pred_label = 0
-                        # -------------------------- # ML Model Integration End
-                        
-                        symbol_info = symbols_info[symbol]
-                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
-                        if quantity is None or quantity == 0:
-                            continue
-
-                        image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                        caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
-                                   f"Symbol: {symbol}\nSide: Long\nLeverage: {leverage}x\n"
-                                   f"Risk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\n"
-                                   f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\n\n"
-                                   f"LIMIT ORDER ONLY VALID 4 HOURS")
-                        await send_market_analysis_image(bot, image_buffer, caption)
-
-                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
-                                     'ml_prediction': pred_label,
-                                     'ml_confidence': pred_prob,
-                                     'sl_to_be_updated': True
-                                     }
-                        with trades_lock:
-                            trades.append(new_trade)
-                        virtual_orders[symbol] = new_trade
-                        update_trade_report(trades)
+                                ml_info, pred_prob, pred_label = "🧠 ML Model not in use.", 0.0, 0
+                            
+                            symbol_info = symbols_info[symbol]
+                            quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
+                            if quantity is None or quantity == 0: continue
+                            
+                            image_buffer = generate_fib_chart(symbol, klines_15m, trend_15m, last_swing_high, last_swing_low, entry_price, sl, tp1, tp1) # Pass tp1 for tp2 placeholder
+                            caption = f"🚀 NEW SIGNAL (ML & EMA) 🚀\n{ml_info}\nSymbol: {symbol}\nSide: Long\nLeverage: {leverage}x\nRisk: {risk_per_trade}%\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nLIMIT ORDER ONLY VALID 4 HOURS"
+                            await send_market_analysis_image(bot, image_buffer, caption)
+                            new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': None, 'status': 'pending', 'quantity': quantity, 'original_quantity': quantity, 'timestamp': klines_15m[-1][0], 'sl_order_id': None, 'tp_order_id': None, 'ml_prediction': pred_label, 'ml_confidence': pred_prob, 'sl_to_be_updated': True}
+                            with trades_lock: trades.append(new_trade)
+                            virtual_orders[symbol] = new_trade
+                            update_trade_report(trades)
                 except Exception as e:
                     print(f"Error scanning {symbol}: {e}")
                     rejected_symbols[symbol] = time.time()
