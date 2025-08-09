@@ -1639,7 +1639,8 @@ async def main():
                         caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
                                    f"Symbol: {symbol}\nSide: Short\nLeverage: {leverage}x\n"
                                    f"Risk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\n"
-                                   f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
+                                   f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\n\n"
+                                   f"LIMIT ORDER ONLY VALID 4 HOURS")
                         await send_market_analysis_image(bot, image_buffer, caption)
 
                         new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
@@ -1696,7 +1697,8 @@ async def main():
                         caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
                                    f"Symbol: {symbol}\nSide: Long\nLeverage: {leverage}x\n"
                                    f"Risk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\n"
-                                   f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
+                                   f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\n\n"
+                                   f"LIMIT ORDER ONLY VALID 4 HOURS")
                         await send_market_analysis_image(bot, image_buffer, caption)
 
                         new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
