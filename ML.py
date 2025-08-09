@@ -483,29 +483,31 @@ def run_hyperparameter_search(train_dataset, val_dataset, epochs, is_quick_test=
 
     def build_model(hp):
         """Builds the model for hyperparameter tuning."""
-        model = Sequential()
-        model.add(Input(shape=input_shape))
+        inputs = tf.keras.Input(shape=input_shape)
 
         hp_units_1 = hp.Int('units_1', min_value=64, max_value=256, step=64)
-        model.add(Bidirectional(LSTM(units=hp_units_1, return_sequences=True)))
+        x = Bidirectional(LSTM(units=hp_units_1, return_sequences=True))(inputs)
         hp_dropout_1 = hp.Float('dropout_1', min_value=0.1, max_value=0.4, step=0.1)
-        model.add(Dropout(hp_dropout_1))
+        x = Dropout(hp_dropout_1)(x)
 
         hp_units_2 = hp.Int('units_2', min_value=32, max_value=128, step=32)
-        model.add(Bidirectional(LSTM(units=hp_units_2, return_sequences=True)))
+        x = Bidirectional(LSTM(units=hp_units_2, return_sequences=True))(x)
 
         hp_num_heads = hp.Int('num_heads', min_value=2, max_value=8, step=2)
-        model.add(MultiHeadAttention(num_heads=hp_num_heads, key_dim=hp_units_2))
+        # For self-attention, query, value, and key are the same.
+        x = MultiHeadAttention(num_heads=hp_num_heads, key_dim=hp_units_2)(x, x)
         
-        model.add(GlobalAveragePooling1D())
+        x = GlobalAveragePooling1D()(x)
 
         hp_dropout_2 = hp.Float('dropout_2', min_value=0.2, max_value=0.5, step=0.1)
-        model.add(Dropout(hp_dropout_2))
+        x = Dropout(hp_dropout_2)(x)
 
         hp_dense_units = hp.Int('dense_units', min_value=32, max_value=128, step=32)
-        model.add(Dense(units=hp_dense_units, activation='relu'))
+        x = Dense(units=hp_dense_units, activation='relu')(x)
         
-        model.add(Dense(1, activation='sigmoid', dtype='float32'))
+        outputs = Dense(1, activation='sigmoid', dtype='float32')(x)
+
+        model = tf.keras.Model(inputs=inputs, outputs=outputs)
 
         hp_learning_rate = hp.Choice('learning_rate', values=[1e-3, 5e-4, 1e-4])
 
