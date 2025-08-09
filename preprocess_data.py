@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 
 # --- Configuration ---
 SYMBOLS = pd.read_csv('symbols.csv').iloc[:, 0].tolist()
-TIME燜RAMES = ['1h', '4h']
+TIMEFRAMES = ['1h', '4h']
 PRIMARY_TIMEFRAME = '1h'
 SEQUENCE_LENGTH = 60
 PROFIT_LOSS_RATIO = 1.5
@@ -65,7 +65,7 @@ def download_all_raw_data():
     """
     print("--- Attempting to download fresh raw data from Binance ---")
     
-    tasks = [(symbol, timeframe) for symbol in SYMBOLS for timeframe in TIME燜RAMES]
+    tasks = [(symbol, timeframe) for symbol in SYMBOLS for timeframe in TIMEFRAMES]
             
     try:
         # Use a process pool for parallel downloads
@@ -164,16 +164,17 @@ def process_symbol(symbol: str):
             return None
 
         df_primary = pd.read_parquet(primary_path)
+        df_primary = df_primary[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
         
         for col in ['open', 'high', 'low', 'close', 'volume']:
-            df_primary[col] = pd.to_numeric(df_primary[col])
+            df_primary[col] = pd.to_numeric(df_primary[col], errors='coerce')
         df_primary['timestamp'] = pd.to_datetime(df_primary['timestamp'], unit='ms')
         df_primary.set_index('timestamp', inplace=True)
         
         df_primary = calculate_features(df_primary.copy())
 
         df_merged = df_primary.copy()
-        for timeframe in TIME燜RAMES:
+        for timeframe in TIMEFRAMES:
             if timeframe == PRIMARY_TIMEFRAME:
                 continue
             
@@ -183,8 +184,9 @@ def process_symbol(symbol: str):
                 continue
 
             df_htf = pd.read_parquet(htf_path)
+            df_htf = df_htf[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
             for col in ['open', 'high', 'low', 'close', 'volume']:
-                df_htf[col] = pd.to_numeric(df_htf[col])
+                df_htf[col] = pd.to_numeric(df_htf[col], errors='coerce')
             df_htf['timestamp'] = pd.to_datetime(df_htf['timestamp'], unit='ms')
             df_htf.set_index('timestamp', inplace=True)
             
@@ -243,7 +245,7 @@ def main():
         feature_columns = None
         symbols_to_process = [s for s in SYMBOLS if os.path.exists(os.path.join(RAW_DIR, s))]
         if not symbols_to_process:
-            print("No raw data found to process. Please provide data manually in 'data/raw' or run with a clean state.")
+            print("No raw data fund to process. Please provide data manually in 'data/raw' or run with a clean state.")
             return
 
         with mp.Pool(processes=mp.cpu_count()) as pool:
