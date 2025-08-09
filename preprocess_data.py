@@ -32,6 +32,8 @@ def get_client():
 
 def download_data_for_symbol(symbol, timeframe):
     """Downloads and saves historical kline data for a single symbol and timeframe."""
+    # Added detailed logging for symbol-by-symbol progress
+    print(f"[Download] Starting: {symbol} ({timeframe})")
     client = get_client()
     start_date = datetime.now() - timedelta(days=500)
     start_str = start_date.strftime("%d %b, %Y")
@@ -47,8 +49,12 @@ def download_data_for_symbol(symbol, timeframe):
         
         filepath = os.path.join(symbol_dir, f'{timeframe}.parquet')
         df.to_parquet(filepath)
+        # Added detailed logging for symbol-by-symbol progress
+        print(f"[Download] Success: {symbol} ({timeframe}) - {len(df)} rows saved to {filepath}")
         return True
     except Exception as e:
+        # Added detailed logging for symbol-by-symbol progress
+        print(f"[Download] FAILED for {symbol} ({timeframe}). Error: {e}")
         # Propagate exception to be caught by the main process
         raise e
 
@@ -148,10 +154,13 @@ def create_sequences(df: pd.DataFrame, feature_cols: list) -> (np.ndarray, np.nd
 
 def process_symbol(symbol: str):
     """Processes the data for a single symbol."""
+    # Added detailed logging for symbol-by-symbol progress
+    print(f"[Process] Starting: {symbol}")
     try:
         primary_path = os.path.join(RAW_DIR, symbol, f'{PRIMARY_TIMEFRAME}.parquet')
         if not os.path.exists(primary_path):
             # This will be logged by the main loop
+            print(f"[Process] SKIPPED: {symbol} - Missing primary data file: {primary_path}")
             return None
 
         df_primary = pd.read_parquet(primary_path)
@@ -170,7 +179,7 @@ def process_symbol(symbol: str):
             
             htf_path = os.path.join(RAW_DIR, symbol, f'{timeframe}.parquet')
             if not os.path.exists(htf_path):
-                print(f"Warning: Missing {timeframe} data for {symbol}. Skipping multi-timeframe features for it.")
+                print(f"[Process] Warning: Missing {timeframe} data for {symbol}. Skipping multi-timeframe features for it.")
                 continue
 
             df_htf = pd.read_parquet(htf_path)
@@ -197,52 +206,61 @@ def process_symbol(symbol: str):
             os.makedirs(processed_symbol_dir, exist_ok=True)
             save_path = os.path.join(processed_symbol_dir, f'features_{PRIMARY_TIMEFRAME}.npz')
             np.savez_compressed(save_path, features=X, labels=y, timestamps=timestamps)
+            # Added detailed logging for symbol-by-symbol progress
+            print(f"[Process] Success: {symbol} - Created {len(X)} sequences. Saved to {save_path}")
             return feature_cols
+        else:
+            print(f"[Process] SKIPPED: {symbol} - No sequences generated after processing.")
+            return None
+            
     except FileNotFoundError as e:
-        print(f"Could not process symbol {symbol} because a data file was not found: {e}")
+        print(f"[Process] FAILED: {symbol} - A data file was not found: {e}")
     except Exception as e:
-        print(f"Failed to process symbol {symbol}: {e}")
+        import traceback
+        print(f"[Process] FAILED: {symbol} - An unexpected error occurred: {e}")
+        traceback.print_exc()
     return None
 
 def main():
     """Main function to run the data preprocessing pipeline."""
     start_time = time.time()
     
-    # Ensure raw data directory is cleared to force a fresh download
-    if os.path.exists(RAW_DIR):
-        print("--- Clearing old raw data to ensure fresh download ---")
-        shutil.rmtree(RAW_DIR)
-    os.makedirs(RAW_DIR)
+    # --- Step 1: Handle Raw Data ---
+    # Check if raw data directory exists and is not empty
+    if not os.path.exists(RAW_DIR) or not os.listdir(RAW_DIR):
+        print("--- Raw data not found. Starting download. ---")
+        os.makedirs(RAW_DIR, exist_ok=True)
+        download_all_raw_data()
+    else:
+        print("--- Raw data found. Skipping download. ---")
 
-    # Ensure processed data directory is also cleared
-    if os.path.exists(PROCESSED_DIR):
-        shutil.rmtree(PROCESSED_DIR)
-    os.makedirs(PROCESSED_DIR)
-    
-    # Always download fresh raw data
-    download_all_raw_data()
-    
-    print("\n--- Processing Data and Generating Features ---")
-    feature_columns = None
-    
-    symbols_to_process = [s for s in SYMBOLS if os.path.exists(os.path.join(RAW_DIR, s))]
-    if not symbols_to_process:
-        print("No raw data found to process. Please provide data manually in the 'data/raw' directory.")
-        return
+    # --- Step 2: Handle Processed Data ---
+    # Check if processed data directory exists and is not empty
+    if not os.path.exists(PROCESSED_DIR) or not os.listdir(PROCESSED_DIR):
+        print("\n--- Processed data not found. Starting feature generation. ---")
+        os.makedirs(PROCESSED_DIR, exist_ok=True)
+        
+        feature_columns = None
+        symbols_to_process = [s for s in SYMBOLS if os.path.exists(os.path.join(RAW_DIR, s))]
+        if not symbols_to_process:
+            print("No raw data found to process. Please provide data manually in 'data/raw' or run with a clean state.")
+            return
 
-    with mp.Pool(processes=mp.cpu_count()) as pool:
-        for result in tqdm(pool.imap_unordered(process_symbol, symbols_to_process), total=len(symbols_to_process), desc="Processing Symbols"):
-            if result and feature_columns is None:
-                feature_columns = result
-    
-    if feature_columns:
-        feature_columns_path = os.path.join(PROCESSED_DIR, 'feature_columns.json')
-        with open(feature_columns_path, 'w') as f:
-            json.dump(feature_columns, f)
-        print(f"\nSaved {len(feature_columns)} feature columns to {feature_columns_path}")
+        with mp.Pool(processes=mp.cpu_count()) as pool:
+            for result in tqdm(pool.imap_unordered(process_symbol, symbols_to_process), total=len(symbols_to_process), desc="Processing Symbols"):
+                if result and feature_columns is None:
+                    feature_columns = result
+        
+        if feature_columns:
+            feature_columns_path = os.path.join(PROCESSED_DIR, 'feature_columns.json')
+            with open(feature_columns_path, 'w') as f:
+                json.dump(feature_columns, f)
+            print(f"\nSaved {len(feature_columns)} feature columns to {feature_columns_path}")
+    else:
+        print("\n--- Processed data found. Skipping feature generation. ---")
         
     total_time = time.time() - start_time
-    print(f"\n--- Data Preprocessing Complete in {total_time:.2f} seconds ---")
+    print(f"\n--- Data Preprocessing Script Finished in {total_time:.2f} seconds ---")
 
 if __name__ == "__main__":
     try:
