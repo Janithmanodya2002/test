@@ -31,31 +31,51 @@ def get_client():
     return Client(keys.BINANCE_API_KEY, keys.BINANCE_API_SECRET, requests_params={'timeout': 10})
 
 def download_data_for_symbol(symbol, timeframe):
-    """Downloads and saves historical kline data for a single symbol and timeframe."""
-    # Added detailed logging for symbol-by-symbol progress
+    """
+    Downloads and saves historical kline data for a single symbol and timeframe,
+    ensuring correct data types before saving.
+    """
     print(f"[Download] Starting: {symbol} ({timeframe})")
     client = get_client()
     start_date = datetime.now() - timedelta(days=500)
     start_str = start_date.strftime("%d %b, %Y")
     
-    # This function is executed in a subprocess, so exceptions must be handled
-    # to avoid crashing the pool worker.
     try:
         klines = client.get_historical_klines(symbol, timeframe, start_str)
+        if not klines:
+            print(f"[Download] No data returned for {symbol} ({timeframe}). Skipping.")
+            return False
+
         df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+        
+        # --- Correct Data Types at the Source ---
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        
+        numeric_cols = [
+            'open', 'high', 'low', 'close', 'volume', 
+            'quote_asset_volume', 'taker_buy_base_asset_volume', 
+            'taker_buy_quote_asset_volume'
+        ]
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+        # number_of_trades should be an integer
+        df['number_of_trades'] = pd.to_numeric(df['number_of_trades'], errors='coerce').astype('Int64')
+
+        # Drop any rows where key numeric data couldn't be parsed
+        df.dropna(subset=['open', 'high', 'low', 'close', 'volume'], inplace=True)
         
         symbol_dir = os.path.join(RAW_DIR, symbol)
         os.makedirs(symbol_dir, exist_ok=True)
         
         filepath = os.path.join(symbol_dir, f'{timeframe}.parquet')
         df.to_parquet(filepath)
-        # Added detailed logging for symbol-by-symbol progress
+        
         print(f"[Download] Success: {symbol} ({timeframe}) - {len(df)} rows saved to {filepath}")
         return True
     except Exception as e:
-        # Added detailed logging for symbol-by-symbol progress
         print(f"[Download] FAILED for {symbol} ({timeframe}). Error: {e}")
-        # Propagate exception to be caught by the main process
+        # To prevent silent failures in multiprocessing, it's better to raise
         raise e
 
 def download_all_raw_data():
