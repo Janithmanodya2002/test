@@ -952,15 +952,22 @@ async def place_new_order(client, symbol_info, side, order_type, quantity, price
         print(error_msg)
         return None, str(e)
 
-async def send_telegram_alert(bot, message):
-    """A simple helper function to send a Telegram message."""
+async def send_telegram_alert(bot, message, message_type='info'):
+    """A helper function to send a Telegram message based on type."""
     if not bot:
         logging.warning(f"Telegram bot not available. Message not sent: {message}")
         return
-    try:
-        await bot.send_message(chat_id=keys.telegram_chat_id, text=message)
-    except Exception as e:
-        logging.error(f"Failed to send Telegram alert: {e}")
+
+    target_chat_ids = [keys.TELEGRAM_DEVELOP_ID]
+    if message_type == 'signal':
+        # Also send to the main channel for signals
+        target_chat_ids.append(keys.TELEGRAM_CHAT_ID)
+
+    for chat_id in target_chat_ids:
+        try:
+            await bot.send_message(chat_id=chat_id, text=message)
+        except Exception as e:
+            logging.error(f"Failed to send Telegram alert to {chat_id}: {e}")
 
 async def send_start_message(bot, backtest_mode=False, current_session=None):
     if backtest_mode:
@@ -971,7 +978,8 @@ async def send_start_message(bot, backtest_mode=False, current_session=None):
             message += f"\n📈 Current Session: {current_session}"
         else:
             message += "\n😴 Outside of all trading sessions."
-        await bot.send_message(chat_id=keys.telegram_chat_id, text=message)
+        # This is an 'info' message, send only to developer
+        await bot.send_message(chat_id=keys.TELEGRAM_DEVELOP_ID, text=message)
     except Exception as e:
         print(f"Error sending start message: {e}")
 
@@ -989,11 +997,12 @@ async def send_backtest_summary(bot, metrics, backtest_trades, starting_balance)
 *Max Drawdown:* {metrics['max_drawdown']:.2f}%
 """
     try:
-        await bot.send_message(chat_id=keys.telegram_chat_id, text=summary_text, parse_mode='Markdown')
+        # This is an 'info' message, send only to developer
+        await bot.send_message(chat_id=keys.TELEGRAM_DEVELOP_ID, text=summary_text, parse_mode='Markdown')
         with open('backtest/equity_curve.png', 'rb') as photo:
-            await bot.send_photo(chat_id=keys.telegram_chat_id, photo=photo, caption="Equity Curve")
+            await bot.send_photo(chat_id=keys.TELEGRAM_DEVELOP_ID, photo=photo, caption="Equity Curve")
         with open('backtest/backtest_trades.csv', 'rb') as document:
-            await bot.send_document(chat_id=keys.telegram_chat_id, document=document, filename='backtest_trades.csv')
+            await bot.send_document(chat_id=keys.TELEGRAM_DEVELOP_ID, document=document, filename='backtest_trades.csv')
     except Exception as e:
         print(f"Error sending backtest summary to Telegram: {e}")
 
@@ -1002,23 +1011,28 @@ async def send_backtest_complete_message(bot):
     Send a message to Telegram to indicate that the backtest is complete.
     """
     try:
-        await bot.send_message(chat_id=keys.telegram_chat_id, text="✅ Backtest is done.")
+        # This is an 'info' message, send only to developer
+        await bot.send_message(chat_id=keys.TELEGRAM_DEVELOP_ID, text="✅ Backtest is done.")
     except Exception as e:
         print(f"Error sending backtest complete message: {e}")
 
-async def send_market_analysis_image(bot, chat_id, image_buffer, caption, backtest_mode=False):
+async def send_market_analysis_image(bot, image_buffer, caption, backtest_mode=False):
     """
     Send the market analysis image to Telegram.
+    This is a 'signal' type message, so it goes to both channels.
     """
     if backtest_mode:
         return
-    try:
-        image_buffer.seek(0)
-        await bot.send_photo(chat_id=chat_id, photo=image_buffer, caption=caption)
-    except Exception as e:
-        print(f"Error sending market analysis image: {e}")
-        # Fallback to text message
-        await bot.send_message(chat_id=chat_id, text=f"Error generating chart. {caption}")
+    
+    target_chat_ids = [keys.TELEGRAM_DEVELOP_ID, keys.TELEGRAM_CHAT_ID]
+    for chat_id in target_chat_ids:
+        try:
+            image_buffer.seek(0)
+            await bot.send_photo(chat_id=chat_id, photo=image_buffer, caption=caption)
+        except Exception as e:
+            print(f"Error sending market analysis image to {chat_id}: {e}")
+            # Fallback to text message
+            await bot.send_message(chat_id=chat_id, text=f"Error generating chart. {caption}")
 
 async def op_command(update, context):
     """
@@ -1166,12 +1180,12 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                     await send_telegram_alert(bot, f"Warning: Failed to place TP2 for {symbol}. Error: {tp2_err}")
 
                         trade['status'] = 'running'
-                        await send_telegram_alert(bot, f"✅ TRADE TRIGGERED & PROTECTED ✅\nSymbol: {symbol}\nEntry: {trade['entry_price']:.8f}\nSide: {trade['side']}\nSL: {trade['sl']:.8f}\nTP1: {trade['tp1']:.8f}")
+                        await send_telegram_alert(bot, f"✅ TRADE TRIGGERED & PROTECTED ✅\nSymbol: {symbol}\nEntry: {trade['entry_price']:.8f}\nSide: {trade['side']}\nSL: {trade['sl']:.8f}\nTP1: {trade['tp1']:.8f}", message_type='signal')
 
                 elif trade['status'] == 'running':
                     sl_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['sl_order_id']))
                     if sl_order['status'] == 'FILLED':
-                        await send_telegram_alert(bot, f"🛑 STOP LOSS HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {sl_order['avgPrice']}")
+                        await send_telegram_alert(bot, f"🛑 STOP LOSS HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {sl_order['avgPrice']}", message_type='signal')
                         await cancel_order(client, symbol, trade['tp_order_id'])
                         trade['status'] = 'sl_hit'
                         if symbol in virtual_orders: del virtual_orders[symbol]
@@ -1180,7 +1194,7 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                     if trade['tp_order_id']:
                         tp_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['tp_order_id']))
                         if tp_order['status'] == 'FILLED':
-                            await send_telegram_alert(bot, f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {tp_order['avgPrice']}\nClosing 50% of the position.")
+                            await send_telegram_alert(bot, f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {tp_order['avgPrice']}\nClosing 50% of the position.", message_type='signal')
                             await cancel_order(client, symbol, trade['sl_order_id'])
 
                             trade['status'] = 'tp1_hit'
@@ -1222,7 +1236,7 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                                 trade['sl'] = new_sl
                                                 trade['sl_order_id'] = new_sl_order['orderId']
                                                 trade['sl_to_be_updated'] = False
-                                                await send_telegram_alert(bot, f"🔒 PROFIT SECURED 🔒\nSymbol: {symbol}\nSide: Long\nNew SL: {new_sl:.8f}")
+                                                await send_telegram_alert(bot, f"🔒 PROFIT SECURED 🔒\nSymbol: {symbol}\nSide: Long\nNew SL: {new_sl:.8f}", message_type='signal')
                                             else:
                                                 await send_telegram_alert(bot, f"Warning: Failed to update SL for profit securing on {symbol}. Original SL may be active or filled.")
                         elif trade['side'] == 'short':
@@ -1238,7 +1252,7 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                                 trade['sl'] = new_sl
                                                 trade['sl_order_id'] = new_sl_order['orderId']
                                                 trade['sl_to_be_updated'] = False
-                                                await send_telegram_alert(bot, f"🔒 PROFIT SECURED 🔒\nSymbol: {symbol}\nSide: Short\nNew SL: {new_sl:.8f}")
+                                                await send_telegram_alert(bot, f"🔒 PROFIT SECURED 🔒\nSymbol: {symbol}\nSide: Short\nNew SL: {new_sl:.8f}", message_type='signal')
                                             else:
                                                 await send_telegram_alert(bot, f"Warning: Failed to update SL for profit securing on {symbol}. Original SL may be active or filled.")
 
@@ -1256,7 +1270,7 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                     if not sl_err:
                                         trade['sl'] = new_sl
                                         trade['sl_order_id'] = new_sl_order['orderId']
-                                        await send_telegram_alert(bot, f"🔒 STOP LOSS UPDATED 🔒\nSymbol: {symbol}\nSide: {trade['side']}\nNew SL: {new_sl:.8f}")
+                                        await send_telegram_alert(bot, f"🔒 STOP LOSS UPDATED 🔒\nSymbol: {symbol}\nSide: {trade['side']}\nNew SL: {new_sl:.8f}", message_type='signal')
                                     else:
                                         await send_telegram_alert(bot, f"Warning: Failed to update SL for {symbol}. Original SL may be active or filled.")
 
@@ -1460,7 +1474,8 @@ async def main():
                 return
             if live_mode:
                 balance = float(account_info['totalWalletBalance'])
-                await bot.send_message(chat_id=keys.telegram_chat_id, text=f"Futures Account Balance: {balance:.2f} USDT")
+                # This is an 'info' message, send only to developer
+                await bot.send_message(chat_id=keys.TELEGRAM_DEVELOP_ID, text=f"Futures Account Balance: {balance:.2f} USDT")
 
         except Exception as e:
             print(f"Error initializing Binance client: {e}")
@@ -1625,7 +1640,7 @@ async def main():
                                    f"Symbol: {symbol}\nSide: Short\nLeverage: {leverage}x\n"
                                    f"Risk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\n"
                                    f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
-                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
+                        await send_market_analysis_image(bot, image_buffer, caption)
 
                         new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
                                      'ml_prediction': pred_label,
@@ -1682,7 +1697,7 @@ async def main():
                                    f"Symbol: {symbol}\nSide: Long\nLeverage: {leverage}x\n"
                                    f"Risk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\n"
                                    f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
-                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
+                        await send_market_analysis_image(bot, image_buffer, caption)
 
                         new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
                                      'ml_prediction': pred_label,
