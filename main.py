@@ -1272,7 +1272,22 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                                 trade['sl_to_be_updated'] = False
                                                 await send_telegram_alert(bot, f"🔒 PROFIT SECURED 🔒\nSymbol: {symbol}\nSide: Long\nNew SL: {new_sl:.8f}", message_type='signal')
                                             else:
-                                                await send_telegram_alert(bot, f"Warning: Failed to update SL for profit securing on {symbol}. Original SL may be active or filled.")
+                                                await send_telegram_alert(bot, f"⚠️ Failed to place new SL for {symbol}. Error: {sl_err}. Checking current status...")
+                                                try:
+                                                    positions = await loop.run_in_executor(None, lambda: client.futures_position_information(symbol=symbol))
+                                                    position_open = any(float(p['positionAmt']) > 0 for p in positions if p['symbol'] == symbol)
+                                                    
+                                                    if not position_open:
+                                                        await send_telegram_alert(bot, f"✅ Position for {symbol} appears to be closed. No further action needed.")
+                                                        trade['status'] = 'closed_during_sl_update'
+                                                    else:
+                                                        old_sl_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['sl_order_id']))
+                                                        if old_sl_order['status'] == 'NEW':
+                                                            await send_telegram_alert(bot, f"Warning: Failed to update SL for {symbol}. The original SL is still active. Please monitor manually.")
+                                                        else:
+                                                            await send_telegram_alert(bot, f"CRITICAL: Failed to update SL for {symbol} and the original SL is NOT active. Position is unprotected! Please intervene manually. Status: {old_sl_order['status']}")
+                                                except Exception as e:
+                                                    await send_telegram_alert(bot, f"CRITICAL: Error while checking status after failed SL update for {symbol}: {e}. Please check manually.")
                         elif trade['side'] == 'short':
                             halfway_to_tp1 = trade['entry_price'] - (trade['entry_price'] - trade['tp1']) * 0.5
                             if current_price <= halfway_to_tp1:
@@ -1288,7 +1303,22 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                                 trade['sl_to_be_updated'] = False
                                                 await send_telegram_alert(bot, f"🔒 PROFIT SECURED 🔒\nSymbol: {symbol}\nSide: Short\nNew SL: {new_sl:.8f}", message_type='signal')
                                             else:
-                                                await send_telegram_alert(bot, f"Warning: Failed to update SL for profit securing on {symbol}. Original SL may be active or filled.")
+                                                await send_telegram_alert(bot, f"⚠️ Failed to place new SL for {symbol}. Error: {sl_err}. Checking current status...")
+                                                try:
+                                                    positions = await loop.run_in_executor(None, lambda: client.futures_position_information(symbol=symbol))
+                                                    position_open = any(float(p['positionAmt']) < 0 for p in positions if p['symbol'] == symbol)
+                                                    
+                                                    if not position_open:
+                                                        await send_telegram_alert(bot, f"✅ Position for {symbol} appears to be closed. No further action needed.")
+                                                        trade['status'] = 'closed_during_sl_update'
+                                                    else:
+                                                        old_sl_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['sl_order_id']))
+                                                        if old_sl_order['status'] == 'NEW':
+                                                            await send_telegram_alert(bot, f"Warning: Failed to update SL for {symbol}. The original SL is still active. Please monitor manually.")
+                                                        else:
+                                                            await send_telegram_alert(bot, f"CRITICAL: Failed to update SL for {symbol} and the original SL is NOT active. Position is unprotected! Please intervene manually. Status: {old_sl_order['status']}")
+                                                except Exception as e:
+                                                    await send_telegram_alert(bot, f"CRITICAL: Error while checking status after failed SL update for {symbol}: {e}. Please check manually.")
 
                     if (trade['side'] == 'long' and current_price >= trade['entry_price'] * 1.20) or \
                        (trade['side'] == 'short' and current_price <= trade['entry_price'] * 0.80):
