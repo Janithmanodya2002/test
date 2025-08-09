@@ -221,6 +221,13 @@ def process_symbol(symbol: str):
         
         feature_cols = [col for col in df_labeled.columns if col not in ['label', 'future_high', 'future_low']]
         
+        # Ensure all feature columns are numeric before creating sequences.
+        for col in feature_cols:
+            df_labeled[col] = pd.to_numeric(df_labeled[col], errors='coerce')
+        
+        # Drop rows that have NaN in any of the feature columns after coercion
+        df_labeled.dropna(subset=feature_cols, inplace=True)
+        
         X, y, timestamps = create_sequences(df_labeled, feature_cols)
         
         if len(X) > 0:
