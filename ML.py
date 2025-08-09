@@ -20,6 +20,8 @@ install_dependencies()
 # Set TensorFlow logging level to suppress all but error messages
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
+# Import setuptools before tensorflow to solve 'distutils' error on Python 3.12+
+import setuptools
 import pandas as pd
 import numpy as np
 import tensorflow as tf
@@ -325,41 +327,88 @@ def generate_full_backtest_report(backtest_trades, output_dir, starting_balance=
 
 # --- ML Specific Functions ---
 
-def load_processed_data(symbol_limit=None):
-    """Load all preprocessed feature files, sort them by timestamp, and return them."""
+def get_chronological_sample_map_and_labels(symbol_limit=None):
+    """
+    Scans all processed data files to build a memory-efficient map of samples
+    sorted chronologically by their timestamp.
+    Returns a map of (file_path, index_in_file) and an array of sorted labels.
+    This avoids loading all features into RAM at once.
+    """
     path_pattern = os.path.join('data', 'processed', '*', '*.npz')
     files = glob.glob(path_pattern)
     if not files:
         raise FileNotFoundError(f"No processed feature files found at {path_pattern}. Run preprocess_data.py first.")
 
     if symbol_limit:
-        files = files[:symbol_limit]
+        # To make quick test faster, limit the number of files to scan
+        files = files[:symbol_limit * 2]  # x2 to account for timeframes
 
-    all_features = []
-    all_labels = []
+    # --- Pass 1: Scan all timestamps and create a map of sample locations ---
     all_timestamps = []
-    for file in tqdm(files, desc="Loading Processed Features"):
-        # Allow pickle for loading datetime objects
-        data = np.load(file, allow_pickle=True)
-        all_features.append(data['features'])
-        all_labels.append(data['labels'])
-        all_timestamps.append(data['timestamps'])
+    sample_location_map = []  # Stores (file_path, index_in_file) for each sample before sorting
     
-    if not all_features:
-        return np.array([]), np.array([]), np.array([])
+    print("--- Scanning timestamps from all files (Pass 1/2) ---")
+    for file_path in tqdm(files, desc="Scanning Timestamps"):
+        # Use a context manager to ensure files are closed
+        with np.load(file_path, allow_pickle=True) as data:
+            timestamps = data['timestamps']
+            num_samples = len(timestamps)
+            all_timestamps.append(timestamps)
+            for i in range(num_samples):
+                sample_location_map.append((file_path, i))
 
-    X = np.concatenate(all_features)
-    y = np.concatenate(all_labels)
-    timestamps = np.concatenate(all_timestamps)
+    if not all_timestamps:
+        return [], np.array([])
 
-    # Sort all data by timestamp to maintain temporal order
-    sorted_indices = np.argsort(timestamps)
-    X = X[sorted_indices]
-    y = y[sorted_indices]
-    timestamps = timestamps[sorted_indices]
+    timestamps_flat = np.concatenate(all_timestamps)
+    
+    # Get the indices that would sort the timestamps array globally
+    print("--- Sorting all sample timestamps... ---")
+    sorted_indices = np.argsort(timestamps_flat)
+    
+    # Reorder the sample location map to be in chronological order
+    chronological_sample_map = [sample_location_map[i] for i in sorted_indices]
+    
+    # --- Pass 2: Scan all labels and sort them according to the timestamp sort order ---
+    # This is necessary for calculating class weights and for reports.
+    all_labels = []
+    print("--- Scanning labels from all files (Pass 2/2) ---")
+    for file_path in tqdm(files, desc="Scanning Labels"):
+        with np.load(file_path) as data:
+            all_labels.append(data['labels'])
+    
+    labels_flat = np.concatenate(all_labels)
+    sorted_labels = labels_flat[sorted_indices]
 
-    print(f"Loaded and sorted {len(X)} samples.")
-    return X, y, timestamps
+    print(f"Found and sorted {len(chronological_sample_map)} total samples across {len(files)} files.")
+    return chronological_sample_map, sorted_labels
+
+def data_generator(sample_map, indices_to_yield):
+    """
+    A generator that yields single (features, label) samples for a given set of indices.
+    This is designed to be wrapped by tf.data.Dataset.from_generator().
+    Args:
+        sample_map: The chronologically sorted list of (file_path, index_in_file).
+        indices_to_yield: The specific indices from the map to load (e.g., from a train/val split).
+    """
+    # Group indices by file to minimize file I/O
+    file_to_indices = {}
+    for i in indices_to_yield:
+        file_path, index_in_file = sample_map[i]
+        if file_path not in file_to_indices:
+            file_to_indices[file_path] = []
+        file_to_indices[file_path].append(index_in_file)
+
+    # Iterate through the files that contain the required indices
+    for file_path, indices_in_file in file_to_indices.items():
+        # Load the data for the current file once, allowing pickle for object arrays.
+        with np.load(file_path, allow_pickle=True) as data:
+            features_array = data['features']
+            labels_array = data['labels']
+            
+            # Yield the required samples one by one from the loaded data
+            for i in indices_in_file:
+                yield (features_array[i], labels_array[i])
 
 def generate_training_report(history, y_true, y_pred_probs, output_dir):
     """Generates and saves a report of the model's training and performance."""
@@ -805,14 +854,25 @@ def run_pipeline(is_quick_test: bool):
     print(f"--- Starting {run_mode} with Walk-Forward Validation ({n_splits} splits) ---")
 
     try:
-        # Step 1 & 2: Load and Sort Preprocessed Data
-        print(f"\n[Step 1/4] Loading and sorting preprocessed data...")
-        X, y, timestamps = load_processed_data(symbol_limit)
+        # Step 1: Build a memory-efficient map of the data samples
+        print(f"\n[Step 1/4] Scanning and sorting all data samples...")
+        sample_map, sorted_labels = get_chronological_sample_map_and_labels(symbol_limit)
         
-        if len(X) < 200: # Need enough data for multiple splits
+        if len(sample_map) < 200: # Need enough data for multiple splits
             print("Error: Not enough data for walk-forward validation.")
             return False
 
+        # Get one sample to determine the shape and type for tf.data.Dataset.
+        # This is needed for the generator's output signature.
+        temp_features, temp_label = next(data_generator(sample_map, [0]))
+        output_signature = (
+            tf.TensorSpec(shape=temp_features.shape, dtype=temp_features.dtype),
+            tf.TensorSpec(shape=(), dtype=temp_label.dtype)
+        )
+        # Clean up temporary variables
+        del temp_features
+        del temp_label
+        
         # --- Walk-Forward Validation Setup ---
         tscv = TimeSeriesSplit(n_splits=n_splits)
         fold_metrics = []
@@ -821,19 +881,27 @@ def run_pipeline(is_quick_test: bool):
         final_model, final_history, final_y_val, final_y_pred_probs = None, None, None, None
 
         print(f"\n[Step 2/4] Starting Walk-Forward Validation...")
-        for fold, (train_index, val_index) in enumerate(tscv.split(X)):
+        # We split a dummy array of indices, not the actual data X, to save memory
+        for fold, (train_index, val_index) in enumerate(tscv.split(np.arange(len(sample_map)))):
             print(f"\n--- Fold {fold + 1}/{n_splits} ---")
             
-            X_train, X_val = X[train_index], X[val_index]
-            y_train, y_val = y[train_index], y[val_index]
+            # We don't load all X and y into memory. We get the labels for the fold from the pre-scanned array.
+            y_train, y_val = sorted_labels[train_index], sorted_labels[val_index]
             
-            print(f"Train size: {len(X_train)}, Validation size: {len(X_val)}")
+            print(f"Train size: {len(train_index)}, Validation size: {len(val_index)}")
             
-            # --- Create tf.data.Dataset for the current fold ---
-            train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-            val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+            # --- Create tf.data.Dataset for the current fold using the memory-efficient generator ---
+            train_dataset = tf.data.Dataset.from_generator(
+                lambda: data_generator(sample_map, train_index),
+                output_signature=output_signature
+            ).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+            
+            val_dataset = tf.data.Dataset.from_generator(
+                lambda: data_generator(sample_map, val_index),
+                output_signature=output_signature
+            ).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-            # Calculate class weights for the current training fold
+            # Calculate class weights for the current training fold using the pre-scanned labels
             neg, pos = np.sum(y_train == 0), np.sum(y_train == 1)
             class_weight = {(1 / neg) * (len(y_train) / 2.0): 0, (1 / pos) * (len(y_train) / 2.0): 1} if neg > 0 and pos > 0 else None
 
@@ -918,18 +986,16 @@ def run_pipeline(is_quick_test: bool):
 
 def main():
     """Main function to orchestrate the quick test and full run."""
-    # --- Force regeneration of processed data ---
+    # --- Check if preprocessing is needed ---
     processed_path = os.path.join('data', 'processed')
-    if os.path.exists(processed_path):
-        print("--- Clearing old processed data to ensure regeneration ---")
-        shutil.rmtree(processed_path)
-    # -----------------------------------------
-
-    # Check if preprocessing is needed
+    # If the processed data directory does not exist or is empty, run the preprocessing script
     if not os.path.exists(processed_path) or not os.listdir(processed_path):
         print("--- Processed data not found. Running preprocessing script. ---")
         import subprocess
+        # This will trigger the download and processing logic within preprocess_data.py
         subprocess.run(['python3', 'preprocess_data.py'], check=True)
+    else:
+        print("--- Processed data found. Skipping preprocessing step. ---")
 
     # We need to declare the global here before any access.
     global QUICK_TEST
@@ -982,9 +1048,13 @@ if __name__ == "__main__":
             pass # It may have been set already.
 
         # Check for GPU
+        print("--- Checking for GPU ---")
         gpus = tf.config.list_physical_devices('GPU')
+        print(f"tf.config.list_physical_devices('GPU') returned: {gpus}")
+        
         if gpus:
             try:
+                print("GPU detected. Attempting to configure memory growth and mixed precision.")
                 # Enable mixed precision for performance
                 from tensorflow.keras import mixed_precision
                 mixed_precision.set_global_policy('mixed_float16')
@@ -993,12 +1063,15 @@ if __name__ == "__main__":
                 for gpu in gpus:
                     tf.config.experimental.set_memory_growth(gpu, True)
                 logical_gpus = tf.config.list_logical_devices('GPU')
-                print(f"{len(gpus)} Physical GPUs, {len(logical_gpus)} Logical GPUs detected and configured.")
+                print(f"Successfully configured {len(gpus)} Physical GPUs, {len(logical_gpus)} Logical GPUs.")
             except RuntimeError as e:
                 # Memory growth must be set before GPUs have been initialized
-                print(e)
+                print(f"Error during GPU configuration: {e}")
         else:
             print("No GPU detected. The script will run on CPU.")
+            # Also print available CPUs for confirmation
+            cpus = tf.config.list_physical_devices('CPU')
+            print(f"Available CPUs: {cpus}")
 
         main()
     else:
