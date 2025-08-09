@@ -1,4 +1,22 @@
 import os
+import subprocess
+import sys
+
+def install_dependencies():
+    """
+    Installs all required libraries from requirements.txt.
+    """
+    print("--- Installing dependencies from requirements.txt ---")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+        print("--- Dependencies installed successfully ---")
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to install dependencies: {e}")
+        sys.exit(1)
+
+# Install dependencies before other imports
+install_dependencies()
+
 # Set TensorFlow logging level to suppress all but error messages
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
@@ -9,10 +27,10 @@ from absl import logging
 logging.set_verbosity(logging.ERROR)
 from tqdm import tqdm
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Input
+from tensorflow.keras.layers import LSTM, Dense, Input, Bidirectional, MultiHeadAttention, GlobalAveragePooling1D, Dropout
 from tensorflow.keras.optimizers import Adam
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 import matplotlib.pyplot as plt
 import glob
 import shutil
@@ -24,6 +42,7 @@ import datetime
 import pandas_ta as ta
 from binance.client import Client
 import keys
+import keras_tuner as kt
 
 # --- New Data Loading and Analysis Functions ---
 
@@ -307,7 +326,7 @@ def generate_full_backtest_report(backtest_trades, output_dir, starting_balance=
 # --- ML Specific Functions ---
 
 def load_processed_data(symbol_limit=None):
-    """Load all preprocessed feature files from the data/processed directory."""
+    """Load all preprocessed feature files, sort them by timestamp, and return them."""
     path_pattern = os.path.join('data', 'processed', '*', '*.npz')
     files = glob.glob(path_pattern)
     if not files:
@@ -318,15 +337,29 @@ def load_processed_data(symbol_limit=None):
 
     all_features = []
     all_labels = []
+    all_timestamps = []
     for file in tqdm(files, desc="Loading Processed Features"):
-        data = np.load(file)
+        # Allow pickle for loading datetime objects
+        data = np.load(file, allow_pickle=True)
         all_features.append(data['features'])
         all_labels.append(data['labels'])
+        all_timestamps.append(data['timestamps'])
     
     if not all_features:
-        return np.array([]), np.array([])
+        return np.array([]), np.array([]), np.array([])
 
-    return np.concatenate(all_features), np.concatenate(all_labels)
+    X = np.concatenate(all_features)
+    y = np.concatenate(all_labels)
+    timestamps = np.concatenate(all_timestamps)
+
+    # Sort all data by timestamp to maintain temporal order
+    sorted_indices = np.argsort(timestamps)
+    X = X[sorted_indices]
+    y = y[sorted_indices]
+    timestamps = timestamps[sorted_indices]
+
+    print(f"Loaded and sorted {len(X)} samples.")
+    return X, y, timestamps
 
 def generate_training_report(history, y_true, y_pred_probs, output_dir):
     """Generates and saves a report of the model's training and performance."""
@@ -393,36 +426,123 @@ def generate_training_report(history, y_true, y_pred_probs, output_dir):
     print(f"Training report saved to {output_dir}")
 
 
-def create_and_train_model(train_dataset, val_dataset, test_dataset, output_dir, training_report_dir, epochs, class_weight=None):
-    """Build, compile, and train the LSTM model using tf.data.Dataset."""
-    print("Building LSTM model...")
+def run_hyperparameter_search(train_dataset, val_dataset, epochs, is_quick_test=False):
+    """Runs hyperparameter search using Keras Tuner."""
+    print("--- Starting Hyperparameter Search ---")
     
-    # Define the input shape from the dataset's element spec
     input_shape = train_dataset.element_spec[0].shape[1:]
-    
-    model = Sequential([
-        Input(shape=input_shape),
-        LSTM(64, return_sequences=True),
-        LSTM(64),
-        Dense(32, activation='relu'),
-        Dense(1, activation='sigmoid', dtype='float32')
-    ])
 
-    model.compile(
-        optimizer=Adam(learning_rate=LEARNING_RATE),
-        loss='binary_crossentropy',
-        metrics=['accuracy']
+    def build_model(hp):
+        """Builds the model for hyperparameter tuning."""
+        model = Sequential()
+        model.add(Input(shape=input_shape))
+
+        hp_units_1 = hp.Int('units_1', min_value=64, max_value=256, step=64)
+        model.add(Bidirectional(LSTM(units=hp_units_1, return_sequences=True)))
+        hp_dropout_1 = hp.Float('dropout_1', min_value=0.1, max_value=0.4, step=0.1)
+        model.add(Dropout(hp_dropout_1))
+
+        hp_units_2 = hp.Int('units_2', min_value=32, max_value=128, step=32)
+        model.add(Bidirectional(LSTM(units=hp_units_2, return_sequences=True)))
+
+        hp_num_heads = hp.Int('num_heads', min_value=2, max_value=8, step=2)
+        model.add(MultiHeadAttention(num_heads=hp_num_heads, key_dim=hp_units_2))
+        
+        model.add(GlobalAveragePooling1D())
+
+        hp_dropout_2 = hp.Float('dropout_2', min_value=0.2, max_value=0.5, step=0.1)
+        model.add(Dropout(hp_dropout_2))
+
+        hp_dense_units = hp.Int('dense_units', min_value=32, max_value=128, step=32)
+        model.add(Dense(units=hp_dense_units, activation='relu'))
+        
+        model.add(Dense(1, activation='sigmoid', dtype='float32'))
+
+        hp_learning_rate = hp.Choice('learning_rate', values=[1e-3, 5e-4, 1e-4])
+
+        model.compile(optimizer=Adam(learning_rate=hp_learning_rate),
+                      loss='binary_crossentropy',
+                      metrics=['accuracy'])
+        return model
+
+    tuner = kt.Hyperband(
+        build_model,
+        objective='val_accuracy',
+        max_epochs=epochs,
+        factor=3,
+        directory='hyperparameter_tuning',
+        project_name='lstm_trader_tuning'
     )
+
+    # Clear tuning results from previous runs
+    if os.path.exists('hyperparameter_tuning'):
+        shutil.rmtree('hyperparameter_tuning')
+
+    stop_early = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3)
+    
+    search_epochs = 3 if is_quick_test else epochs
+    print(f"Tuner search running for a max of {search_epochs} epochs.")
+    tuner.search(train_dataset, epochs=search_epochs, validation_data=val_dataset, callbacks=[stop_early])
+
+    best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+    
+    # Build the model with the optimal hyperparameters
+    model = tuner.hypermodel.build(best_hps)
+    return model, best_hps
+
+
+def generate_walk_forward_report(fold_metrics, best_hps, output_dir):
+    """Generates a detailed report of the walk-forward validation results."""
+    report_str = "--- Walk-Forward Validation Report ---\n\n"
+
+    report_str += "--- Best Hyperparameters Found ---\n"
+    report_str += json.dumps(best_hps.values, indent=4)
+    report_str += "\n\n"
+
+    report_str += "--- Fold-by-Fold Performance ---\n"
+    for i, metrics in enumerate(fold_metrics):
+        report_str += f"\nFold {i + 1}:\n"
+        report_str += f"  - Validation Loss: {metrics['loss']:.4f}\n"
+        report_str += f"  - Validation Accuracy: {metrics['accuracy']:.4f}\n"
+        if '1' in metrics['report']:
+            report_str += f"  - Win Precision: {metrics['report']['1']['precision']:.4f}\n"
+            report_str += f"  - Win Recall: {metrics['report']['1']['recall']:.4f}\n"
+            report_str += f"  - Win F1-Score: {metrics['report']['1']['f1-score']:.4f}\n"
+
+    report_str += "\n\n--- Average Performance ---\n"
+    avg_loss = np.mean([m['loss'] for m in fold_metrics])
+    avg_accuracy = np.mean([m['accuracy'] for m in fold_metrics])
+    # Handle cases where a class might not be predicted in a fold
+    avg_precision = np.mean([m['report'].get('1', {}).get('precision', 0) for m in fold_metrics if '1' in m['report']])
+    avg_recall = np.mean([m['report'].get('1', {}).get('recall', 0) for m in fold_metrics if '1' in m['report']])
+    avg_f1 = np.mean([m['report'].get('1', {}).get('f1-score', 0) for m in fold_metrics if '1' in m['report']])
+
+    report_str += f"  - Average Validation Loss: {avg_loss:.4f}\n"
+    report_str += f"  - Average Validation Accuracy: {avg_accuracy:.4f}\n"
+    report_str += f"  - Average Win Precision: {avg_precision:.4f}\n"
+    report_str += f"  - Average Win Recall: {avg_recall:.4f}\n"
+    report_str += f"  - Average Win F1-Score: {avg_f1:.4f}\n"
+
+    report_path = os.path.join(output_dir, "walk_forward_summary.txt")
+    with open(report_path, "w") as f:
+        f.write(report_str)
+    
+    print(f"Walk-forward validation summary saved to {report_path}")
+
+
+def create_and_train_model(model, train_dataset, val_dataset, test_dataset, output_dir, training_report_dir, epochs, class_weight=None):
+    """Build, compile, and train the LSTM model using tf.data.Dataset."""
+    print("Training final model with best hyperparameters...")
     
     model.summary()
 
-    print("Training model...")
     history = model.fit(
         train_dataset,
         validation_data=val_dataset,
         epochs=epochs,
         verbose=1,
-        class_weight=class_weight
+        class_weight=class_weight,
+        callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5)]
     )
 
     print("Model training complete.")
@@ -659,8 +779,8 @@ def run_ml_backtest(model_path, data_files, output_dir, starting_balance=10000, 
 
 def run_pipeline(is_quick_test: bool):
     """
-    Encapsulates the entire ML pipeline from data loading to backtesting.
-    Returns True on success, False on failure.
+    Encapsulates the entire ML pipeline from data loading to backtesting,
+    now featuring Walk-Forward Validation.
     """
     start_time = time.time()
 
@@ -670,6 +790,7 @@ def run_pipeline(is_quick_test: bool):
     epochs = QUICK_TEST_EPOCHS if is_quick_test else EPOCHS
     symbol_limit = QUICK_TEST_SYMBOL_COUNT if is_quick_test else None
     batch_size = QUICK_TEST_BATCH_SIZE if is_quick_test else FULL_RUN_BATCH_SIZE
+    n_splits = 2 if is_quick_test else 5 # Fewer splits for a quick test
     
     model_output_dir = os.path.join(output_folder, "model")
     backtest_report_dir = os.path.join(output_folder, "backtest_report")
@@ -681,59 +802,98 @@ def run_pipeline(is_quick_test: bool):
     for d in [model_output_dir, backtest_report_dir, training_report_dir]:
         os.makedirs(d)
 
-    print(f"--- Starting {run_mode} ---")
+    print(f"--- Starting {run_mode} with Walk-Forward Validation ({n_splits} splits) ---")
 
     try:
-        # Step 1 & 2: Load Preprocessed Data
-        print(f"\n[Step 1-2/5] Loading preprocessed data for {run_mode}...")
-        X, y = load_processed_data(symbol_limit)
+        # Step 1 & 2: Load and Sort Preprocessed Data
+        print(f"\n[Step 1/4] Loading and sorting preprocessed data...")
+        X, y, timestamps = load_processed_data(symbol_limit)
         
-        dataset_size = len(X)
-        print(f"Found {dataset_size} samples.")
-        
-        if dataset_size < 20:
-            print("Error: Not enough data generated to proceed with training.")
+        if len(X) < 200: # Need enough data for multiple splits
+            print("Error: Not enough data for walk-forward validation.")
             return False
 
-        # Calculate class weights to handle imbalance
-        neg = np.sum(y == 0)
-        pos = np.sum(y == 1)
-        total = neg + pos
+        # --- Walk-Forward Validation Setup ---
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        fold_metrics = []
+        best_hps = None
         
-        class_weight = None
-        if neg > 0 and pos > 0:
-            weight_for_0 = (1 / neg) * (total / 2.0)
-            weight_for_1 = (1 / pos) * (total / 2.0)
-            class_weight = {0: weight_for_0, 1: weight_for_1}
-            print(f"Calculated class weights for imbalanced data: {class_weight}")
+        final_model, final_history, final_y_val, final_y_pred_probs = None, None, None, None
 
-        # Create a tf.data.Dataset from the in-memory numpy arrays
-        dataset = tf.data.Dataset.from_tensor_slices((X, y))
-        dataset = dataset.shuffle(buffer_size=dataset_size).cache()
+        print(f"\n[Step 2/4] Starting Walk-Forward Validation...")
+        for fold, (train_index, val_index) in enumerate(tscv.split(X)):
+            print(f"\n--- Fold {fold + 1}/{n_splits} ---")
+            
+            X_train, X_val = X[train_index], X[val_index]
+            y_train, y_val = y[train_index], y[val_index]
+            
+            print(f"Train size: {len(X_train)}, Validation size: {len(X_val)}")
+            
+            # --- Create tf.data.Dataset for the current fold ---
+            train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+            val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-        # Splitting the dataset
-        train_size = int(0.7 * dataset_size)
-        val_size = int(0.2 * dataset_size)
+            # Calculate class weights for the current training fold
+            neg, pos = np.sum(y_train == 0), np.sum(y_train == 1)
+            class_weight = {(1 / neg) * (len(y_train) / 2.0): 0, (1 / pos) * (len(y_train) / 2.0): 1} if neg > 0 and pos > 0 else None
+
+            # --- Hyperparameter Search (only on the first, smallest fold) ---
+            if best_hps is None:
+                print("\nRunning hyperparameter search on the first fold...")
+                tuner = run_hyperparameter_search(train_dataset, val_dataset, epochs, is_quick_test)
+                best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+                
+                print(f"\n--- Best Hyperparameters Found ---")
+                print(best_hps.values)
+                hps_path = os.path.join(training_report_dir, 'best_hyperparameters.json')
+                with open(hps_path, 'w') as f: json.dump(best_hps.values, f, indent=4)
+                print(f"Best hyperparameters saved to {hps_path}")
+
+            # --- Build and Train Model for the current fold ---
+            print("\nBuilding and training model for the current fold...")
+            # Build a new model with the best HPs for each fold to avoid data leakage
+            model = tuner.hypermodel.build(best_hps)
+            history = model.fit(
+                train_dataset,
+                validation_data=val_dataset,
+                epochs=epochs,
+                class_weight=class_weight,
+                callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5)],
+                verbose=1
+            )
+            
+            # --- Evaluate and store metrics ---
+            loss, acc = model.evaluate(val_dataset, verbose=0)
+            y_pred_probs = model.predict(val_dataset)
+            y_pred = (y_pred_probs > 0.5).astype(int)
+            report = classification_report(y_val, y_pred, output_dict=True, zero_division=0)
+            
+            fold_metrics.append({'loss': loss, 'accuracy': acc, 'report': report})
+            print(f"Fold {fold + 1} Validation Accuracy: {acc:.4f}")
+            
+            # The model from the final fold is used for the final backtest
+            if fold == n_splits - 1:
+                final_model = model
+                final_history = history
+                final_y_val = y_val
+                final_y_pred_probs = y_pred_probs
+
+        # --- Aggregating and Reporting Walk-Forward Results ---
+        print(f"\n--- Walk-Forward Validation Complete ---")
+        generate_walk_forward_report(fold_metrics, best_hps, training_report_dir)
         
-        train_dataset = dataset.take(train_size)
-        val_dataset = dataset.skip(train_size).take(val_size)
-        test_dataset = dataset.skip(train_size + val_size)
+        # --- Generate report for the final model's training history ---
+        if final_history:
+            print("\nGenerating training history report for the final model...")
+            generate_training_report(final_history, final_y_val, final_y_pred_probs, training_report_dir)
 
-        train_dataset = train_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-        val_dataset = val_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-        test_dataset = test_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        # Save the final model
+        trained_model_path = os.path.join(model_output_dir, "lstm_trader.keras")
+        final_model.save(trained_model_path)
+        print(f"Final model trained on the last fold saved to {trained_model_path}")
 
-        print(f"Dataset split: {train_size} train, {val_size} validation, {dataset_size - train_size - val_size} test samples.")
-
-        # Step 3: Build and Train the Model
-        print(f"\n[Step 3/5] Training model for {run_mode}... (Epochs: {epochs})")
-        # The training function now takes datasets instead of numpy arrays
-        trained_model_path = create_and_train_model(train_dataset, val_dataset, test_dataset, model_output_dir, training_report_dir, epochs, class_weight)
-        print(f"Model for {run_mode} saved to {trained_model_path}")
-
-        # Step 4: Run ML-powered backtest
-        print(f"\n[Step 4/5] Running ML-powered backtest for {run_mode}...")
-        # Load raw data file paths for the backtest simulation
+        # Step 3: Run ML-powered backtest
+        print(f"\n[Step 3/4] Running ML-powered backtest on the final model...")
         raw_files_path = os.path.join('data', 'raw', '*', '*.parquet')
         raw_data_files = glob.glob(raw_files_path)
         if symbol_limit:
@@ -741,8 +901,8 @@ def run_pipeline(is_quick_test: bool):
         
         run_ml_backtest(trained_model_path, raw_data_files, backtest_report_dir, starting_balance=10000)
 
-        # Step 5: Finalization
-        print(f"\n[Step 5/5] {run_mode} finished.")
+        # Step 4: Finalization
+        print(f"\n[Step 4/4] {run_mode} finished.")
         total_time = time.time() - start_time
         print(f"Total execution time for {run_mode}: {total_time:.2f} seconds.")
 
@@ -758,8 +918,14 @@ def run_pipeline(is_quick_test: bool):
 
 def main():
     """Main function to orchestrate the quick test and full run."""
-    # Check if preprocessing is needed
+    # --- Force regeneration of processed data ---
     processed_path = os.path.join('data', 'processed')
+    if os.path.exists(processed_path):
+        print("--- Clearing old processed data to ensure regeneration ---")
+        shutil.rmtree(processed_path)
+    # -----------------------------------------
+
+    # Check if preprocessing is needed
     if not os.path.exists(processed_path) or not os.listdir(processed_path):
         print("--- Processed data not found. Running preprocessing script. ---")
         import subprocess
