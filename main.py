@@ -538,7 +538,8 @@ def generate_summary_report(backtest_trades, metrics, strategy_analysis, config,
     report += f"Risk per trade: {config['risk_per_trade']}%\n"
     report += f"Leverage: {config['leverage']}x\n"
     report += f"ATR Value: {config['atr_value']}\n"
-    report += f"Lookback Candles: {config['lookback_candles']}\n"
+    report += f"Lookback Candles Short: {config['lookback_candles_short']}\n"
+    report += f"Lookback Candles Long: {config['lookback_candles_long']}\n"
     report += f"Swing Window: {config['swing_window']}\n\n"
 
     report += "Overall Performance:\n"
@@ -605,7 +606,8 @@ Configuration:
 Risk per trade: {config['risk_per_trade']}%
 Leverage: {config['leverage']}x
 ATR Value: {config['atr_value']}
-Lookback Candles: {config['lookback_candles']}
+Lookback Candles Short: {config['lookback_candles_short']}
+Lookback Candles Long: {config['lookback_candles_long']}
 Swing Window: {config['swing_window']}
 
 Results:
@@ -717,8 +719,8 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info, loaded
     for symbol in all_klines:
         print(f"Backtesting {symbol}...")
         klines = all_klines[symbol]
-        for i in range(config['lookback_candles'], len(klines)):
-            current_klines = klines[i-config['lookback_candles']:i]
+        for i in range(config['lookback_candles_long'], len(klines)):
+            current_klines = klines[i-config['lookback_candles_long']:i]
             swing_highs, swing_lows = get_swing_points(current_klines, config['swing_window'])
             trend = get_trend(swing_highs, swing_lows)
 
@@ -731,16 +733,32 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info, loaded
                 tp1 = entry_price - (sl - entry_price)
                 tp2 = entry_price - (sl - entry_price) * 2
 
-                ml_prediction = None
-                ml_confidence = None
                 if loaded_ml_model:
-                    setup_info = {
-                        'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
-                        'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'short'
-                    }
-                    ml_prediction, ml_confidence = get_model_prediction(current_klines, loaded_ml_model, ml_feature_columns)
-                    if ml_prediction == 0 or (ml_confidence is not None and ml_confidence < config.get('model_confidence_threshold', 0.0)): # Apply threshold if configured for backtest
+                    # Short-term prediction
+                    klines_short = current_klines[-config['lookback_candles_short']:]
+                    _, ml_confidence_short = get_model_prediction(klines_short, loaded_ml_model, ml_feature_columns)
+
+                    # Long-term prediction
+                    _, ml_confidence_long = get_model_prediction(current_klines, loaded_ml_model, ml_feature_columns)
+
+                    if ml_confidence_short is None or ml_confidence_long is None:
                         continue
+
+                    prediction_short = 1 if ml_confidence_short > 0.5 else 0
+                    prediction_long = 1 if ml_confidence_long > 0.5 else 0
+                    
+                    model_confidence_threshold = config.get('model_confidence_threshold', 0.0)
+
+                    if not (prediction_short == 1 and prediction_long == 1 and
+                            ml_confidence_short >= model_confidence_threshold and
+                            ml_confidence_long >= model_confidence_threshold):
+                        continue
+                    
+                    ml_prediction = 1 # Both are 1
+                    ml_confidence = (ml_confidence_short + ml_confidence_long) / 2
+                else:
+                    ml_prediction = None
+                    ml_confidence = None
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) > entry_price:
@@ -810,16 +828,32 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info, loaded
                 tp1 = entry_price + (entry_price - sl)
                 tp2 = entry_price + (entry_price - sl) * 2
 
-                ml_prediction = None
-                ml_confidence = None
                 if loaded_ml_model:
-                    setup_info = {
-                        'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
-                        'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'long'
-                    }
-                    ml_prediction, ml_confidence = get_model_prediction(current_klines, loaded_ml_model, ml_feature_columns)
-                    if ml_prediction == 0 or (ml_confidence is not None and ml_confidence < config.get('model_confidence_threshold', 0.0)): # Apply threshold if configured for backtest
+                    # Short-term prediction
+                    klines_short = current_klines[-config['lookback_candles_short']:]
+                    _, ml_confidence_short = get_model_prediction(klines_short, loaded_ml_model, ml_feature_columns)
+
+                    # Long-term prediction
+                    _, ml_confidence_long = get_model_prediction(current_klines, loaded_ml_model, ml_feature_columns)
+
+                    if ml_confidence_short is None or ml_confidence_long is None:
                         continue
+
+                    prediction_short = 1 if ml_confidence_short > 0.5 else 0
+                    prediction_long = 1 if ml_confidence_long > 0.5 else 0
+                    
+                    model_confidence_threshold = config.get('model_confidence_threshold', 0.0)
+
+                    if not (prediction_short == 1 and prediction_long == 1 and
+                            ml_confidence_short >= model_confidence_threshold and
+                            ml_confidence_long >= model_confidence_threshold):
+                        continue
+                    
+                    ml_prediction = 1 # Both are 1
+                    ml_confidence = (ml_confidence_short + ml_confidence_long) / 2
+                else:
+                    ml_prediction = None
+                    ml_confidence = None
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) < entry_price:
@@ -1392,7 +1426,8 @@ async def main():
         use_fixed_risk_amount = config['use_fixed_risk_amount']
         leverage = config['leverage']
         atr_value = int(config['atr_value'])
-        lookback_candles = int(config['lookback_candles'])
+        lookback_candles_short = int(config['lookback_candles_short'])
+        lookback_candles_long = int(config['lookback_candles_long'])
         swing_window = int(config['swing_window'])
         starting_balance = int(config['starting_balance'])
         chart_image_candles = int(config['chart_image_candles'])
@@ -1588,7 +1623,7 @@ async def main():
                             continue
 
                     print(f"Scanning {symbol}...")
-                    klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles)
+                    klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles_long)
                     if not klines:
                         continue
 
@@ -1612,28 +1647,52 @@ async def main():
 
                         # --- ML Model Integration ---
                         if ml_model and ml_feature_columns:
-                            features = generate_live_features(klines, ml_feature_columns)
-                            if features is not None:
-                                pred_prob = float(ml_model.predict(features)[0][0])
-                                if pred_prob < model_confidence_threshold:
-                                    log_ml_decision(symbol, 'short', 0, pred_prob, 'rejected')
-                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Short\nReason: Confidence {pred_prob:.2f} < {model_confidence_threshold:.2f}")
-                                    rejected_symbols[symbol] = time.time()
-                                    continue
-                                else:
-                                    log_ml_decision(symbol, 'short', 1, pred_prob)
-                                    print(f"  - ML Model ACCEPTED signal for {symbol} Short with confidence {pred_prob:.2f}")
-                            else:
+                            # Short-term prediction
+                            klines_short = klines[-lookback_candles_short:]
+                            features_short = generate_live_features(klines_short, ml_feature_columns)
+                            pred_prob_short = None
+                            if features_short is not None:
+                                pred_prob_short = float(ml_model.predict(features_short)[0][0])
+
+                            # Long-term prediction
+                            features_long = generate_live_features(klines, ml_feature_columns) # klines is already lookback_candles_long
+                            pred_prob_long = None
+                            if features_long is not None:
+                                pred_prob_long = float(ml_model.predict(features_long)[0][0])
+
+                            if pred_prob_short is None or pred_prob_long is None:
                                 print(f"Could not generate features for {symbol}. Skipping ML check.")
+                                continue
+
+                            prediction_short = 1 if pred_prob_short > 0.5 else 0
+                            prediction_long = 1 if pred_prob_long > 0.5 else 0
+
+                            if (prediction_short == 1 and prediction_long == 1 and
+                                pred_prob_short >= model_confidence_threshold and
+                                pred_prob_long >= model_confidence_threshold):
+                                
+                                log_ml_decision(symbol, 'short', 1, (pred_prob_short + pred_prob_long) / 2)
+                                print(f"  - ML Model ACCEPTED signal for {symbol} Short with confidences Short:{pred_prob_short:.2f}, Long:{pred_prob_long:.2f}")
+                                ml_info = f"🧠 ML Prediction: Win (Conf Short: {pred_prob_short:.1%}, Conf Long: {pred_prob_long:.1%})"
+                                pred_prob = (pred_prob_short + pred_prob_long) / 2 # for logging
+                                pred_label = 1
+
+                            else:
+                                log_ml_decision(symbol, 'short', 0, (pred_prob_short + pred_prob_long) / 2, 'rejected')
+                                await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Short\nReason: Short Pred: {prediction_short} ({pred_prob_short:.2f}), Long Pred: {prediction_long} ({pred_prob_long:.2f})")
+                                rejected_symbols[symbol] = time.time()
+                                continue
+                        else:
+                             # Default behavior if no model
+                            ml_info = "🧠 ML Model not in use."
+                            pred_prob = 0.0
+                            pred_label = 0
                         # -------------------------- # ML Model Integration End
                         
                         symbol_info = symbols_info[symbol]
                         quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
                         if quantity is None or quantity == 0:
                             continue
-                        
-                        pred_label = 1 if pred_prob > 0.5 else 0
-                        ml_info = f"🧠 ML Prediction: Win (Conf: {pred_prob:.1%})"
                         
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
                         caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
@@ -1670,28 +1729,52 @@ async def main():
 
                         # --- ML Model Integration ---
                         if ml_model and ml_feature_columns:
-                            features = generate_live_features(klines, ml_feature_columns)
-                            if features is not None:
-                                pred_prob = float(ml_model.predict(features)[0][0])
-                                if pred_prob < model_confidence_threshold:
-                                    log_ml_decision(symbol, 'long', 0, pred_prob, 'rejected')
-                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Long\nReason: Confidence {pred_prob:.2f} < {model_confidence_threshold:.2f}")
-                                    rejected_symbols[symbol] = time.time()
-                                    continue
-                                else:
-                                    log_ml_decision(symbol, 'long', 1, pred_prob)
-                                    print(f"  - ML Model ACCEPTED signal for {symbol} Long with confidence {pred_prob:.2f}")
-                            else:
+                            # Short-term prediction
+                            klines_short = klines[-lookback_candles_short:]
+                            features_short = generate_live_features(klines_short, ml_feature_columns)
+                            pred_prob_short = None
+                            if features_short is not None:
+                                pred_prob_short = float(ml_model.predict(features_short)[0][0])
+
+                            # Long-term prediction
+                            features_long = generate_live_features(klines, ml_feature_columns) # klines is already lookback_candles_long
+                            pred_prob_long = None
+                            if features_long is not None:
+                                pred_prob_long = float(ml_model.predict(features_long)[0][0])
+
+                            if pred_prob_short is None or pred_prob_long is None:
                                 print(f"Could not generate features for {symbol}. Skipping ML check.")
+                                continue
+
+                            prediction_short = 1 if pred_prob_short > 0.5 else 0
+                            prediction_long = 1 if pred_prob_long > 0.5 else 0
+
+                            if (prediction_short == 1 and prediction_long == 1 and
+                                pred_prob_short >= model_confidence_threshold and
+                                pred_prob_long >= model_confidence_threshold):
+                                
+                                log_ml_decision(symbol, 'long', 1, (pred_prob_short + pred_prob_long) / 2)
+                                print(f"  - ML Model ACCEPTED signal for {symbol} Long with confidences Short:{pred_prob_short:.2f}, Long:{pred_prob_long:.2f}")
+                                ml_info = f"🧠 ML Prediction: Win (Conf Short: {pred_prob_short:.1%}, Conf Long: {pred_prob_long:.1%})"
+                                pred_prob = (pred_prob_short + pred_prob_long) / 2 # for logging
+                                pred_label = 1
+
+                            else:
+                                log_ml_decision(symbol, 'long', 0, (pred_prob_short + pred_prob_long) / 2, 'rejected')
+                                await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Long\nReason: Short Pred: {prediction_short} ({pred_prob_short:.2f}), Long Pred: {prediction_long} ({pred_prob_long:.2f})")
+                                rejected_symbols[symbol] = time.time()
+                                continue
+                        else:
+                             # Default behavior if no model
+                            ml_info = "🧠 ML Model not in use."
+                            pred_prob = 0.0
+                            pred_label = 0
                         # -------------------------- # ML Model Integration End
                         
                         symbol_info = symbols_info[symbol]
                         quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
                         if quantity is None or quantity == 0:
                             continue
-
-                        pred_label = 1 if pred_prob > 0.5 else 0
-                        ml_info = f"🧠 ML Prediction: Win (Conf: {pred_prob:.1%})"
 
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
                         caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
