@@ -30,8 +30,10 @@ logging.set_verbosity(logging.ERROR)
 from tqdm import tqdm
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Input, Bidirectional, MultiHeadAttention, GlobalAveragePooling1D, Dropout
+from tensorflow.keras.regularizers import l2
 from tensorflow.keras.optimizers import Adam
 from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 import matplotlib.pyplot as plt
 import glob
@@ -45,6 +47,7 @@ import pandas_ta as ta
 from binance.client import Client
 import keys
 import keras_tuner as kt
+import joblib
 
 # --- New Data Loading and Analysis Functions ---
 
@@ -64,29 +67,46 @@ def download_data(symbol, timeframe='1h', limit=1000):
     return df[['open', 'high', 'low', 'close', 'volume']]
 
 # --- Configuration ---
-# Set to True to run a quick test on a small subset of data
-QUICK_TEST = False
-QUICK_TEST_DATA_SIZE = 1000
-QUICK_TEST_EPOCHS = 5
-QUICK_TEST_SYMBOL_COUNT = 1
+class Config:
+    """
+    A static class to hold all configuration variables for the ML pipeline.
+    This makes it easy to manage and adjust parameters from one place.
+    """
+    # --- Run Mode ---
+    # Set to True to run a quick test on a small subset of data
+    QUICK_TEST = True
+    QUICK_TEST_DATA_SIZE = 1000
+    QUICK_TEST_EPOCHS = 5
+    QUICK_TEST_SYMBOL_COUNT = 1
 
-# Configuration for the strategy and feature generation (from main.py)
-# These should ideally match the configuration used in the original strategy
-LOOKBACK_CANDLES = 100
-SWING_WINDOW = 5
+    # --- Strategy and Feature Generation ---
+    # These should ideally match the configuration used in the original strategy
+    PRIMARY_TIMEFRAME = '1h'
+    LOOKBACK_CANDLES = 100
+    SWING_WINDOW = 5
+    FUTURE_WINDOW_OPTIONS = [10, 20, 30, 40]
+    
+    # --- Model and Training Parameters ---
+    SEQUENCE_LENGTH = 60  # Number of timesteps in each sample
+    QUICK_TEST_BATCH_SIZE = 32
+    FULL_RUN_BATCH_SIZE = 128 # Larger batch size for better GPU utilization
+    EPOCHS = 50
+    LEARNING_RATE = 0.001
 
-# Model and Training Parameters
-SEQUENCE_LENGTH = 60  # Number of timesteps in each sample
-QUICK_TEST_BATCH_SIZE = 32
-FULL_RUN_BATCH_SIZE = 128 # Larger batch size for better GPU utilization
-EPOCHS = 50
-LEARNING_RATE = 0.001
+    # --- Backtesting Parameters ---
+    STARTING_BALANCE = 10000
+    RISK_PER_TRADE = 0.02 # Default risk percentage per trade
+    
+    # --- Data Directories ---
+    DATA_DIR = 'data'
+    RAW_DIR = os.path.join(DATA_DIR, 'raw')
+    PROCESSED_DIR = os.path.join(DATA_DIR, 'processed')
 
 # --- Classes and Functions from main.py (for backtesting and reporting) ---
 
 class TradeResult:
     """A class to hold the results of a single backtested trade."""
-    def __init__(self, symbol, side, entry_price, exit_price, entry_timestamp, exit_timestamp, status, pnl_usd, pnl_pct, reason_for_entry, reason_for_exit):
+    def __init__(self, symbol, side, entry_price, exit_price, entry_timestamp, exit_timestamp, status, pnl_usd, pnl_pct, reason_for_entry, reason_for_exit, confidence):
         self.symbol = symbol
         self.side = side
         self.entry_price = entry_price
@@ -98,6 +118,7 @@ class TradeResult:
         self.pnl_pct = pnl_pct
         self.reason_for_entry = reason_for_entry
         self.reason_for_exit = reason_for_exit
+        self.confidence = confidence
         self.balance = 0.0 # Will be updated during backtest
 
 def get_swing_points(klines_df, window=10):
@@ -247,21 +268,17 @@ def calculate_performance_metrics(backtest_trades, starting_balance):
     expectancy = (win_rate / 100 * avg_win) - ((losses / num_trades) * abs(avg_loss))
 
     # Drawdown calculation
-    balance_over_time = [starting_balance] + [trade.balance for trade in backtest_trades]
-    peak = balance_over_time[0]
-    max_drawdown = 0
-    for balance in balance_over_time:
-        if balance > peak:
-            peak = balance
-        drawdown = (peak - balance) / peak
-        if drawdown > max_drawdown:
-            max_drawdown = drawdown
+    balance_over_time = np.array([starting_balance] + [trade.balance for trade in backtest_trades])
+    running_max = np.maximum.accumulate(balance_over_time)
+    drawdown_series = (running_max - balance_over_time) / running_max
+    max_drawdown = np.max(drawdown_series)
 
     return {
         'total_trades': num_trades, 'winning_trades': wins, 'losing_trades': losses,
         'win_rate': win_rate, 'average_win': avg_win, 'average_loss': avg_loss,
         'profit_factor': profit_factor, 'max_drawdown': max_drawdown * 100,
-        'net_pnl_usd': net_pnl_usd, 'net_pnl_pct': net_pnl_pct, 'expectancy': expectancy
+        'net_pnl_usd': net_pnl_usd, 'net_pnl_pct': net_pnl_pct, 'expectancy': expectancy,
+        'drawdown_series': drawdown_series # Return the series for plotting
     }
 
 def generate_summary_report(metrics, output_dir, starting_balance=10000):
@@ -307,6 +324,34 @@ def generate_equity_curve(backtest_trades, output_dir, starting_balance=10000):
     plt.savefig(os.path.join(output_dir, 'equity_curve.png'))
     plt.close()
 
+def generate_pnl_histogram(backtest_trades, output_dir):
+    """Generates and saves a histogram of P&L for all trades."""
+    if not backtest_trades:
+        return
+    pnl_values = [trade.pnl_usd for trade in backtest_trades]
+    plt.figure(figsize=(10, 6))
+    plt.hist(pnl_values, bins=50, edgecolor='black')
+    plt.title('Distribution of P&L per Trade')
+    plt.xlabel('P&L (USD)')
+    plt.ylabel('Number of Trades')
+    plt.grid(True, axis='y')
+    plt.savefig(os.path.join(output_dir, 'pnl_distribution.png'))
+    plt.close()
+
+def generate_drawdown_chart(drawdown_series, output_dir):
+    """Generates and saves a plot of the drawdown series."""
+    if drawdown_series is None or len(drawdown_series) == 0:
+        return
+    plt.figure(figsize=(10, 6))
+    plt.fill_between(range(len(drawdown_series)), -drawdown_series * 100, color='red', alpha=0.3)
+    plt.plot(range(len(drawdown_series)), -drawdown_series * 100, color='red')
+    plt.title('Drawdown Over Time')
+    plt.xlabel('Trade Number')
+    plt.ylabel('Drawdown (%)')
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, 'drawdown_chart.png'))
+    plt.close()
+
 def generate_full_backtest_report(backtest_trades, output_dir, starting_balance=10000):
     """Generates all reports for the backtest."""
     if not os.path.exists(output_dir):
@@ -319,6 +364,8 @@ def generate_full_backtest_report(backtest_trades, output_dir, starting_balance=
     metrics = calculate_performance_metrics(backtest_trades, starting_balance)
     generate_summary_report(metrics, output_dir, starting_balance)
     generate_equity_curve(backtest_trades, output_dir, starting_balance)
+    generate_pnl_histogram(backtest_trades, output_dir)
+    generate_drawdown_chart(metrics.get('drawdown_series'), output_dir)
 
     df = pd.DataFrame([vars(t) for t in backtest_trades])
     df.to_csv(os.path.join(output_dir, 'backtest_trades.csv'), index=False)
@@ -327,14 +374,13 @@ def generate_full_backtest_report(backtest_trades, output_dir, starting_balance=
 
 # --- ML Specific Functions ---
 
-def get_chronological_sample_map_and_labels(symbol_limit=None):
+def get_chronological_sample_map_and_labels(future_window, symbol_limit=None):
     """
-    Scans all processed data files to build a memory-efficient map of samples
-    sorted chronologically by their timestamp.
-    Returns a map of (file_path, index_in_file) and an array of sorted labels.
-    This avoids loading all features into RAM at once.
+    Scans processed data files for a SPECIFIC future_window to build a
+    memory-efficient map of samples sorted chronologically by their timestamp.
     """
-    path_pattern = os.path.join('data', 'processed', '*', '*.npz')
+    print(f"--- Scanning data for future_window = {future_window} ---")
+    path_pattern = os.path.join(Config.PROCESSED_DIR, '*', f'*_fw{future_window}.npz')
     files = glob.glob(path_pattern)
     if not files:
         raise FileNotFoundError(f"No processed feature files found at {path_pattern}. Run preprocess_data.py first.")
@@ -484,14 +530,16 @@ def run_hyperparameter_search(train_dataset, val_dataset, epochs, is_quick_test=
     def build_model(hp):
         """Builds the model for hyperparameter tuning."""
         inputs = tf.keras.Input(shape=input_shape)
+        
+        hp_l2_reg = hp.Choice('l2_reg', values=[1e-2, 1e-3, 1e-4, 1e-5])
 
         hp_units_1 = hp.Int('units_1', min_value=64, max_value=256, step=64)
-        x = Bidirectional(LSTM(units=hp_units_1, return_sequences=True))(inputs)
+        x = Bidirectional(LSTM(units=hp_units_1, return_sequences=True, kernel_regularizer=l2(hp_l2_reg)))(inputs)
         hp_dropout_1 = hp.Float('dropout_1', min_value=0.1, max_value=0.4, step=0.1)
         x = Dropout(hp_dropout_1)(x)
 
         hp_units_2 = hp.Int('units_2', min_value=32, max_value=128, step=32)
-        x = Bidirectional(LSTM(units=hp_units_2, return_sequences=True))(x)
+        x = Bidirectional(LSTM(units=hp_units_2, return_sequences=True, kernel_regularizer=l2(hp_l2_reg)))(x)
 
         hp_num_heads = hp.Int('num_heads', min_value=2, max_value=8, step=2)
         # For self-attention, query, value, and key are the same.
@@ -503,7 +551,7 @@ def run_hyperparameter_search(train_dataset, val_dataset, epochs, is_quick_test=
         x = Dropout(hp_dropout_2)(x)
 
         hp_dense_units = hp.Int('dense_units', min_value=32, max_value=128, step=32)
-        x = Dense(units=hp_dense_units, activation='relu')(x)
+        x = Dense(units=hp_dense_units, activation='relu', kernel_regularizer=l2(hp_l2_reg))(x)
         
         outputs = Dense(1, activation='sigmoid', dtype='float32')(x)
 
@@ -606,48 +654,58 @@ def create_and_train_model(model, train_dataset, val_dataset, test_dataset, outp
 
     return model_path
 
-def generate_signals_for_symbol(df):
-    """Generates all potential trade signals for a given symbol's DataFrame."""
-    potential_trades = []
+def get_signal_and_features(df, i, feature_columns):
+    """
+    Checks for a trade signal at a specific index `i` and returns the signal
+    and the UN-SCALED features for the model if a signal is found.
+    Scaling is handled globally in the main pipeline.
+    """
+    if i < Config.LOOKBACK_CANDLES or i >= len(df):
+        return None, None
+
+    # 1. Generate Signal
+    strategy_klines = df.iloc[i - Config.LOOKBACK_CANDLES : i]
+    swing_highs, swing_lows = get_swing_points(strategy_klines.copy(), window=Config.SWING_WINDOW)
+    trend, _ = get_trend(swing_highs, swing_lows)
+    
+    signal = None
     np_close = df['close'].to_numpy()
 
-    for i in range(LOOKBACK_CANDLES, len(df) - 1):
-        strategy_klines = df.iloc[i - LOOKBACK_CANDLES : i]
-        swing_highs, swing_lows = get_swing_points(strategy_klines, window=SWING_WINDOW)
-        trend = get_trend(swing_highs, swing_lows)
-        
-        signal = None
-        if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-            last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
-            entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
-            if np_close[i-1] > entry_price:
-                sl, tp = last_swing_high, entry_price - (last_swing_high - entry_price)
-                signal = {'side': 'short', 'entry': entry_price, 'sl': sl, 'tp': tp}
-        elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-            last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
-            entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
-            if np_close[i-1] < entry_price:
-                sl, tp = last_swing_low, entry_price + (entry_price - last_swing_low)
-                signal = {'side': 'long', 'entry': entry_price, 'sl': sl, 'tp': tp}
-        
-        if signal:
-            potential_trades.append((signal, i))
-            
-    return potential_trades
+    if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+        last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
+        entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
+        if np_close[i-1] > entry_price:
+            sl, tp = last_swing_high, entry_price - (last_swing_high - entry_price)
+            signal = {'side': 'short', 'entry': entry_price, 'sl': sl, 'tp': tp}
+    elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+        last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
+        entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
+        if np_close[i-1] < entry_price:
+            sl, tp = last_swing_low, entry_price + (entry_price - last_swing_low)
+            signal = {'side': 'long', 'entry': entry_price, 'sl': sl, 'tp': tp}
 
-def get_features_for_signals(df, potential_trades):
-    """Extracts features for a list of potential trades."""
-    features_to_predict = []
-    for signal, i in potential_trades:
-        feature_klines = df.iloc[i - SEQUENCE_LENGTH : i]
-        first_candle = feature_klines.iloc[0]
-        if first_candle['close'] > 0 and first_candle['volume'] > 0:
-            normalized_features = feature_klines[['open', 'high', 'low', 'close', 'volume']].copy()
-            for col in ['open', 'high', 'low', 'close']:
-                normalized_features[col] = (normalized_features[col] / first_candle['close']) - 1
-            normalized_features['volume'] = (normalized_features['volume'] / first_candle['volume']) - 1
-            features_to_predict.append(normalized_features.to_numpy())
-    return np.array(features_to_predict)
+    if not signal:
+        return None, None
+
+    # 2. Extract Features (Unscaled)
+    feature_klines = df.iloc[i - Config.SEQUENCE_LENGTH : i].copy()
+    
+    # Calculate all technical indicators that were used in preprocessing
+    feature_klines.ta.rsi(append=True)
+    feature_klines.ta.macd(append=True)
+    feature_klines.ta.bbands(append=True)
+    feature_klines.ta.atr(append=True)
+    feature_klines.ta.obv(append=True) # Added On-Balance Volume
+    feature_klines.dropna(inplace=True)
+    
+    if len(feature_klines) < Config.SEQUENCE_LENGTH:
+        return None, None # Not enough data after indicator calculation
+
+    # Ensure the columns match what the model was trained on
+    feature_values = feature_klines[feature_columns]
+    
+    return signal, feature_values.to_numpy()
+
 
 def simulate_trades(df, symbol, potential_trades, predictions):
     """Simulates trades based on predictions and returns a list of TradeResult objects."""
@@ -673,30 +731,20 @@ def simulate_trades(df, symbol, potential_trades, predictions):
                     entry_timestamp=df.index[trade_idx], exit_timestamp=df.index[j], status=status,
                     pnl_usd=0, pnl_pct=0,
                     reason_for_entry=f"ML Signal (Pred: {prediction[0]:.2f})",
-                    reason_for_exit=reason
+                    reason_for_exit=reason,
+                    confidence=prediction[0]
                 )
                 local_trades.append(trade)
     return local_trades
 
-def backtest_symbol(args):
+def backtest_symbol_worker(args):
     """
-    Backtesting logic for a single symbol. Designed to be called by a multiprocessing pool.
+    A worker function for multiprocessing. It finds potential trades and extracts
+    features for a given symbol, but does NOT perform predictions.
+    It returns the features and trade info to the main process.
     """
-    # Disable GPU in worker process
-    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-    # Set env var BEFORE importing tensorflow in the new process
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-    from absl import logging
-    logging.set_verbosity(logging.ERROR)
-    import tensorflow as tf
-
-    filepath, model_path = args
-    symbol = filepath.split(os.sep)[-2]
-    
-    # Each process needs to load the model. This is memory-intensive but necessary for parallelism.
-    model = tf.keras.models.load_model(model_path)
-    
-    local_trades = []
+    filepath, primary_timeframe, feature_columns = args
+    symbol = os.path.basename(os.path.dirname(filepath))
     
     try:
         df = pd.read_parquet(filepath)
@@ -704,107 +752,120 @@ def backtest_symbol(args):
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
         
-        # Convert to numpy for faster access
-        np_close = df['close'].to_numpy()
+        features_for_symbol = []
+        trades_for_symbol = []
+
+        for i in range(Config.LOOKBACK_CANDLES, len(df)):
+            signal, features = get_signal_and_features(df, i, feature_columns)
+            if signal and features is not None:
+                features_for_symbol.append(features)
+                # We pass the dataframe itself to be used later in simulation
+                trades_for_symbol.append({'signal': signal, 'index': i, 'dataframe': df, 'symbol': symbol})
+
+        return features_for_symbol, trades_for_symbol
+
+    except FileNotFoundError:
+        print(f"Could not process {symbol}. Required files not found.")
+        return [], []
+    except Exception as e:
+        print(f"Error processing {symbol} in worker: {e}")
+        return [], []
+
+def run_ml_backtest(model_path, data_files, output_dir, starting_balance=Config.STARTING_BALANCE, risk_per_trade=Config.RISK_PER_TRADE):
+    """
+    Run a memory-optimized backtest using the trained ML model.
+    The model is loaded once, and feature extraction is done in parallel.
+    """
+    print("--- Starting Optimized ML-Powered Backtest ---")
+
+    # 1. Load the model, the scaler, and feature columns
+    print("Loading model, scaler, and feature columns...")
+    model = tf.keras.models.load_model(model_path)
+    scaler_path = os.path.join(os.path.dirname(model_path), 'global_scaler.joblib')
+    scaler = joblib.load(scaler_path)
+    
+    feature_columns_path = os.path.join(Config.PROCESSED_DIR, 'feature_columns.json')
+    with open(feature_columns_path, 'r') as f:
+        feature_columns = json.load(f)
+
+    # 2. Use multiprocessing to extract features in parallel
+    print("Extracting features from all symbols in parallel...")
+    num_cores = min(mp.cpu_count(), 4)
+    pool_args = [(file, Config.PRIMARY_TIMEFRAME, feature_columns) for file in data_files]
+    
+    all_features = []
+    all_potential_trades = []
+    with mp.Pool(processes=num_cores) as pool:
+        for features, trades in tqdm(pool.imap_unordered(backtest_symbol_worker, pool_args), total=len(data_files), desc="Extracting Features"):
+            if features:
+                all_features.extend(features)
+                all_potential_trades.extend(trades)
+
+    if not all_features:
+        print("No potential trades found across all symbols. Backtest complete.")
+        return
+
+    # 3. Scale features and perform batch prediction
+    print(f"Found {len(all_potential_trades)} potential trades. Scaling features and performing batch prediction...")
+    
+    # Reshape for scaling: from (n_samples, seq_len, n_features) to (n_samples * seq_len, n_features)
+    n_samples, seq_len, n_features = np.array(all_features).shape
+    reshaped_features = np.array(all_features).reshape(-1, n_features)
+    
+    scaled_reshaped_features = scaler.transform(reshaped_features)
+    
+    # Reshape back to sequence form
+    scaled_features = scaled_reshaped_features.reshape(n_samples, seq_len, n_features)
+    
+    predictions = model.predict(scaled_features, batch_size=Config.FULL_RUN_BATCH_SIZE, verbose=0)
+    
+    # 4. Simulate trades and generate results
+    print("Simulating trades with predictions...")
+    all_trades = []
+    for i, trade_info in enumerate(all_potential_trades):
+        prediction = predictions[i]
+        if prediction[0] < 0.45: # Confidence threshold
+            continue
+
+        df = trade_info['dataframe']
+        signal = trade_info['signal']
+        trade_idx = trade_info['index']
+        symbol = trade_info['symbol']
+        
+        # Simulate the single trade
         np_high = df['high'].to_numpy()
         np_low = df['low'].to_numpy()
+        exit_price, status, reason = (None, None, None)
+
+        for j in range(trade_idx, len(df)):
+            future_high, future_low = np_high[j], np_low[j]
+            if signal['side'] == 'long':
+                if future_high >= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
+                if future_low <= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
+            else: # short
+                if future_low <= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
+                if future_high >= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
         
-        i = LOOKBACK_CANDLES
-        while i < len(df) - 1:
-            strategy_klines = df.iloc[i - LOOKBACK_CANDLES : i]
-            swing_highs, swing_lows = get_swing_points(strategy_klines, window=SWING_WINDOW)
-            trend = get_trend(swing_highs, swing_lows)
+        if status:
+            trade = TradeResult(
+                symbol=symbol, side=signal['side'], entry_price=signal['entry'], exit_price=exit_price,
+                entry_timestamp=df.index[trade_idx], exit_timestamp=df.index[j], status=status,
+                pnl_usd=0, pnl_pct=0,
+                reason_for_entry=f"ML Signal (Pred: {prediction[0]:.2f})",
+                reason_for_exit=reason,
+                confidence=prediction[0]
+            )
+            all_trades.append(trade)
             
-            signal = None
-            if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
-                entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
-                if np_close[i-1] > entry_price:
-                    sl, tp = last_swing_high, entry_price - (last_swing_high - entry_price)
-                    signal = {'side': 'short', 'entry': entry_price, 'sl': sl, 'tp': tp}
-            elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                last_swing_high, last_swing_low = swing_highs[-1][1], swing_lows[-1][1]
-                entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
-                if np_close[i-1] < entry_price:
-                    sl, tp = last_swing_low, entry_price + (entry_price - last_swing_low)
-                    signal = {'side': 'long', 'entry': entry_price, 'sl': sl, 'tp': tp}
-
-            if signal:
-                feature_klines = df.iloc[i - SEQUENCE_LENGTH : i]
-                first_candle = feature_klines.iloc[0]
-                if first_candle['close'] > 0 and first_candle['volume'] > 0:
-                    normalized_features = feature_klines[['open', 'high', 'low', 'close', 'volume']].copy()
-                    for col in ['open', 'high', 'low', 'close']:
-                        normalized_features[col] = (normalized_features[col] / first_candle['close']) - 1
-                    normalized_features['volume'] = (normalized_features['volume'] / first_candle['volume']) - 1
-                    feature_array = np.array([normalized_features.to_numpy()])
-                    
-                # Collect all features for batch prediction
-                features_to_predict = []
-                potential_trades = []
-
-                if first_candle['close'] > 0 and first_candle['volume'] > 0:
-                    normalized_features = feature_klines[['open', 'high', 'low', 'close', 'volume']].copy()
-                    for col in ['open', 'high', 'low', 'close']:
-                        normalized_features[col] = (normalized_features[col] / first_candle['close']) - 1
-                    normalized_features['volume'] = (normalized_features['volume'] / first_candle['volume']) - 1
-                    features_to_predict.append(normalized_features.to_numpy())
-                    potential_trades.append((signal, i))
-            i += 1
-        
-        # Batch prediction
-        if features_to_predict:
-            predictions = model.predict(np.array(features_to_predict), verbose=0)
-            for (signal, trade_idx), prediction in zip(potential_trades, predictions):
-                if prediction[0] > 0.45:
-                    exit_price, status, reason = (None, None, None)
-                    for j in range(trade_idx, len(df)):
-                        future_high, future_low = np_high[j], np_low[j]
-                        if signal['side'] == 'long':
-                            if future_high >= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
-                            if future_low <= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
-                        else:
-                            if future_low <= signal['tp']: exit_price, status, reason = signal['tp'], 'win', 'TP Hit'; break
-                            if future_high >= signal['sl']: exit_price, status, reason = signal['sl'], 'loss', 'SL Hit'; break
-                    
-                    if status:
-                        trade = TradeResult(
-                            symbol=symbol, side=signal['side'], entry_price=signal['entry'], exit_price=exit_price,
-                            entry_timestamp=df.index[trade_idx], exit_timestamp=df.index[j], status=status,
-                            pnl_usd=0, pnl_pct=0,
-                            reason_for_entry=f"ML Signal (Pred: {prediction[0]:.2f})",
-                            reason_for_exit=reason
-                        )
-                        local_trades.append(trade)
-            i += 1
-    except Exception as e:
-        print(f"Error backtesting {symbol}: {e}")
-    
-    return local_trades
-
-def run_ml_backtest(model_path, data_files, output_dir, starting_balance=10000, risk_per_trade=0.02):
-    """Run a backtest using the trained ML model to filter trades in parallel."""
-    print("Starting parallel ML-powered backtest simulation...")
-    
-    num_cores = min(mp.cpu_count(), 4)
-    pool_args = [(file, model_path) for file in data_files]
-    
-    all_trades_lists = []
-    # Use tqdm to show progress for the overall backtesting process (per symbol)
-    with mp.Pool(processes=num_cores) as pool:
-        for result in tqdm(pool.imap_unordered(backtest_symbol, pool_args), total=len(data_files), desc="Overall Backtest Progress"):
-            all_trades_lists.append(result)
-
-    # Flatten the list of lists into a single list of trades
-    all_trades = [trade for sublist in all_trades_lists for trade in sublist]
-    
-    # Sort trades by entry timestamp to build a coherent equity curve
+    # 5. Sort trades and calculate PnL
     all_trades.sort(key=lambda t: t.entry_timestamp)
     
-    # Calculate PnL and equity curve sequentially
     balance = starting_balance
     for trade in all_trades:
-        risk_amount = balance * risk_per_trade
+        risk_multiplier = 0.5 + abs(trade.confidence - 0.5)
+        dynamic_risk = risk_per_trade * risk_multiplier
+        risk_amount = balance * dynamic_risk
+        
         sl_pct = abs(trade.entry_price - (trade.exit_price if trade.status == 'loss' else trade.entry_price * (1-0.02))) / trade.entry_price
         if sl_pct > 0:
             position_size_usd = risk_amount / sl_pct
@@ -820,24 +881,25 @@ def run_ml_backtest(model_path, data_files, output_dir, starting_balance=10000, 
             trade.pnl_usd = 0
             trade.pnl_pct = 0
             trade.balance = balance
-
+            
     print(f"Backtest complete. Total trades executed: {len(all_trades)}")
     generate_full_backtest_report(all_trades, output_dir, starting_balance)
 
 
-def run_pipeline(is_quick_test: bool):
+def run_pipeline(is_quick_test: bool, future_window: int):
     """
-    Encapsulates the entire ML pipeline from data loading to backtesting,
-    now featuring Walk-Forward Validation.
+    Encapsulates the entire ML pipeline for a given future_window.
     """
     start_time = time.time()
 
     # --- Configuration based on mode ---
     run_mode = "Quick Test" if is_quick_test else "Full Run"
-    output_folder = "quick_test_output" if is_quick_test else "full_run_output"
-    epochs = QUICK_TEST_EPOCHS if is_quick_test else EPOCHS
-    symbol_limit = QUICK_TEST_SYMBOL_COUNT if is_quick_test else None
-    batch_size = QUICK_TEST_BATCH_SIZE if is_quick_test else FULL_RUN_BATCH_SIZE
+    # Create a unique output folder for each future_window run
+    output_folder = f"quick_test_output_fw{future_window}" if is_quick_test else f"full_run_output_fw{future_window}"
+    
+    epochs = Config.QUICK_TEST_EPOCHS if is_quick_test else Config.EPOCHS
+    symbol_limit = Config.QUICK_TEST_SYMBOL_COUNT if is_quick_test else None
+    batch_size = Config.QUICK_TEST_BATCH_SIZE if is_quick_test else Config.FULL_RUN_BATCH_SIZE
     n_splits = 2 if is_quick_test else 5 # Fewer splits for a quick test
     
     model_output_dir = os.path.join(output_folder, "model")
@@ -850,86 +912,82 @@ def run_pipeline(is_quick_test: bool):
     for d in [model_output_dir, backtest_report_dir, training_report_dir]:
         os.makedirs(d)
 
-    print(f"--- Starting {run_mode} with Walk-Forward Validation ({n_splits} splits) ---")
+    print(f"\n{'='*80}")
+    print(f"--- Starting {run_mode} for future_window={future_window} ---")
+    print(f"{'='*80}")
 
     try:
-        # Step 1: Build a memory-efficient map of the data samples
-        print(f"\n[Step 1/4] Scanning and sorting all data samples...")
-        sample_map, sorted_labels = get_chronological_sample_map_and_labels(symbol_limit)
+        # Step 1: Build a memory-efficient map of the data samples for the given future_window
+        print(f"\n[Step 1/4] Scanning data for future_window={future_window}...")
+        sample_map, sorted_labels = get_chronological_sample_map_and_labels(future_window, symbol_limit)
         
-        if len(sample_map) < 200: # Need enough data for multiple splits
-            print("Error: Not enough data for walk-forward validation.")
-            return False
+        if len(sample_map) < 200:
+            print(f"Error: Not enough data for future_window={future_window}. Skipping.")
+            return None, None # Return None for results if skipped
 
         # Get one sample to determine the shape and type for tf.data.Dataset.
-        # This is needed for the generator's output signature.
         temp_features, temp_label = next(data_generator(sample_map, [0]))
-        output_signature = (
-            tf.TensorSpec(shape=temp_features.shape, dtype=temp_features.dtype),
-            tf.TensorSpec(shape=(), dtype=temp_label.dtype)
-        )
-        # Clean up temporary variables
-        del temp_features
-        del temp_label
+        output_signature = (tf.TensorSpec(shape=temp_features.shape, dtype=temp_features.dtype), tf.TensorSpec(shape=(), dtype=temp_label.dtype))
+        del temp_features, temp_label
         
         # --- Walk-Forward Validation Setup ---
         tscv = TimeSeriesSplit(n_splits=n_splits)
         fold_metrics = []
         best_hps = None
+        scaler = None
         
         final_model, final_history, final_y_val, final_y_pred_probs = None, None, None, None
 
         print(f"\n[Step 2/4] Starting Walk-Forward Validation...")
-        # We split a dummy array of indices, not the actual data X, to save memory
         for fold, (train_index, val_index) in enumerate(tscv.split(np.arange(len(sample_map)))):
             print(f"\n--- Fold {fold + 1}/{n_splits} ---")
             
-            # We don't load all X and y into memory. We get the labels for the fold from the pre-scanned array.
             y_train, y_val = sorted_labels[train_index], sorted_labels[val_index]
-            
             print(f"Train size: {len(train_index)}, Validation size: {len(val_index)}")
             
-            # --- Create tf.data.Dataset for the current fold using the memory-efficient generator ---
-            train_dataset = tf.data.Dataset.from_generator(
-                lambda: data_generator(sample_map, train_index),
-                output_signature=output_signature
-            ).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-            
-            val_dataset = tf.data.Dataset.from_generator(
-                lambda: data_generator(sample_map, val_index),
-                output_signature=output_signature
-            ).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+            train_dataset_raw = tf.data.Dataset.from_generator(lambda: data_generator(sample_map, train_index), output_signature=output_signature)
+            val_dataset_raw = tf.data.Dataset.from_generator(lambda: data_generator(sample_map, val_index), output_signature=output_signature)
 
-            # Calculate class weights for the current training fold using the pre-scanned labels
+            if scaler is None:
+                print("Fitting global feature scaler on the first training fold...")
+                training_features_for_scaling = [x for x, y in train_dataset_raw]
+                if not training_features_for_scaling:
+                    print("Error: No training data to fit scaler."); return None, None
+                n_samples, seq_len, n_features = np.array(training_features_for_scaling).shape
+                reshaped_features = np.array(training_features_for_scaling).reshape(-1, n_features)
+                scaler = StandardScaler().fit(reshaped_features)
+                scaler_path = os.path.join(model_output_dir, 'global_scaler.joblib')
+                joblib.dump(scaler, scaler_path)
+                print(f"Global scaler saved to {scaler_path}")
+
+            def scale_features(features, label):
+                def _scale(features):
+                    shape = features.shape
+                    reshaped = tf.reshape(features, [-1, shape[-1]])
+                    scaled = scaler.transform(reshaped.numpy())
+                    return tf.reshape(scaled, shape)
+                scaled_features = tf.py_function(_scale, [features], tf.float32)
+                return scaled_features, label
+
+            train_dataset = train_dataset_raw.map(scale_features, num_parallel_calls=tf.data.AUTOTUNE).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+            val_dataset = val_dataset_raw.map(scale_features, num_parallel_calls=tf.data.AUTOTUNE).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
             neg, pos = np.sum(y_train == 0), np.sum(y_train == 1)
             class_weight = {(1 / neg) * (len(y_train) / 2.0): 0, (1 / pos) * (len(y_train) / 2.0): 1} if neg > 0 and pos > 0 else None
 
-            # --- Hyperparameter Search (only on the first, smallest fold) ---
             if best_hps is None:
                 print("\nRunning hyperparameter search on the first fold...")
                 tuner = run_hyperparameter_search(train_dataset, val_dataset, epochs, is_quick_test)
                 best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
-                
-                print(f"\n--- Best Hyperparameters Found ---")
+                print(f"\n--- Best Hyperparameters Found for fw={future_window} ---")
                 print(best_hps.values)
                 hps_path = os.path.join(training_report_dir, 'best_hyperparameters.json')
                 with open(hps_path, 'w') as f: json.dump(best_hps.values, f, indent=4)
                 print(f"Best hyperparameters saved to {hps_path}")
 
-            # --- Build and Train Model for the current fold ---
-            print("\nBuilding and training model for the current fold...")
-            # Build a new model with the best HPs for each fold to avoid data leakage
             model = tuner.hypermodel.build(best_hps)
-            history = model.fit(
-                train_dataset,
-                validation_data=val_dataset,
-                epochs=epochs,
-                class_weight=class_weight,
-                callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5)],
-                verbose=1
-            )
+            history = model.fit(train_dataset, validation_data=val_dataset, epochs=epochs, class_weight=class_weight, callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5)], verbose=1)
             
-            # --- Evaluate and store metrics ---
             loss, acc = model.evaluate(val_dataset, verbose=0)
             y_pred_probs = model.predict(val_dataset)
             y_pred = (y_pred_probs > 0.5).astype(int)
@@ -938,92 +996,96 @@ def run_pipeline(is_quick_test: bool):
             fold_metrics.append({'loss': loss, 'accuracy': acc, 'report': report})
             print(f"Fold {fold + 1} Validation Accuracy: {acc:.4f}")
             
-            # The model from the final fold is used for the final backtest
             if fold == n_splits - 1:
                 final_model = model
                 final_history = history
                 final_y_val = y_val
                 final_y_pred_probs = y_pred_probs
 
-        # --- Aggregating and Reporting Walk-Forward Results ---
-        print(f"\n--- Walk-Forward Validation Complete ---")
+        print(f"\n--- Walk-Forward Validation Complete for fw={future_window} ---")
         generate_walk_forward_report(fold_metrics, best_hps, training_report_dir)
         
-        # --- Generate report for the final model's training history ---
         if final_history:
             print("\nGenerating training history report for the final model...")
             generate_training_report(final_history, final_y_val, final_y_pred_probs, training_report_dir)
 
-        # Save the final model
         trained_model_path = os.path.join(model_output_dir, "lstm_trader.keras")
         final_model.save(trained_model_path)
-        print(f"Final model trained on the last fold saved to {trained_model_path}")
+        print(f"Final model for fw={future_window} saved to {trained_model_path}")
 
-        # Step 3: Run ML-powered backtest
-        print(f"\n[Step 3/4] Running ML-powered backtest on the final model...")
+        print(f"\n[Step 3/4] Running ML-powered backtest...")
         raw_files_path = os.path.join('data', 'raw', '*', '*.parquet')
         raw_data_files = glob.glob(raw_files_path)
-        if symbol_limit:
-            raw_data_files = raw_data_files[:symbol_limit]
+        if symbol_limit: raw_data_files = raw_data_files[:symbol_limit]
         
-        run_ml_backtest(trained_model_path, raw_data_files, backtest_report_dir, starting_balance=10000)
+        run_ml_backtest(trained_model_path, raw_data_files, backtest_report_dir, starting_balance=Config.STARTING_BALANCE)
 
-        # Step 4: Finalization
-        print(f"\n[Step 4/4] {run_mode} finished.")
         total_time = time.time() - start_time
-        print(f"Total execution time for {run_mode}: {total_time:.2f} seconds.")
+        print(f"\n[Step 4/4] Pipeline for fw={future_window} finished in {total_time:.2f} seconds.")
+        
+        # Read the summary to get the final PnL to return for comparison
+        summary_path = os.path.join(backtest_report_dir, 'backtest_summary.txt')
+        with open(summary_path, 'r') as f:
+            summary_content = f.read()
+        
+        return summary_content, best_hps.values
 
     except Exception as e:
-        print(f"\n--- {run_mode} FAILED ---")
+        print(f"\n--- Pipeline FAILED for future_window={future_window} ---")
         import traceback
         traceback.print_exc()
-        return False
-
-    print(f"\n--- {run_mode} Finished Successfully ---")
-    return True
-
+        return None, None
 
 def main():
-    """Main function to orchestrate the quick test and full run."""
+    """
+    Main function to orchestrate the ML pipeline.
+    It now iterates through different future_window values to find the best one.
+    """
     # --- Check if preprocessing is needed ---
     processed_path = os.path.join('data', 'processed')
-    # If the processed data directory does not exist or is empty, run the preprocessing script
     if not os.path.exists(processed_path) or not os.listdir(processed_path):
         print("--- Processed data not found. Running preprocessing script. ---")
         import subprocess
-        # This will trigger the download and processing logic within preprocess_data.py
         subprocess.run(['python3', 'preprocess_data.py'], check=True)
     else:
         print("--- Processed data found. Skipping preprocessing step. ---")
 
-    # We need to declare the global here before any access.
-    global QUICK_TEST
+    all_results = {}
+
+    for fw in Config.FUTURE_WINDOW_OPTIONS:
+        # Run the entire pipeline for one future_window value
+        summary, hps = run_pipeline(is_quick_test=Config.QUICK_TEST, future_window=fw)
+        if summary:
+            all_results[fw] = {'summary': summary, 'hyperparameters': hps}
+
+    # --- Final Summary ---
+    print("\n\n" + "="*80)
+    print("--- Hyperparameter Search Across All Future Windows Complete ---")
+    print("="*80)
     
-    # Hold the initial value of the flag.
-    run_quick_test_first = QUICK_TEST
+    best_fw = None
+    best_pnl = -float('inf')
 
-    if run_quick_test_first:
-        print("--- Running Quick Test ---")
-        # Ensure the global flag is set correctly for the pipeline
-        QUICK_TEST = True
-        success = run_pipeline(is_quick_test=True)
+    for fw, result in all_results.items():
+        print(f"\n--- Results for future_window = {fw} ---")
+        # A simple way to parse PnL from the summary string
+        try:
+            pnl_line = [line for line in result['summary'].split('\n') if "Total Profit" in line][0]
+            pnl_str = pnl_line.split('$')[1].split(' ')[0].replace(',', '')
+            pnl = float(pnl_str)
+            print(f"  - Final PnL: ${pnl:,.2f}")
+            if pnl > best_pnl:
+                best_pnl = pnl
+                best_fw = fw
+        except (IndexError, ValueError) as e:
+            print(f"  - Could not parse PnL from summary. Error: {e}")
+        print(f"  - Best Hyperparameters: {result['hyperparameters']}")
 
-        if not success:
-            print("\n--- Quick Test FAILED. Halting execution. ---")
-            return
-
-        print("\n--- Quick Test PASSED. Proceeding to Full Run. ---")
-        
-        quick_test_folder = "quick_test_output"
-        if os.path.exists(quick_test_folder):
-            print(f"Cleaning up {quick_test_folder} directory...")
-            shutil.rmtree(quick_test_folder)
-
-    # Proceed to the full run
-    print("\n--- Preparing for Full Run ---")
-    # Ensure the global flag is set to False for the full run
-    QUICK_TEST = False
-    run_pipeline(is_quick_test=False)
+    print("\n--- Overall Best Configuration ---")
+    if best_fw:
+        print(f"Best future_window: {best_fw} with a PnL of ${best_pnl:,.2f}")
+    else:
+        print("No successful runs to determine the best configuration.")
 
     print("\n--- All Processes Finished ---")
 
