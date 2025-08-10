@@ -522,12 +522,9 @@ def run_hyperparameter_search(train_dataset, val_dataset, epochs, is_quick_test=
         max_epochs=epochs,
         factor=3,
         directory='hyperparameter_tuning',
-        project_name='lstm_trader_tuning'
+        project_name='lstm_trader_tuning',
+        overwrite=False
     )
-
-    # Clear tuning results from previous runs
-    if os.path.exists('hyperparameter_tuning'):
-        shutil.rmtree('hyperparameter_tuning')
 
     stop_early = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3)
     
