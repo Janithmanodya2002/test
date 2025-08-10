@@ -454,7 +454,7 @@ def data_generator(sample_map, indices_to_yield):
             
             # Yield the required samples one by one from the loaded data
             for i in indices_in_file:
-                yield (features_array[i], labels_array[i])
+                yield (features_array[i].astype(np.float32), labels_array[i].astype(np.int32))
 
 def generate_training_report(history, y_true, y_pred_probs, output_dir):
     """Generates and saves a report of the model's training and performance."""
@@ -521,70 +521,71 @@ def generate_training_report(history, y_true, y_pred_probs, output_dir):
     print(f"Training report saved to {output_dir}")
 
 
-def run_hyperparameter_search(train_dataset, val_dataset, epochs, is_quick_test=False):
+def build_model_for_tuning(hp, input_shape):
+    """Builds the model for hyperparameter tuning."""
+    inputs = tf.keras.Input(shape=input_shape)
+    
+    hp_l2_reg = hp.Choice('l2_reg', values=[1e-2, 1e-3, 1e-4])
+
+    hp_units_1 = hp.Int('units_1', min_value=64, max_value=256, step=64)
+    x = Bidirectional(LSTM(units=hp_units_1, return_sequences=True, kernel_regularizer=l2(hp_l2_reg)))(inputs)
+    hp_dropout_1 = hp.Float('dropout_1', min_value=0.2, max_value=0.6, step=0.1)
+    x = Dropout(hp_dropout_1)(x)
+
+    hp_units_2 = hp.Int('units_2', min_value=32, max_value=128, step=32)
+    x = Bidirectional(LSTM(units=hp_units_2, return_sequences=True, kernel_regularizer=l2(hp_l2_reg)))(x)
+
+    hp_num_heads = hp.Int('num_heads', min_value=2, max_value=8, step=2)
+    # For self-attention, query, value, and key are the same.
+    x = MultiHeadAttention(num_heads=hp_num_heads, key_dim=hp_units_2)(x, x)
+    
+    x = GlobalAveragePooling1D()(x)
+
+    hp_dropout_2 = hp.Float('dropout_2', min_value=0.2, max_value=0.6, step=0.1)
+    x = Dropout(hp_dropout_2)(x)
+
+    hp_dense_units = hp.Int('dense_units', min_value=32, max_value=128, step=32)
+    x = Dense(units=hp_dense_units, activation='relu', kernel_regularizer=l2(hp_l2_reg))(x)
+    
+    outputs = Dense(1, activation='sigmoid', dtype='float32')(x)
+
+    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+
+    hp_learning_rate = hp.Choice('learning_rate', values=[1e-3, 5e-4, 1e-4])
+
+    model.compile(optimizer=Adam(learning_rate=hp_learning_rate),
+                  loss='binary_crossentropy',
+                  metrics=['accuracy'])
+    return model
+
+
+def run_hyperparameter_search(train_dataset, val_dataset, epochs, future_window, is_quick_test=False):
     """Runs hyperparameter search using Keras Tuner."""
     print("--- Starting Hyperparameter Search ---")
-    
+
     input_shape = train_dataset.element_spec[0].shape[1:]
-
-    def build_model(hp):
-        """Builds the model for hyperparameter tuning."""
-        inputs = tf.keras.Input(shape=input_shape)
-        
-        hp_l2_reg = hp.Choice('l2_reg', values=[1e-2, 1e-3, 1e-4, 1e-5])
-
-        hp_units_1 = hp.Int('units_1', min_value=64, max_value=256, step=64)
-        x = Bidirectional(LSTM(units=hp_units_1, return_sequences=True, kernel_regularizer=l2(hp_l2_reg)))(inputs)
-        hp_dropout_1 = hp.Float('dropout_1', min_value=0.1, max_value=0.4, step=0.1)
-        x = Dropout(hp_dropout_1)(x)
-
-        hp_units_2 = hp.Int('units_2', min_value=32, max_value=128, step=32)
-        x = Bidirectional(LSTM(units=hp_units_2, return_sequences=True, kernel_regularizer=l2(hp_l2_reg)))(x)
-
-        hp_num_heads = hp.Int('num_heads', min_value=2, max_value=8, step=2)
-        # For self-attention, query, value, and key are the same.
-        x = MultiHeadAttention(num_heads=hp_num_heads, key_dim=hp_units_2)(x, x)
-        
-        x = GlobalAveragePooling1D()(x)
-
-        hp_dropout_2 = hp.Float('dropout_2', min_value=0.2, max_value=0.5, step=0.1)
-        x = Dropout(hp_dropout_2)(x)
-
-        hp_dense_units = hp.Int('dense_units', min_value=32, max_value=128, step=32)
-        x = Dense(units=hp_dense_units, activation='relu', kernel_regularizer=l2(hp_l2_reg))(x)
-        
-        outputs = Dense(1, activation='sigmoid', dtype='float32')(x)
-
-        model = tf.keras.Model(inputs=inputs, outputs=outputs)
-
-        hp_learning_rate = hp.Choice('learning_rate', values=[1e-3, 5e-4, 1e-4])
-
-        model.compile(optimizer=Adam(learning_rate=hp_learning_rate),
-                      loss='binary_crossentropy',
-                      metrics=['accuracy'])
-        return model
+    build_fn = lambda hp: build_model_for_tuning(hp, input_shape)
 
     tuner = kt.Hyperband(
-        build_model,
+        build_fn,
         objective='val_accuracy',
         max_epochs=epochs,
         factor=3,
         directory='hyperparameter_tuning',
-        project_name='lstm_trader_tuning',
+        project_name=f'lstm_trader_tuning_fw{future_window}',
         overwrite=False
     )
 
     stop_early = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3)
-    
+
     search_epochs = 3 if is_quick_test else epochs
     print(f"Tuner search running for a max of {search_epochs} epochs.")
     tuner.search(train_dataset, epochs=search_epochs, validation_data=val_dataset, callbacks=[stop_early])
 
     best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
-    
-    # Build the model with the optimal hyperparameters
-    model = tuner.hypermodel.build(best_hps)
-    return model, best_hps
+
+    # Return the tuner and the best hyperparameters
+    return tuner, best_hps
 
 
 def generate_walk_forward_report(fold_metrics, best_hps, output_dir):
@@ -967,26 +968,63 @@ def run_pipeline(is_quick_test: bool, future_window: int):
                     scaled = scaler.transform(reshaped.numpy())
                     return tf.reshape(scaled, shape)
                 scaled_features = tf.py_function(_scale, [features], tf.float32)
+                
+                # Restore the shape information lost by tf.py_function
+                scaled_features.set_shape(train_dataset_raw.element_spec[0].shape)
+                
                 return scaled_features, label
 
-            train_dataset = train_dataset_raw.map(scale_features, num_parallel_calls=tf.data.AUTOTUNE).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-            val_dataset = val_dataset_raw.map(scale_features, num_parallel_calls=tf.data.AUTOTUNE).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+            train_dataset = train_dataset_raw.map(scale_features, num_parallel_calls=tf.data.AUTOTUNE).repeat().batch(batch_size).prefetch(tf.data.AUTOTUNE)
+            val_dataset = val_dataset_raw.map(scale_features, num_parallel_calls=tf.data.AUTOTUNE).repeat().batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
             neg, pos = np.sum(y_train == 0), np.sum(y_train == 1)
             class_weight = {(1 / neg) * (len(y_train) / 2.0): 0, (1 / pos) * (len(y_train) / 2.0): 1} if neg > 0 and pos > 0 else None
 
             if best_hps is None:
-                print("\nRunning hyperparameter search on the first fold...")
-                tuner = run_hyperparameter_search(train_dataset, val_dataset, epochs, is_quick_test)
-                best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
-                print(f"\n--- Best Hyperparameters Found for fw={future_window} ---")
-                print(best_hps.values)
                 hps_path = os.path.join(training_report_dir, 'best_hyperparameters.json')
-                with open(hps_path, 'w') as f: json.dump(best_hps.values, f, indent=4)
-                print(f"Best hyperparameters saved to {hps_path}")
+                if os.path.exists(hps_path):
+                    print(f"--- Loading best hyperparameters from {hps_path} ---")
+                    with open(hps_path, 'r') as f:
+                        hps_values = json.load(f)
+                    best_hps = kt.HyperParameters.from_config(hps_values)
+                    print("Loaded hyperparameters:")
+                    print(best_hps.values)
+                    # We still need a tuner object to build the model from hps.
+                    # The project_name should be consistent.
+                    input_shape = train_dataset.element_spec[0].shape[1:]
+                    build_fn = lambda hp: build_model_for_tuning(hp, input_shape)
+                    tuner = kt.Hyperband(
+                        build_fn,
+                        objective='val_accuracy',
+                        max_epochs=epochs,
+                        factor=3,
+                        directory='hyperparameter_tuning',
+                        project_name=f'lstm_trader_tuning_fw{future_window}',
+                        overwrite=False)
+                else:
+                    print("--- No saved hyperparameters found. Running search... ---")
+                    tuner, best_hps = run_hyperparameter_search(train_dataset, val_dataset, epochs, future_window, is_quick_test)
+                    print(f"\n--- Best Hyperparameters Found for fw={future_window} ---")
+                    print(best_hps.values)
+                    # Save the best HPs to a file for future runs
+                    with open(hps_path, 'w') as f:
+                        json.dump(best_hps.get_config(), f, indent=4)
+                    print(f"Best hyperparameters saved to {hps_path}")
 
             model = tuner.hypermodel.build(best_hps)
-            history = model.fit(train_dataset, validation_data=val_dataset, epochs=epochs, class_weight=class_weight, callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5)], verbose=1)
+            steps_per_epoch = len(train_index) // batch_size
+            validation_steps = len(val_index) // batch_size
+            
+            history = model.fit(
+                train_dataset,
+                validation_data=val_dataset,
+                epochs=epochs,
+                steps_per_epoch=steps_per_epoch,
+                validation_steps=validation_steps,
+                class_weight=class_weight,
+                callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5)],
+                verbose=1
+            )
             
             loss, acc = model.evaluate(val_dataset, verbose=0)
             y_pred_probs = model.predict(val_dataset)
