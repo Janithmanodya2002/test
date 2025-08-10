@@ -559,7 +559,7 @@ def build_model_for_tuning(hp, input_shape):
     return model
 
 
-def run_hyperparameter_search(train_dataset, val_dataset, epochs, future_window, is_quick_test=False):
+def run_hyperparameter_search(train_dataset, val_dataset, epochs, future_window, steps_per_epoch, validation_steps, is_quick_test=False):
     """Runs hyperparameter search using Keras Tuner."""
     print("--- Starting Hyperparameter Search ---")
 
@@ -580,7 +580,7 @@ def run_hyperparameter_search(train_dataset, val_dataset, epochs, future_window,
 
     search_epochs = 3 if is_quick_test else epochs
     print(f"Tuner search running for a max of {search_epochs} epochs.")
-    tuner.search(train_dataset, epochs=search_epochs, validation_data=val_dataset, callbacks=[stop_early])
+    tuner.search(train_dataset, epochs=search_epochs, validation_data=val_dataset, callbacks=[stop_early], steps_per_epoch=steps_per_epoch, validation_steps=validation_steps)
 
     best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
 
@@ -977,6 +977,9 @@ def run_pipeline(is_quick_test: bool, future_window: int):
             train_dataset = train_dataset_raw.map(scale_features, num_parallel_calls=tf.data.AUTOTUNE).repeat().batch(batch_size).prefetch(tf.data.AUTOTUNE)
             val_dataset = val_dataset_raw.map(scale_features, num_parallel_calls=tf.data.AUTOTUNE).repeat().batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
+            steps_per_epoch = len(train_index) // batch_size
+            validation_steps = len(val_index) // batch_size
+
             neg, pos = np.sum(y_train == 0), np.sum(y_train == 1)
             class_weight = {(1 / neg) * (len(y_train) / 2.0): 0, (1 / pos) * (len(y_train) / 2.0): 1} if neg > 0 and pos > 0 else None
 
@@ -1003,7 +1006,7 @@ def run_pipeline(is_quick_test: bool, future_window: int):
                         overwrite=False)
                 else:
                     print("--- No saved hyperparameters found. Running search... ---")
-                    tuner, best_hps = run_hyperparameter_search(train_dataset, val_dataset, epochs, future_window, is_quick_test)
+                    tuner, best_hps = run_hyperparameter_search(train_dataset, val_dataset, epochs, future_window, steps_per_epoch, validation_steps, is_quick_test)
                     print(f"\n--- Best Hyperparameters Found for fw={future_window} ---")
                     print(best_hps.values)
                     # Save the best HPs to a file for future runs
@@ -1012,8 +1015,6 @@ def run_pipeline(is_quick_test: bool, future_window: int):
                     print(f"Best hyperparameters saved to {hps_path}")
 
             model = tuner.hypermodel.build(best_hps)
-            steps_per_epoch = len(train_index) // batch_size
-            validation_steps = len(val_index) // batch_size
             
             history = model.fit(
                 train_dataset,
