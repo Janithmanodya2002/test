@@ -12,17 +12,24 @@ import shutil
 import multiprocessing as mp
 import json
 from datetime import datetime, timedelta
+from sklearn.preprocessing import StandardScaler
+import joblib
 
 # --- Configuration ---
-SYMBOLS = pd.read_csv('symbols.csv').iloc[:, 0].tolist()
-TIMEFRAMES = ['1h', '4h']
-PRIMARY_TIMEFRAME = '1h'
-SEQUENCE_LENGTH = 60
-PROFIT_LOSS_RATIO = 1.5
-STOP_LOSS_PCT = 0.02
-DATA_DIR = 'data'
-RAW_DIR = os.path.join(DATA_DIR, 'raw')
-PROCESSED_DIR = os.path.join(DATA_DIR, 'processed')
+class Config:
+    """
+    Holds all configuration parameters for the data preprocessing script.
+    """
+    SYMBOLS = pd.read_csv('symbols.csv').iloc[:, 0].tolist()
+    TIMEFRAMES = ['1h', '4h']
+    PRIMARY_TIMEFRAME = '1h'
+    SEQUENCE_LENGTH = 60
+    FUTURE_WINDOW_OPTIONS = [10, 20, 30, 40]  # New: list of windows to generate data for
+    PROFIT_LOSS_RATIO = 1.5
+    STOP_LOSS_PCT = 0.02
+    DATA_DIR = 'data'
+    RAW_DIR = os.path.join(DATA_DIR, 'raw')
+    PROCESSED_DIR = os.path.join(DATA_DIR, 'processed')
 
 # --- Helper Functions ---
 
@@ -62,10 +69,15 @@ def download_data_for_symbol(symbol, timeframe):
         # number_of_trades should be an integer
         df['number_of_trades'] = pd.to_numeric(df['number_of_trades'], errors='coerce').astype('Int64')
 
+        # --- Log Dropped Rows ---
+        initial_rows = len(df)
         # Drop any rows where key numeric data couldn't be parsed
         df.dropna(subset=['open', 'high', 'low', 'close', 'volume'], inplace=True)
+        dropped_rows = initial_rows - len(df)
+        if dropped_rows > 0:
+            print(f"[Download] Dropped {dropped_rows} rows from {symbol} ({timeframe}) due to missing values.")
         
-        symbol_dir = os.path.join(RAW_DIR, symbol)
+        symbol_dir = os.path.join(Config.RAW_DIR, symbol)
         os.makedirs(symbol_dir, exist_ok=True)
         
         filepath = os.path.join(symbol_dir, f'{timeframe}.parquet')
@@ -85,7 +97,7 @@ def download_all_raw_data():
     """
     print("--- Attempting to download fresh raw data from Binance ---")
     
-    tasks = [(symbol, timeframe) for symbol in SYMBOLS for timeframe in TIMEFRAMES]
+    tasks = [(symbol, timeframe) for symbol in Config.SYMBOLS for timeframe in Config.TIMEFRAMES]
             
     try:
         # Use a process pool for parallel downloads
@@ -114,6 +126,7 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df.ta.macd(append=True)
     df.ta.bbands(append=True)
     df.ta.atr(append=True)
+    df.ta.obv(append=True) # Added On-Balance Volume
     df.dropna(inplace=True)
     return df
 
@@ -126,8 +139,8 @@ def create_labels(df: pd.DataFrame, future_window: int = 20) -> pd.DataFrame:
     df['future_high'] = df['high'].rolling(window=future_window).max().shift(-future_window)
     df['future_low'] = df['low'].rolling(window=future_window).min().shift(-future_window)
     
-    take_profit_long = df['close'] * (1 + STOP_LOSS_PCT * PROFIT_LOSS_RATIO)
-    stop_loss_long = df['close'] * (1 - STOP_LOSS_PCT)
+    take_profit_long = df['close'] * (1 + Config.STOP_LOSS_PCT * Config.PROFIT_LOSS_RATIO)
+    stop_loss_long = df['close'] * (1 - Config.STOP_LOSS_PCT)
     
     win_long = (df['future_high'] >= take_profit_long) & (df['future_low'] > stop_loss_long)
     loss_long = (df['future_low'] <= stop_loss_long)
@@ -140,44 +153,35 @@ def create_labels(df: pd.DataFrame, future_window: int = 20) -> pd.DataFrame:
     return df
 
 def create_sequences(df: pd.DataFrame, feature_cols: list) -> (np.ndarray, np.ndarray, np.ndarray):
-    """Creates sequences of features and corresponding labels."""
+    """
+    Creates sequences from a DataFrame that is already scaled.
+    """
     X, y, timestamps = [], [], []
-    for i in range(len(df) - SEQUENCE_LENGTH):
-        seq = df.iloc[i:i + SEQUENCE_LENGTH]
-        label = df.iloc[i + SEQUENCE_LENGTH]['label']
-        timestamp = df.index[i + SEQUENCE_LENGTH]
+    
+    # The feature data is already scaled, so we just need to create sequences
+    feature_data = df[feature_cols].to_numpy()
+    
+    for i in range(len(df) - Config.SEQUENCE_LENGTH):
+        # The sequence is a view into the feature_data array
+        seq = feature_data[i:i + Config.SEQUENCE_LENGTH]
         
-        first_close = seq['close'].iloc[0]
-        first_volume = seq['volume'].iloc[0] if 'volume' in seq.columns and seq['volume'].iloc[0] > 0 else 1
+        # The label corresponds to the end of the sequence
+        label = df.iloc[i + Config.SEQUENCE_LENGTH]['label']
+        timestamp = df.index[i + Config.SEQUENCE_LENGTH]
 
-        normalized_seq_df = seq[feature_cols].copy()
-        
-        price_cols = [col for col in feature_cols if any(c in col for c in ['open', 'high', 'low', 'close', 'BBL', 'BBM', 'BBU', 'ATRr'])]
-        for col in price_cols:
-            if first_close > 0:
-                normalized_seq_df[col] = (normalized_seq_df[col] / first_close) - 1
-        
-        if 'volume' in feature_cols:
-            normalized_seq_df['volume'] = (normalized_seq_df['volume'] / first_volume) - 1
-
-        for col in ['RSI_14', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9']:
-            if col in feature_cols:
-                normalized_seq_df[col] = normalized_seq_df[col] / 100.0
-
-        normalized_seq_df.fillna(0, inplace=True)
-
-        X.append(normalized_seq_df.to_numpy())
+        X.append(seq)
         y.append(label)
         timestamps.append(timestamp)
         
     return np.array(X), np.array(y), np.array(timestamps)
 
-def process_symbol(symbol: str):
+def process_symbol(args):
     """Processes the data for a single symbol."""
+    symbol, future_window = args
     # Added detailed logging for symbol-by-symbol progress
     print(f"[Process] Starting: {symbol}")
     try:
-        primary_path = os.path.join(RAW_DIR, symbol, f'{PRIMARY_TIMEFRAME}.parquet')
+        primary_path = os.path.join(Config.RAW_DIR, symbol, f'{Config.PRIMARY_TIMEFRAME}.parquet')
         if not os.path.exists(primary_path):
             # This will be logged by the main loop
             print(f"[Process] SKIPPED: {symbol} - Missing primary data file: {primary_path}")
@@ -194,11 +198,11 @@ def process_symbol(symbol: str):
         df_primary = calculate_features(df_primary.copy())
 
         df_merged = df_primary.copy()
-        for timeframe in TIMEFRAMES:
-            if timeframe == PRIMARY_TIMEFRAME:
+        for timeframe in Config.TIMEFRAMES:
+            if timeframe == Config.PRIMARY_TIMEFRAME:
                 continue
             
-            htf_path = os.path.join(RAW_DIR, symbol, f'{timeframe}.parquet')
+            htf_path = os.path.join(Config.RAW_DIR, symbol, f'{timeframe}.parquet')
             if not os.path.exists(htf_path):
                 print(f"[Process] Warning: Missing {timeframe} data for {symbol}. Skipping multi-timeframe features for it.")
                 continue
@@ -217,26 +221,31 @@ def process_symbol(symbol: str):
 
         df_merged.dropna(inplace=True)
         
-        df_labeled = create_labels(df_merged.copy())
+        df_labeled = create_labels(df_merged.copy(), future_window=future_window)
         
         feature_cols = [col for col in df_labeled.columns if col not in ['label', 'future_high', 'future_low']]
         
-        # Ensure all feature columns are numeric before creating sequences.
+        # Ensure all feature columns are numeric before scaling.
         for col in feature_cols:
             df_labeled[col] = pd.to_numeric(df_labeled[col], errors='coerce')
-        
-        # Drop rows that have NaN in any of the feature columns after coercion
         df_labeled.dropna(subset=feature_cols, inplace=True)
-        
+
+        if df_labeled.empty:
+            print(f"[Process] SKIPPED: {symbol} - No data left after cleaning.")
+            return None
+
+        # --- Create and Save Sequences (Unscaled) ---
+        # The scaling will now be handled globally in the ML pipeline
+        # to prevent data leakage and ensure consistency.
         X, y, timestamps = create_sequences(df_labeled, feature_cols)
         
         if len(X) > 0:
-            processed_symbol_dir = os.path.join(PROCESSED_DIR, symbol)
+            processed_symbol_dir = os.path.join(Config.PROCESSED_DIR, symbol)
             os.makedirs(processed_symbol_dir, exist_ok=True)
-            save_path = os.path.join(processed_symbol_dir, f'features_{PRIMARY_TIMEFRAME}.npz')
+            # New filename format includes the future window
+            save_path = os.path.join(processed_symbol_dir, f'features_{Config.PRIMARY_TIMEFRAME}_fw{future_window}.npz')
             np.savez_compressed(save_path, features=X, labels=y, timestamps=timestamps)
-            # Added detailed logging for symbol-by-symbol progress
-            print(f"[Process] Success: {symbol} - Created {len(X)} sequences. Saved to {save_path}")
+            print(f"[Process] Success: {symbol} (fw={future_window}) - Created {len(X)} unscaled sequences. Saved to {save_path}")
             return feature_cols
         else:
             print(f"[Process] SKIPPED: {symbol} - No sequences generated after processing.")
@@ -256,32 +265,38 @@ def main():
     
     # --- Step 1: Handle Raw Data ---
     # Check if raw data directory exists and is not empty
-    if not os.path.exists(RAW_DIR) or not os.listdir(RAW_DIR):
+    if not os.path.exists(Config.RAW_DIR) or not os.listdir(Config.RAW_DIR):
         print("--- Raw data not found. Starting download. ---")
-        os.makedirs(RAW_DIR, exist_ok=True)
+        os.makedirs(Config.RAW_DIR, exist_ok=True)
         download_all_raw_data()
     else:
         print("--- Raw data found. Skipping download. ---")
 
     # --- Step 2: Handle Processed Data ---
     # Check if processed data directory exists and is not empty
-    if not os.path.exists(PROCESSED_DIR) or not os.listdir(PROCESSED_DIR):
+    if not os.path.exists(Config.PROCESSED_DIR) or not os.listdir(Config.PROCESSED_DIR):
         print("\n--- Processed data not found. Starting feature generation. ---")
-        os.makedirs(PROCESSED_DIR, exist_ok=True)
+        os.makedirs(Config.PROCESSED_DIR, exist_ok=True)
         
         feature_columns = None
-        symbols_to_process = [s for s in SYMBOLS if os.path.exists(os.path.join(RAW_DIR, s))]
+        # Prepare arguments for multiprocessing
+        symbols_to_process = [s for s in Config.SYMBOLS if os.path.exists(os.path.join(Config.RAW_DIR, s))]
         if not symbols_to_process:
             print("No raw data fund to process. Please provide data manually in 'data/raw' or run with a clean state.")
             return
+        
+        tasks = []
+        for fw in Config.FUTURE_WINDOW_OPTIONS:
+            for symbol in symbols_to_process:
+                tasks.append((symbol, fw))
 
         with mp.Pool(processes=mp.cpu_count()) as pool:
-            for result in tqdm(pool.imap_unordered(process_symbol, symbols_to_process), total=len(symbols_to_process), desc="Processing Symbols"):
+            for result in tqdm(pool.imap_unordered(process_symbol, tasks), total=len(tasks), desc="Processing Symbols for all Future Windows"):
                 if result and feature_columns is None:
-                    feature_columns = result
+                    feature_columns = result # Capture feature columns from the first successful run
         
         if feature_columns:
-            feature_columns_path = os.path.join(PROCESSED_DIR, 'feature_columns.json')
+            feature_columns_path = os.path.join(Config.PROCESSED_DIR, 'feature_columns.json')
             with open(feature_columns_path, 'w') as f:
                 json.dump(feature_columns, f)
             print(f"\nSaved {len(feature_columns)} feature columns to {feature_columns_path}")
