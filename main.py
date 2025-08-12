@@ -178,6 +178,72 @@ def generate_fib_chart(symbol, klines, trend, swing_high, swing_low, entry_price
 
     return buf
 
+
+def generate_reversal_chart(symbol, klines, signal_details):
+    """
+    Generate a detailed candlestick chart for the reversal strategy.
+    """
+    df = pd.DataFrame(klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    df['dt'] = pd.to_datetime(df['dt'], unit='ms')
+    df.set_index('dt', inplace=True)
+    df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+
+    entry_price = signal_details['entry_price']
+    sl = signal_details['stop_loss']
+    tp = signal_details['take_profit']
+    grabbed_price = signal_details['grabbed_price']
+    signal_type = signal_details['signal']
+
+    # Chart Styling
+    mc = mpf.make_marketcolors(up='#26A69A', down='#EF5350', wick={'up':'#26A69A', 'down':'#EF5350'}, volume='in', ohlc='i')
+    s = mpf.make_mpf_style(base_mpf_style='yahoo', marketcolors=mc, gridcolor='lightgrey', facecolor='white')
+
+    # Plot
+    fig, axlist = mpf.plot(df, type='candle', style=s,
+                          figsize=(8, 4.5),
+                          returnfig=True,
+                          volume=False)
+
+    ax = axlist[0]
+    ax.set_title(f'{symbol} 15m - {signal_type.capitalize()} Reversal Signal', fontsize=16, weight='bold')
+    ax.set_ylabel('Price (USDT)', fontsize=10)
+    ax.tick_params(axis='x', labelsize=10, labelrotation=45)
+    ax.tick_params(axis='y', labelsize=10)
+
+    # Liquidity Grab Level
+    ax.axhline(y=grabbed_price, color='#FF5722', linestyle='--', linewidth=1.5, label='Liquidity Level')
+    ax.text(df.index[-1], grabbed_price, f' Grabbed Level {grabbed_price:.2f}', color='#FF5722', va='center', ha='left', fontsize=9)
+
+    # Current Price
+    current_price = df['close'].iloc[-1]
+    ax.axhline(y=current_price, color='#000000', linestyle='-', linewidth=1)
+    ax.text(df.index[-1], current_price, f' PRICE {current_price:.2f}', color='#000000', va='center', ha='left', fontsize=9, weight='bold')
+
+    # Entry/SL/TP Lines
+    ax.axhline(y=entry_price, color='green', linestyle='-', linewidth=1.2)
+    ax.axhline(y=sl, color='red', linestyle='-', linewidth=1.2)
+    ax.axhline(y=tp, color='blue', linestyle='-', linewidth=1.2)
+
+    x_mid = df.index[0] + (df.index[-1] - df.index[0]) / 2
+    ax.text(x_mid, entry_price, f'ENTRY {entry_price:.2f}', color='green', va='bottom', ha='center', fontsize=10)
+    ax.text(x_mid, sl, f'SL {sl:.2f}', color='red', va='top', ha='center', fontsize=10)
+    ax.text(x_mid, tp, f'TP {tp:.2f}', color='blue', va='bottom', ha='center', fontsize=10)
+
+    # Legend
+    entry_patch = mpatches.Patch(color='green', label='ENTRY')
+    sl_patch = mpatches.Patch(color='red', label='SL')
+    tp_patch = mpatches.Patch(color='blue', label='TP')
+    liquidity_patch = mpatches.Patch(color='#FF5722', label='Liquidity Level')
+    ax.legend(handles=[entry_patch, sl_patch, tp_patch, liquidity_patch], loc='lower left')
+
+    # Save to buffer
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100)
+    buf.seek(0)
+
+    return buf
+
+
 def get_binance_server_time(client):
     """
     Get the current server time from Binance.
@@ -265,64 +331,6 @@ def check_for_divergence(klines, lookback=60, rsi_period=14):
 
     return 'none'
 
-def get_volume_profile(klines, bins=20):
-    """
-    Calculates the Volume Profile for a given set of klines.
-    Returns a pandas Series with IntervalIndex.
-    """
-    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-    for col in ['high', 'low', 'close', 'volume']:
-        df[col] = pd.to_numeric(df[col])
-
-    min_price = df['low'].min()
-    max_price = df['high'].max()
-    
-    # Ensure there's a price range to bin
-    if min_price == max_price:
-        return pd.Series(dtype='float64')
-
-    price_bins = np.linspace(min_price, max_price, bins + 1)
-    df['price_bin'] = pd.cut(df['close'], bins=price_bins, right=False)
-    
-    volume_profile = df.groupby('price_bin')['volume'].sum()
-    
-    return volume_profile
-
-def check_for_high_volume_node(volume_profile, entry_price, tolerance_pct=0.1):
-    """
-    Checks if an entry price is inside or "close" to a High-Volume Node (HVN) bin.
-    HVNs are defined as bins with volume > 1.5 * average volume.
-    POC (Point of Control) is the highest volume node.
-    A tolerance is added to check for prices "close" to an HVN bin.
-    """
-    if volume_profile is None or volume_profile.empty:
-        return False
-
-    avg_volume = volume_profile.mean()
-    poc_bin = volume_profile.idxmax()
-    
-    # Define a helper function to check price with tolerance
-    def is_price_in_bin_with_tolerance(price, price_bin):
-        tolerance_amount = (price_bin.right - price_bin.left) * (tolerance_pct / 100)
-        return (price_bin.left - tolerance_amount) <= price <= (price_bin.right + tolerance_amount)
-
-    # Check if entry is in POC bin with tolerance
-    if is_price_in_bin_with_tolerance(entry_price, poc_bin):
-        return True
-        
-    # Find other HVNs
-    hvns = volume_profile[volume_profile > avg_volume * 1.5]
-    
-    if hvns.empty:
-        return False
-        
-    # Check if entry is in any HVN bin with tolerance
-    for hvn_bin in hvns.index:
-        if is_price_in_bin_with_tolerance(entry_price, hvn_bin):
-            return True
-            
-    return False
-
 def get_swing_points(klines, window=5):
     """
     Identify swing points from kline data.
@@ -387,6 +395,94 @@ def get_fib_retracement(p1, p2, trend):
     entry_price = (golden_zone_start + golden_zone_end) / 2
 
     return entry_price
+
+
+def find_liquidity_grab(klines, swing_highs, swing_lows, tp_rr_ratio):
+    """
+    Identifies a liquidity grab pattern (fake-out).
+    Checks for a candle that wicks past a recent swing point and closes back.
+    Enforces the 10-candle rule.
+    """
+    if not klines or len(klines) < 2:
+        return None
+
+    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    for col in ['timestamp', 'open', 'high', 'low', 'close']:
+        df[col] = pd.to_numeric(df[col])
+    
+    kline_timestamps = df['timestamp'].tolist()
+
+    # Check for Bearish Liquidity Grab (fake-out above swing high)
+    if swing_highs:
+        last_swing_high_timestamp, last_swing_high_price = swing_highs[-1]
+        try:
+            swing_high_kline_index = kline_timestamps.index(last_swing_high_timestamp)
+            for i in range(swing_high_kline_index + 1, len(df)):
+                candle = df.iloc[i]
+                if candle['high'] > last_swing_high_price and candle['close'] < last_swing_high_price:
+                    if i - swing_high_kline_index < 10:
+                        entry_price = candle['close']
+                        stop_loss = candle['high']
+                        take_profit = entry_price - abs(stop_loss - entry_price) * tp_rr_ratio
+                        return {
+                            'signal': 'bearish',
+                            'entry_price': entry_price,
+                            'stop_loss': stop_loss,
+                            'take_profit': take_profit,
+                            'timestamp': candle['timestamp'],
+                            'grabbed_price': last_swing_high_price
+                        }
+                    break 
+        except ValueError:
+            pass
+
+    # Check for Bullish Liquidity Grab (fake-out below swing low)
+    if swing_lows:
+        last_swing_low_timestamp, last_swing_low_price = swing_lows[-1]
+        try:
+            swing_low_kline_index = kline_timestamps.index(last_swing_low_timestamp)
+            for i in range(swing_low_kline_index + 1, len(df)):
+                candle = df.iloc[i]
+                if candle['low'] < last_swing_low_price and candle['close'] > last_swing_low_price:
+                    if i - swing_low_kline_index < 10:
+                        entry_price = candle['close']
+                        stop_loss = candle['low']
+                        take_profit = entry_price + abs(entry_price - stop_loss) * tp_rr_ratio
+                        return {
+                            'signal': 'bullish',
+                            'entry_price': entry_price,
+                            'stop_loss': stop_loss,
+                            'take_profit': take_profit,
+                            'timestamp': candle['timestamp'],
+                            'grabbed_price': last_swing_low_price
+                        }
+                    break
+        except ValueError:
+            pass
+
+    return None
+
+
+def check_htf_confluence(client, symbol, entry_price, higher_timeframe, tolerance_pct, swing_window=5):
+    """
+    Checks if the entry price is near a major support/resistance level on a higher timeframe.
+    """
+    htf_klines = get_klines(client, symbol, interval=higher_timeframe, limit=200)
+    if not htf_klines:
+        return False
+
+    swing_highs_htf, swing_lows_htf = get_swing_points(htf_klines, swing_window)
+
+    for _, price in swing_highs_htf:
+        if abs(entry_price - price) / price < (tolerance_pct / 100):
+            return True
+
+    for _, price in swing_lows_htf:
+        if abs(entry_price - price) / price < (tolerance_pct / 100):
+            return True
+            
+    return False
+
 
 def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_price, leverage, risk_amount_usd=0, use_fixed_risk_amount=False, backtest_balance=None):
     """
@@ -1496,7 +1592,7 @@ async def main():
         chart_image_candles = int(config['chart_image_candles'])
         max_open_positions = int(config['max_open_positions'])
         model_confidence_threshold = config.get('model_confidence_threshold', 0.7) # Use .get for safe access
-        volume_profile_tolerance_pct = float(config['volume_profile_tolerance_pct'])
+        htf_confluence_tolerance_pct = float(config['htf_confluence_tolerance_pct'])
         print("Configuration loaded.")
     except FileNotFoundError:
         print("Error: configuration.csv not found.")
@@ -1736,12 +1832,6 @@ async def main():
                                 await send_telegram_alert(bot, f"❌ Signal Rejected by Divergence Check ❌\nSymbol: {symbol}\nSide: Short\nReason: Bullish divergence found.")
                                 continue
                             
-                            # Volume Profile Check
-                            volume_profile = get_volume_profile(klines_15m)
-                            if not check_for_high_volume_node(volume_profile, entry_price, volume_profile_tolerance_pct):
-                                await send_telegram_alert(bot, f"❌ Signal Rejected by Volume Profile ❌\nSymbol: {symbol}\nSide: Short\nReason: Entry price not at a high-volume node.")
-                                continue
-
                             if ml_model and ml_feature_columns:
                                 klines_short = klines_15m[-lookback_candles_short:]
                                 features_short = generate_live_features(klines_short, ml_feature_columns)
@@ -1779,12 +1869,6 @@ async def main():
                             divergence = check_for_divergence(klines_15m)
                             if divergence == 'bearish':
                                 await send_telegram_alert(bot, f"❌ Signal Rejected by Divergence Check ❌\nSymbol: {symbol}\nSide: Long\nReason: Bearish divergence found.")
-                                continue
-
-                            # Volume Profile Check
-                            volume_profile = get_volume_profile(klines_15m)
-                            if not check_for_high_volume_node(volume_profile, entry_price, volume_profile_tolerance_pct):
-                                await send_telegram_alert(bot, f"❌ Signal Rejected by Volume Profile ❌\nSymbol: {symbol}\nSide: Long\nReason: Entry price not at a high-volume node.")
                                 continue
 
                             if ml_model and ml_feature_columns:
