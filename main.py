@@ -484,6 +484,26 @@ def check_htf_confluence(client, symbol, entry_price, higher_timeframe, toleranc
     return False
 
 
+def check_htf_confluence_backtest(htf_klines, entry_price, tolerance_pct, swing_window=5):
+    """
+    Checks for HTF confluence using pre-fetched kline data for backtesting.
+    """
+    if not htf_klines:
+        return False
+
+    swing_highs_htf, swing_lows_htf = get_swing_points(htf_klines, swing_window)
+
+    for _, price in swing_highs_htf:
+        if abs(entry_price - price) / price < (tolerance_pct / 100):
+            return True
+
+    for _, price in swing_lows_htf:
+        if abs(entry_price - price) / price < (tolerance_pct / 100):
+            return True
+            
+    return False
+
+
 def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_price, leverage, risk_amount_usd=0, use_fixed_risk_amount=False, backtest_balance=None):
     """
     Calculate the order quantity based on risk and leverage.
@@ -622,7 +642,6 @@ def analyze_strategy_behavior(backtest_trades):
     """
     Analyze the performance of the strategy based on different conditions.
     """
-    # Performance by hour
     hourly_performance = {}
     for trade in backtest_trades:
         hour = datetime.datetime.fromtimestamp(trade.entry_timestamp/1000).hour
@@ -634,25 +653,22 @@ def analyze_strategy_behavior(backtest_trades):
         else:
             hourly_performance[hour]['losses'] += 1
 
-    # Performance by trend
-    trend_performance = {'uptrend': {'wins': 0, 'losses': 0, 'total': 0}, 'downtrend': {'wins': 0, 'losses': 0, 'total': 0}}
+    strategy_performance = {
+        'Reversal': {'wins': 0, 'losses': 0, 'total': 0, 'pnl': 0},
+        'Fibonacci': {'wins': 0, 'losses': 0, 'total': 0, 'pnl': 0}
+    }
     for trade in backtest_trades:
-        if "uptrend" in trade.reason_for_entry:
-            trend_performance['uptrend']['total'] += 1
-            if trade.status == 'win':
-                trend_performance['uptrend']['wins'] += 1
-            else:
-                trend_performance['uptrend']['losses'] += 1
-        elif "downtrend" in trade.reason_for_entry:
-            trend_performance['downtrend']['total'] += 1
-            if trade.status == 'win':
-                trend_performance['downtrend']['wins'] += 1
-            else:
-                trend_performance['downtrend']['losses'] += 1
+        strategy = 'Reversal' if 'Reversal' in trade.reason_for_entry else 'Fibonacci'
+        strategy_performance[strategy]['total'] += 1
+        strategy_performance[strategy]['pnl'] += trade.pnl_usd
+        if trade.status == 'win':
+            strategy_performance[strategy]['wins'] += 1
+        else:
+            strategy_performance[strategy]['losses'] += 1
 
     return {
         'hourly_performance': hourly_performance,
-        'trend_performance': trend_performance
+        'strategy_performance': strategy_performance
     }
 
 def generate_drawdown_curve(backtest_trades, starting_balance):
@@ -775,12 +791,12 @@ def generate_summary_report(backtest_trades, metrics, strategy_analysis, config,
     report += tabulate(hourly_table, headers="firstrow", tablefmt="grid")
     report += "\n\n"
 
-    report += "Trend Performance:\n"
-    trend_table = [["Trend", "Wins", "Losses", "Win Rate"]]
-    for trend, data in strategy_analysis['trend_performance'].items():
+    report += "Strategy Performance:\n"
+    strategy_table = [["Strategy", "Total Trades", "Wins", "Losses", "Win Rate", "Total PnL"]]
+    for strategy, data in strategy_analysis['strategy_performance'].items():
         win_rate = (data['wins'] / data['total']) * 100 if data['total'] > 0 else 0
-        trend_table.append([trend.capitalize(), data['wins'], data['losses'], f"{win_rate:.2f}%"])
-    report += tabulate(trend_table, headers="firstrow", tablefmt="grid")
+        strategy_table.append([strategy, data['total'], data['wins'], data['losses'], f"{win_rate:.2f}%", f"${data['pnl']:,.2f}"])
+    report += tabulate(strategy_table, headers="firstrow", tablefmt="grid")
 
     with open("backtest/backtest_summary.txt", "w") as f:
         f.write(report)
@@ -963,6 +979,58 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info, loaded
             swing_highs_htf, swing_lows_htf = get_swing_points(relevant_klines_htf, config['swing_window'])
             trend_htf = get_trend(swing_highs_htf, swing_lows_htf)
 
+            # --- Reversal Strategy Logic for Backtesting ---
+            reversal_signal = find_liquidity_grab(current_klines_15m, swing_highs_15m, swing_lows_15m, config['tp1_rr_ratio'])
+            if reversal_signal:
+                divergence_signal = check_for_divergence(current_klines_15m)
+                signal_side = reversal_signal['signal']
+                if (signal_side == 'bullish' and divergence_signal == 'bullish') or \
+                   (signal_side == 'bearish' and divergence_signal == 'bearish'):
+                    
+                    is_confluent = check_htf_confluence_backtest(relevant_klines_htf, reversal_signal['entry_price'], config['htf_confluence_tolerance_pct'], config['swing_window'])
+                    if is_confluent:
+                        entry_price_rev = reversal_signal['entry_price']
+                        sl_rev = reversal_signal['stop_loss']
+                        tp_rev = reversal_signal['take_profit']
+                        trade_side = 'long' if signal_side == 'bullish' else 'short'
+
+                        quantity_rev = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl_rev, entry_price_rev, config['leverage'], backtest_balance=balance)
+                        if quantity_rev is not None and quantity_rev > 0:
+                            entry_timestamp = current_klines_15m[-1][0]
+                            exit_price = 0
+                            reason_for_exit = ""
+                            
+                            for j in range(i, len(klines_15m)):
+                                future_kline = klines_15m[j]
+                                high_price, low_price = float(future_kline[2]), float(future_kline[3])
+                                
+                                if trade_side == 'long':
+                                    if low_price <= sl_rev:
+                                        exit_price, reason_for_exit = sl_rev, "SL Hit"
+                                        break
+                                    elif high_price >= tp_rev:
+                                        exit_price, reason_for_exit = tp_rev, "TP Hit"
+                                        break
+                                elif trade_side == 'short':
+                                    if high_price >= sl_rev:
+                                        exit_price, reason_for_exit = sl_rev, "SL Hit"
+                                        break
+                                    elif low_price <= tp_rev:
+                                        exit_price, reason_for_exit = tp_rev, "TP Hit"
+                                        break
+                            
+                            if exit_price > 0:
+                                pnl = (exit_price - entry_price_rev) * quantity_rev if trade_side == 'long' else (entry_price_rev - exit_price) * quantity_rev
+                                status = 'win' if pnl > 0 else 'loss'
+                                balance += pnl
+                                reason_for_entry = f"Reversal: {signal_side.capitalize()} & {divergence_signal.capitalize()}"
+                                trade = TradeResult(symbol=symbol, side=trade_side, entry_price=entry_price_rev, exit_price=exit_price, entry_timestamp=entry_timestamp, exit_timestamp=klines_15m[j][0], status=status, pnl_usd=pnl, pnl_pct=(pnl / (entry_price_rev * quantity_rev)) * 100, drawdown=0, reason_for_entry=reason_for_entry, reason_for_exit=reason_for_exit, fib_levels=[])
+                                trade.balance = balance
+                                backtest_trades.append(trade)
+                                i = j + 1
+                                continue
+            
+            # --- Fallback to Fibonacci Strategy ---
             entry_price = 0
             if trend_15m == trend_htf and trend_15m != "undetermined":
                 df_15m = pd.DataFrame(current_klines_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
@@ -1728,6 +1796,7 @@ async def main():
     else:
         # Main scanning loop
         print("Entering main loop...")
+        loop = asyncio.get_running_loop()
         last_session = None
         while True:
             if not is_session_valid(client):
@@ -1802,6 +1871,51 @@ async def main():
                     swing_highs_htf, swing_lows_htf = get_swing_points(klines_htf, swing_window)
                     trend_htf = get_trend(swing_highs_htf, swing_lows_htf)
 
+                    # --- Reversal Strategy Logic ---
+                    reversal_signal = find_liquidity_grab(klines_15m, swing_highs_15m, swing_lows_15m, tp1_rr_ratio)
+                    if reversal_signal:
+                        print(f"  - Potential liquidity grab found for {symbol}: {reversal_signal['signal']}")
+                        divergence_signal = check_for_divergence(klines_15m)
+                        
+                        # Check for alignment between grab and divergence
+                        signal_side = reversal_signal['signal']
+                        if (signal_side == 'bullish' and divergence_signal == 'bullish') or \
+                           (signal_side == 'bearish' and divergence_signal == 'bearish'):
+                            
+                            print(f"  - Divergence confirmed for {symbol}: {divergence_signal}")
+                            is_confluent = await loop.run_in_executor(None, lambda: check_htf_confluence(client, symbol, reversal_signal['entry_price'], higher_timeframe, htf_confluence_tolerance_pct, swing_window))
+                            
+                            if is_confluent:
+                                print(f"  - HTF Confluence confirmed for {symbol}")
+                                
+                                # All conditions met, execute reversal trade
+                                entry_price = reversal_signal['entry_price']
+                                sl = reversal_signal['stop_loss']
+                                tp1 = reversal_signal['take_profit']
+                                trade_side = 'long' if signal_side == 'bullish' else 'short'
+                                
+                                quantity = calculate_quantity(client, symbols_info[symbol], risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
+                                
+                                if quantity is not None and quantity > 0:
+                                    reason = f"Reversal: {signal_side.capitalize()} Grab & {divergence_signal.capitalize()} Divergence"
+                                    image_buffer = generate_reversal_chart(symbol, klines_15m, reversal_signal)
+                                    caption = f"🚀 NEW REVERSAL SIGNAL 🚀\nSymbol: {symbol}\nSide: {trade_side.capitalize()}\nReason: {reason}\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nLIMIT ORDER ONLY VALID 4 HOURS"
+                                    await send_market_analysis_image(bot, image_buffer, caption, backtest_mode)
+                                    
+                                    new_trade = {
+                                        'symbol': symbol, 'side': trade_side, 'entry_price': entry_price, 'sl': sl, 
+                                        'tp1': tp1, 'tp2': None, 'status': 'pending', 'quantity': quantity, 
+                                        'original_quantity': quantity, 'timestamp': klines_15m[-1][0], 
+                                        'sl_order_id': None, 'tp_order_id': None, 'reason_for_entry': reason
+                                    }
+                                    with trades_lock:
+                                        trades.append(new_trade)
+                                    virtual_orders[symbol] = new_trade
+                                    update_trade_report(trades)
+                                    print(f"  - Reversal trade initiated for {symbol}.")
+                                    continue
+
+                    # --- Fallback to Fibonacci Strategy ---
                     if trend_15m == trend_htf and trend_15m != "undetermined":
                         print(f"  - Trend confirmed on 15m and {higher_timeframe}: {trend_15m}")
                         
