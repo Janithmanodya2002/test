@@ -288,11 +288,12 @@ def get_volume_profile(klines, bins=20):
     
     return volume_profile
 
-def check_for_high_volume_node(volume_profile, entry_price):
+def check_for_high_volume_node(volume_profile, entry_price, tolerance_pct=0.1):
     """
-    Checks if an entry price is inside a High-Volume Node (HVN) bin.
+    Checks if an entry price is inside or "close" to a High-Volume Node (HVN) bin.
     HVNs are defined as bins with volume > 1.5 * average volume.
     POC (Point of Control) is the highest volume node.
+    A tolerance is added to check for prices "close" to an HVN bin.
     """
     if volume_profile is None or volume_profile.empty:
         return False
@@ -300,8 +301,13 @@ def check_for_high_volume_node(volume_profile, entry_price):
     avg_volume = volume_profile.mean()
     poc_bin = volume_profile.idxmax()
     
-    # Check if entry is in POC bin
-    if entry_price in poc_bin:
+    # Define a helper function to check price with tolerance
+    def is_price_in_bin_with_tolerance(price, price_bin):
+        tolerance_amount = (price_bin.right - price_bin.left) * (tolerance_pct / 100)
+        return (price_bin.left - tolerance_amount) <= price <= (price_bin.right + tolerance_amount)
+
+    # Check if entry is in POC bin with tolerance
+    if is_price_in_bin_with_tolerance(entry_price, poc_bin):
         return True
         
     # Find other HVNs
@@ -310,9 +316,9 @@ def check_for_high_volume_node(volume_profile, entry_price):
     if hvns.empty:
         return False
         
-    # Check if entry is in any HVN bin
+    # Check if entry is in any HVN bin with tolerance
     for hvn_bin in hvns.index:
-        if entry_price in hvn_bin:
+        if is_price_in_bin_with_tolerance(entry_price, hvn_bin):
             return True
             
     return False
@@ -1490,6 +1496,7 @@ async def main():
         chart_image_candles = int(config['chart_image_candles'])
         max_open_positions = int(config['max_open_positions'])
         model_confidence_threshold = config.get('model_confidence_threshold', 0.7) # Use .get for safe access
+        volume_profile_tolerance_pct = float(config['volume_profile_tolerance_pct'])
         print("Configuration loaded.")
     except FileNotFoundError:
         print("Error: configuration.csv not found.")
@@ -1731,7 +1738,7 @@ async def main():
                             
                             # Volume Profile Check
                             volume_profile = get_volume_profile(klines_15m)
-                            if not check_for_high_volume_node(volume_profile, entry_price):
+                            if not check_for_high_volume_node(volume_profile, entry_price, volume_profile_tolerance_pct):
                                 await send_telegram_alert(bot, f"❌ Signal Rejected by Volume Profile ❌\nSymbol: {symbol}\nSide: Short\nReason: Entry price not at a high-volume node.")
                                 continue
 
@@ -1776,7 +1783,7 @@ async def main():
 
                             # Volume Profile Check
                             volume_profile = get_volume_profile(klines_15m)
-                            if not check_for_high_volume_node(volume_profile, entry_price):
+                            if not check_for_high_volume_node(volume_profile, entry_price, volume_profile_tolerance_pct):
                                 await send_telegram_alert(bot, f"❌ Signal Rejected by Volume Profile ❌\nSymbol: {symbol}\nSide: Long\nReason: Entry price not at a high-volume node.")
                                 continue
 
