@@ -53,6 +53,357 @@ class CustomJSONEncoder(json.JSONEncoder):
             return o.__dict__
         return super().default(o)
 
+
+class PositionMonitor:
+    """
+    Manages the lifecycle of a single trade, including SL/TP orders and monitoring.
+    """
+    def __init__(self, client, bot, symbol_info, trade_details, trades_list, trades_lock, is_hedge_mode, trade_manager, config):
+        self.client = client
+        self.bot = bot
+        self.symbol_info = symbol_info
+        self.trade_details = trade_details
+        self.trades_list = trades_list
+        self.trades_lock = trades_lock
+        self.is_hedge_mode = is_hedge_mode
+        self.trade_manager = trade_manager
+        self.config = config
+
+        self.symbol = trade_details['symbol']
+        self.side = trade_details['side']
+        self.quantity = trade_details['quantity']
+        self.entry_price = trade_details['entry_price']
+        self.sl_price = trade_details['sl']
+        self.tp_price = trade_details['tp1']
+        
+        self.sl_order_id = None
+        self.tp_order_id = None
+        self.status = 'running'
+        self.trailing_stop_activated = False
+
+    async def _update_trailing_stop(self):
+        """
+        Calculates and updates the trailing stop loss if conditions are met.
+        """
+        try:
+            # 1. Activation Check: Only proceed if the trailing stop is active.
+            if not self.trailing_stop_activated:
+                # Check if the position is profitable enough to activate trailing
+                report = await self.get_status_report()
+                if 'error' in report or report.get('pnl', 0) <= 0:
+                    return # Not in profit or error fetching PNL
+
+                profit_pct = (report['pnl'] / (self.entry_price * self.quantity)) * 100
+                
+                if profit_pct >= self.config['ts_activation_pct']:
+                    self.trailing_stop_activated = True
+                    await send_telegram_alert(self.bot, f"✅ TRAILING STOP ACTIVATED for {self.symbol} at {profit_pct:.2f}% profit.", message_type='info')
+                else:
+                    return # Not profitable enough to activate yet
+
+            # 2. Fetch latest data for ATR calculation
+            loop = asyncio.get_running_loop()
+            klines = await loop.run_in_executor(
+                None, lambda: get_klines(self.client, self.symbol, interval='1m', limit=100)
+            )
+            if not klines or len(klines) < self.config['ts_atr_period']:
+                return # Not enough data
+
+            # 3. Calculate New SL
+            df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = pd.to_numeric(df[col])
+            
+            atr_series = atr(df['high'], df['low'], df['close'], length=self.config['ts_atr_period'])
+            if atr_series is None or atr_series.empty or pd.isna(atr_series.iloc[-1]):
+                return
+
+            latest_atr = atr_series.iloc[-1]
+            current_price = df['close'].iloc[-1]
+            
+            new_sl_price = 0
+            if self.side == 'long':
+                new_sl_price = current_price - (latest_atr * self.config['ts_atr_multiplier'])
+            else: # short
+                new_sl_price = current_price + (latest_atr * self.config['ts_atr_multiplier'])
+
+            # 4. Update SL Order if it's an improvement
+            is_improvement = (self.side == 'long' and new_sl_price > self.sl_price) or \
+                             (self.side == 'short' and new_sl_price < self.sl_price)
+
+            if is_improvement:
+                ok, err = await cancel_order(self.client, self.symbol, self.sl_order_id)
+                if not ok:
+                    self.status = 'error_trailing_failed'
+                    return
+
+                sl_tp_side = 'SELL' if self.side == 'long' else 'BUY'
+                pos_side = 'LONG' if self.side == 'long' else 'SHORT' if self.is_hedge_mode else None
+                new_sl_order, sl_err = await place_new_order(
+                    self.client, self.symbol_info, sl_tp_side, 'STOP_MARKET',
+                    self.quantity, stop_price=new_sl_price, is_closing_order=True, position_side=pos_side
+                )
+
+                if sl_err:
+                    await place_new_order(self.client, self.symbol_info, sl_tp_side, 'MARKET', self.quantity, is_closing_order=True, position_side=pos_side)
+                    self.status = 'error_trailing_failed'
+                    return
+
+                self.sl_price = new_sl_price
+                self.sl_order_id = new_sl_order['orderId']
+                await send_telegram_alert(self.bot, f"🔒 TRAILING STOP UPDATED for {self.symbol}. New SL: {self.sl_price:.4f}", message_type='info')
+
+        except Exception as e:
+            print(f"Error in _update_trailing_stop for {self.symbol}: {e}")
+
+    async def _place_sl_tp_orders(self):
+        """
+        Places the stop-loss and take-profit orders for the current trade.
+        Returns True on success, False on critical failure.
+        """
+        sl_tp_side = 'SELL' if self.side == 'long' else 'BUY'
+        pos_side = 'LONG' if self.side == 'long' else 'SHORT' if self.is_hedge_mode else None
+
+        # Place Stop Loss Order
+        sl_order, sl_err = await place_new_order(
+            self.client, self.symbol_info, sl_tp_side, 'STOP_MARKET',
+            self.quantity, stop_price=self.sl_price,
+            is_closing_order=True, position_side=pos_side
+        )
+
+        if sl_err:
+            await send_telegram_alert(self.bot, f"CRITICAL: Failed to place SL for {self.symbol}. Closing position immediately. Error: {sl_err}")
+            await place_new_order(
+                self.client, self.symbol_info, sl_tp_side, 'MARKET',
+                self.quantity, is_closing_order=True, position_side=pos_side
+            )
+            self.status = 'error_sl_failed'
+            # Update the central trade list
+            with self.trades_lock:
+                for t in self.trades_list:
+                    if t['symbol'] == self.symbol and t['status'] == 'running':
+                        t['status'] = self.status
+                        break
+            return False
+
+        self.sl_order_id = sl_order['orderId']
+
+        # Place Take Profit Order
+        tp_order, tp_err = await place_new_order(
+            self.client, self.symbol_info, sl_tp_side, 'TAKE_PROFIT_MARKET',
+            self.quantity, stop_price=self.tp_price,
+            is_closing_order=True, position_side=pos_side
+        )
+
+        if tp_err:
+            await send_telegram_alert(self.bot, f"⚠️ WARNING: Failed to place TP for {self.symbol}. The trade is active but only protected by a Stop Loss. Error: {tp_err}")
+            self.tp_order_id = None
+        else:
+            self.tp_order_id = tp_order['orderId']
+            
+        await send_telegram_alert(self.bot, f"🔒 Position for {self.symbol} is now protected with SL/TP.", message_type='signal')
+        return True
+
+    async def monitor(self):
+        """
+        The main monitoring loop for a single trade. It places SL/TP orders
+        and then watches for them to be filled. This version standardizes behavior
+        by treating TP1 as a full take-profit, correcting a bug in the original logic.
+        """
+        # Step 1: Place the initial SL/TP orders
+        if not await self._place_sl_tp_orders():
+            if self.symbol in virtual_orders:
+                del virtual_orders[self.symbol]
+            return
+
+        # Step 2: Main monitoring loop
+        loop = asyncio.get_running_loop()
+        while self.status == 'running':
+            try:
+                # Check for SL Hit
+                sl_order = await loop.run_in_executor(None, lambda: self.client.futures_get_order(symbol=self.symbol, orderId=self.sl_order_id))
+                if sl_order['status'] == 'FILLED':
+                    await send_telegram_alert(self.bot, f"🛑 STOP LOSS HIT 🛑\nSymbol: {self.symbol}\nSide: {self.side}\nPrice: {sl_order['avgPrice']}", message_type='signal')
+                    if self.tp_order_id:
+                        await cancel_order(self.client, self.symbol, self.tp_order_id)
+                    self.status = 'sl_hit'
+                    break
+
+                # Check for TP Hit
+                if self.tp_order_id:
+                    tp_order = await loop.run_in_executor(None, lambda: self.client.futures_get_order(symbol=self.symbol, orderId=self.tp_order_id))
+                    if tp_order['status'] == 'FILLED':
+                        strategy = self.trade_details.get('strategy_type', 'fibonacci')
+                        tp_message = "TAKE PROFIT 1 HIT" if strategy != 'reversal' else "TAKE PROFIT HIT"
+                        await send_telegram_alert(self.bot, f"🎉 {tp_message} 🎉\nSymbol: {self.symbol}\nSide: {self.side}\nPrice: {tp_order['avgPrice']}", message_type='signal')
+                        await cancel_order(self.client, self.symbol, self.sl_order_id)
+                        self.status = 'tp_hit' # Simplified status
+                        break
+
+            except BinanceAPIException as e:
+                if e.code == -2013: # Order does not exist
+                    print(f"Monitor: Order for {self.symbol} not found, likely filled. Re-checking on next cycle.")
+                else:
+                    print(f"Error in monitor loop for {self.symbol}: {e}")
+                    self.status = 'error_monitor_failed'
+                    break
+            except Exception as e:
+                print(f"An unexpected error occurred in monitor for {self.symbol}: {e}")
+                self.status = 'error_monitor_failed'
+                break
+            
+            # Update trailing stop loss if enabled in config
+            if self.config.get('ts_atr_period'):
+                await self._update_trailing_stop()
+
+            # The main loop polls every 15 seconds to check for fills and update trailing stops
+            await asyncio.sleep(15)
+
+        # Step 3: Update final status in the global list
+        with self.trades_lock:
+            for t in self.trades_list:
+                if t.get('entry_order_id') == self.trade_details.get('entry_order_id') or \
+                   (t['symbol'] == self.symbol and t['status'] in ['running', 'pending_entry']):
+                    t['status'] = self.status
+                    t['sl_order_id'] = self.sl_order_id
+                    t['tp_order_id'] = self.tp_order_id
+                    break
+        
+        if self.symbol in virtual_orders:
+            del virtual_orders[self.symbol]
+        
+        # Remove self from the trade manager
+        if self.trade_manager:
+            await self.trade_manager.remove_monitor(self.symbol)
+
+        print(f"Monitoring finished for {self.symbol}. Final status: {self.status}")
+
+    async def get_status_report(self):
+        """
+        Fetches the current market price and calculates the real-time PNL for the trade.
+        Returns a dictionary with the trade's current status.
+        """
+        try:
+            # Run the synchronous SDK call in an executor to avoid blocking asyncio loop
+            ticker = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self.client.get_symbol_ticker(symbol=self.symbol)
+            )
+            current_price = float(ticker['price'])
+            
+            if self.side == 'long':
+                pnl = (current_price - self.entry_price) * self.quantity
+            else:  # short
+                pnl = (self.entry_price - current_price) * self.quantity
+                
+            return {
+                'symbol': self.symbol,
+                'side': self.side,
+                'entry_price': self.entry_price,
+                'current_price': current_price,
+                'pnl': pnl,
+                'status': self.status,
+                'trailing_stop_activated': self.trailing_stop_activated
+            }
+        except Exception as e:
+            print(f"Could not get status report for {self.symbol}: {e}")
+            return {
+                'symbol': self.symbol,
+                'side': self.side,
+                'entry_price': self.entry_price,
+                'current_price': 'N/A',
+                'pnl': 'N/A',
+                'status': self.status,
+                'error': str(e),
+                'trailing_stop_activated': self.trailing_stop_activated
+            }
+
+
+class TradeManager:
+    """
+    Manages all active PositionMonitor tasks to provide a central point of control.
+    """
+    def __init__(self):
+        self.active_monitors = {}
+        self._lock = asyncio.Lock()
+
+    async def add_monitor(self, symbol, monitor_instance):
+        """Adds a new position monitor to the manager, keyed by symbol."""
+        async with self._lock:
+            if symbol in self.active_monitors:
+                print(f"Warning: A monitor for {symbol} already exists and will be overwritten.")
+            self.active_monitors[symbol] = monitor_instance
+            print(f"TradeManager: Added monitor for {symbol}. Total: {len(self.active_monitors)}")
+
+    async def remove_monitor(self, symbol):
+        """Removes a position monitor from the manager."""
+        async with self._lock:
+            if symbol in self.active_monitors:
+                del self.active_monitors[symbol]
+                print(f"TradeManager: Removed monitor for {symbol}. Total: {len(self.active_monitors)}")
+            else:
+                print(f"Warning: Attempted to remove a non-existent monitor for {symbol}.")
+
+    async def get_all_monitors(self):
+        """Returns a list of all currently active monitor instances."""
+        async with self._lock:
+            return list(self.active_monitors.values())
+
+
+async def monitor_open_positions(trade_manager, bot, interval_seconds=30):
+    """
+    Periodically checks and reports the status of all open positions managed
+    by the TradeManager.
+    """
+    while True:
+        try:
+            active_monitors = await trade_manager.get_all_monitors()
+            if not active_monitors:
+                await asyncio.sleep(interval_seconds)
+                continue
+
+            reports = await asyncio.gather(*(m.get_status_report() for m in active_monitors))
+            
+            valid_reports = [r for r in reports if 'error' not in r]
+
+            if valid_reports:
+                headers = ["Symbol", "Side", "Entry", "Current", "PnL (USD)", "TS Active"]
+                table_data = []
+                total_pnl = 0.0
+                for report in valid_reports:
+                    pnl = report.get('pnl', 0.0)
+                    total_pnl += pnl
+                    ts_active = "Yes" if report.get('trailing_stop_activated') else "No"
+                    table_data.append([
+                        report['symbol'],
+                        report['side'].capitalize(),
+                        f"{report.get('entry_price', 0):.4f}",
+                        f"{report.get('current_price', 0):.4f}",
+                        f"{pnl:+.2f}",
+                        ts_active
+                    ])
+                
+                table = tabulate(table_data, headers=headers, tablefmt="pipe")
+                
+                message = f"📊 *Open Positions Summary*\n\n"
+                message += f"```\n{table}\n```\n\n"
+                message += f"*Total PnL:* `${total_pnl:+.2f}`"
+                
+                await bot.send_message(
+                    chat_id=keys.TELEGRAM_DEVELOP_ID,
+                    text=message,
+                    parse_mode='Markdown'
+                )
+
+        except Exception as e:
+            print(f"Error in monitor_open_positions: {e}")
+            try:
+                await bot.send_message(chat_id=keys.TELEGRAM_DEVELOP_ID, text=f"🚨 Error in Position Monitor Loop: {e}")
+            except Exception as e2:
+                print(f"Failed to send monitoring error alert: {e2}")
+        
+        await asyncio.sleep(interval_seconds)
+
+
 def install_dependencies():
     """
     Installs all required libraries from requirements.txt.
@@ -545,7 +896,7 @@ def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_pric
         else:
             # Get account balance for live trading
             account_info = client.futures_account()
-            balance = float(account_info['totalWalletBalance'])
+            balance = float(account_info['availableBalance'])
 
         # Calculate the maximum position size allowed by leverage
         max_position_size = balance * leverage
@@ -1419,7 +1770,7 @@ async def cancel_order(client, symbol, order_id):
         print(error_msg)
         return False, str(e)
 
-async def order_status_monitor(client, application, backtest_mode=False, live_mode=False, symbols_info=None, is_hedge_mode=False, tp1_close_percentage=0.5, lookback_candles_long=200, atr_period=14, atr_multiplier=1.5):
+async def order_status_monitor(client, application, backtest_mode=False, live_mode=False, symbols_info=None, is_hedge_mode=False, config=None, trade_manager=None):
     """
     Continuously monitor the status of open and pending trades using order status polling.
     """
@@ -1433,7 +1784,9 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
         try:
             active_trades = []
             with trades_lock:
-                active_trades = [t for t in trades if t['status'] in ['pending', 'running', 'tp1_hit']]
+                # The order_status_monitor is now only responsible for pending trades.
+                # Running trades are handled by their own PositionMonitor instance.
+                active_trades = [t for t in trades if t['status'] in ['pending', 'pending_entry']]
 
             if not active_trades:
                 await asyncio.sleep(5)
@@ -1456,27 +1809,20 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                             # Update entry price to actual filled price
                             trade['entry_price'] = float(entry_order['avgPrice'])
 
-                            # Place SL and TP orders
-                            sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
-                            sl_order, sl_err = await place_new_order(client, symbol_info, sl_tp_side, 'STOP_MARKET', trade['quantity'], stop_price=trade['sl'], is_closing_order=True, position_side=pos_side)
-                            if sl_err:
-                                await send_telegram_alert(bot, f"CRITICAL: Failed to place SL for {symbol} after entry. Closing position immediately.")
-                                await place_new_order(client, symbol_info, sl_tp_side, 'MARKET', trade['quantity'], is_closing_order=True, position_side=pos_side)
-                                trade['status'] = 'error'
-                                if symbol in virtual_orders: del virtual_orders[symbol]
-                                continue
-
-                            tp_order, tp_err = await place_new_order(client, symbol_info, sl_tp_side, 'TAKE_PROFIT_MARKET', trade['quantity'], stop_price=trade['tp1'], is_closing_order=True, position_side=pos_side)
-                            if tp_err:
-                                await send_telegram_alert(bot, f"⚠️ WARNING: Failed to place TP for {symbol} after entry. The trade is active but only protected by a Stop Loss. Error: {tp_err}")
-                                trade['tp_order_id'] = None
-                            else:
-                                trade['tp_order_id'] = tp_order['orderId']
-
-                            trade['sl_order_id'] = sl_order['orderId']
+                            # The entry order is filled. Hand off to PositionMonitor.
                             trade['status'] = 'running'
-                            await send_telegram_alert(bot, f"🔒 Position for {symbol} is now protected with SL/TP.", message_type='signal')
-                            continue # Continue to next trade check, as this one is now running
+                            
+                            # Create and start the position monitor
+                            position_monitor = PositionMonitor(
+                                client, bot, symbol_info, trade, trades, trades_lock, is_hedge_mode, trade_manager, config
+                            )
+                            # Add to manager before starting the task
+                            await trade_manager.add_monitor(symbol, position_monitor)
+                            asyncio.create_task(position_monitor.monitor())
+                            
+                            # The monitor will now handle SL/TP placement and further monitoring.
+                            print(f"Handed off {symbol} to a dedicated PositionMonitor task.")
+                            continue
 
                         elif entry_order['status'] in ['CANCELED', 'EXPIRED', 'REJECTED']:
                             await send_telegram_alert(bot, f"❌ REVERSAL ENTRY FAILED ❌\nSymbol: {symbol}\nReason: Order status is {entry_order['status']}.")
@@ -1535,90 +1881,8 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                             trade['status'] = 'triggered_signal' # A new status to indicate signal was triggered but not acted upon
                             await send_telegram_alert(bot, f"🎯 ENTRY PRICE REACHED for {symbol} at {trade['entry_price']:.8f}", message_type='signal')
 
-                elif trade['status'] == 'running':
-                    # Check for SL hit
-                    sl_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['sl_order_id']))
-                    if sl_order['status'] == 'FILLED':
-                        await send_telegram_alert(bot, f"🛑 STOP LOSS HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {sl_order['avgPrice']}", message_type='signal')
-                        if trade.get('tp_order_id'): await cancel_order(client, symbol, trade['tp_order_id'])
-                        trade['status'] = 'sl_hit'
-                        if symbol in virtual_orders: del virtual_orders[symbol]
-                        continue
-
-                    # Check for TP hit
-                    if trade.get('tp_order_id'):
-                        tp_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['tp_order_id']))
-                        if tp_order['status'] == 'FILLED':
-                            # Handle TP for Reversal (all-in, all-out) strategy
-                            if trade.get('strategy_type') == 'reversal':
-                                await send_telegram_alert(bot, f"🎉 TAKE PROFIT HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {tp_order['avgPrice']}", message_type='signal')
-                                await cancel_order(client, symbol, trade['sl_order_id']) # Cancel SL
-                                trade['status'] = 'tp_hit'
-                                if symbol in virtual_orders: del virtual_orders[symbol]
-                                continue
-                            # Handle partial TP for Fibonacci strategy
-                            else:
-                                await send_telegram_alert(bot, f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {tp_order['avgPrice']}\nClosing {tp1_close_percentage*100}% of the position.", message_type='signal')
-                                await cancel_order(client, symbol, trade['sl_order_id'])
-                                
-                                trade['status'] = 'tp1_hit'
-                                trade['sl'] = trade['entry_price'] # Move SL to entry
-                                
-                                step_size = next((float(f['stepSize']) for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-                                remaining_quantity = (trade['original_quantity'] * (1 - tp1_close_percentage) // step_size) * step_size if step_size else 0
-                                trade['quantity'] = remaining_quantity
-                                trade['tp_order_id'] = None # TP1 is done
-                                
-                                if live_mode and remaining_quantity > 0:
-                                    sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
-                                    new_sl_order, sl_err = await place_new_order(client, symbol_info, sl_tp_side, 'STOP_MARKET', remaining_quantity, stop_price=trade['sl'], reduce_only=True, position_side=pos_side)
-                                    if sl_err:
-                                        await send_telegram_alert(bot, f"CRITICAL: Failed to place new SL at breakeven for {symbol} after TP1. Closing position.")
-                                        await place_new_order(client, symbol_info, sl_tp_side, 'MARKET', remaining_quantity, reduce_only=True, position_side=pos_side)
-                                        trade['status'] = 'error'
-                                        if symbol in virtual_orders: del virtual_orders[symbol]
-                                        continue
-                                    trade['sl_order_id'] = new_sl_order['orderId']
-                                continue
-                
-                elif trade['status'] == 'tp1_hit':
-                    # Check for SL hit
-                    sl_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['sl_order_id']))
-                    if sl_order['status'] == 'FILLED':
-                        await send_telegram_alert(bot, f"🛑 TRAILING STOP HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {sl_order['avgPrice']}", message_type='signal')
-                        trade['status'] = 'trailing_sl_hit'
-                        if symbol in virtual_orders: del virtual_orders[symbol]
-                        continue
-
-                    # Trailing stop logic
-                    klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles_long)
-                    if not klines: continue
-                    
-                    new_sl, should_exit = update_trailing_stop(klines, trade['side'], trade['sl'], atr_multiplier, atr_period)
-                    
-                    if should_exit:
-                        await send_telegram_alert(bot, f"🏃 PSAR FLIP EXIT 🏃\nSymbol: {symbol}\nSide: {trade['side']}\nClosing remaining position.", message_type='signal')
-                        if live_mode:
-                            sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
-                            await place_new_order(client, symbol_info, sl_tp_side, 'MARKET', trade['quantity'], reduce_only=True, position_side=pos_side)
-                            await cancel_order(client, symbol, trade['sl_order_id'])
-                        trade['status'] = 'psar_exit'
-                        if symbol in virtual_orders: del virtual_orders[symbol]
-                        continue
-                    
-                    if (trade['side'] == 'long' and new_sl > trade['sl']) or \
-                       (trade['side'] == 'short' and new_sl < trade['sl']):
-                        if live_mode:
-                            sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
-                            ok, err = await cancel_order(client, symbol, trade['sl_order_id'])
-                            if ok:
-                                new_sl_order, sl_err = await place_new_order(client, symbol_info, sl_tp_side, 'STOP_MARKET', trade['quantity'], stop_price=new_sl, reduce_only=True, position_side=pos_side)
-                                if not sl_err:
-                                    trade['sl'] = new_sl
-                                    trade['sl_order_id'] = new_sl_order['orderId']
-                                    await send_telegram_alert(bot, f"🔒 TRAILING STOP UPDATED 🔒\nSymbol: {symbol}\nSide: {trade['side']}\nNew SL: {new_sl:.8f}", message_type='info')
-                                else:
-                                    await send_telegram_alert(bot, f"Warning: Failed to update trailing SL for {symbol}. Original SL may be active or filled.")
+                # The logic for 'running' and 'tp1_hit' has been removed from this function.
+                # It is now fully handled by the dedicated PositionMonitor task for each trade.
 
             with trades_lock:
                 update_trade_report(trades)
@@ -1706,11 +1970,11 @@ def log_ml_decision(symbol, side, prediction, confidence, outcome='pending'):
         writer = pd.DataFrame([log_entry])
         writer.to_csv(f, header=not file_exists, index=False)
 
-def start_order_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, tp1_close_percentage, lookback_candles_long, atr_period, atr_multiplier):
+def start_order_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, config, trade_manager):
     """Wrapper to run the async order_status_monitor in a separate thread."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    monitor_coro = order_status_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, tp1_close_percentage, lookback_candles_long, atr_period, atr_multiplier)
+    monitor_coro = order_status_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, config, trade_manager)
     loop.run_until_complete(monitor_coro)
 
 
@@ -1728,6 +1992,7 @@ async def main():
         print("Could not determine public IP address.")
 
     bot = telegram.Bot(token=keys.telegram_bot_token)
+    trade_manager = TradeManager()
 
     # Load configuration
     global leverage, chart_image_candles, ml_model, ml_feature_columns, model_confidence_threshold
@@ -1751,6 +2016,12 @@ async def main():
         max_open_positions = int(config['max_open_positions'])
         model_confidence_threshold = config.get('model_confidence_threshold', 0.7) # Use .get for safe access
         htf_confluence_tolerance_pct = float(config['htf_confluence_tolerance_pct'])
+        
+        # Load trailing stop parameters
+        config['ts_atr_period'] = int(config.get('ts_atr_period', 14))
+        config['ts_atr_multiplier'] = float(config.get('ts_atr_multiplier', 2.0))
+        config['ts_activation_pct'] = float(config.get('ts_activation_pct', 0.5))
+
         print("Configuration loaded.")
     except FileNotFoundError:
         print("Error: configuration.csv not found.")
@@ -1869,9 +2140,11 @@ async def main():
                 pass
 
     if not backtest_mode:
+        # Start the new open positions monitor as a concurrent task
+        asyncio.create_task(monitor_open_positions(trade_manager, bot))
+
         monitor_args = (client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode, 
-                        config.get('tp1_close_percentage', 0.5), lookback_candles_long, 
-                        config.get('atr_period', 14), config.get('atr_multiplier', 1.5))
+                        config, trade_manager)
         monitor_thread = threading.Thread(target=start_order_monitor, args=monitor_args, daemon=True)
         monitor_thread.start()
 
