@@ -1,2 +1,2 @@
-risk_per_trade,risk_amount_usd,use_fixed_risk_amount,leverage,atr_value,lookback_candles,swing_window,starting_balance,chart_image_candles,max_open_positions,model_confidence_threshold,model_path
-0.5,20,False,10,14,100,5,10000,100,5,0.7,"full_run_output/model/best_model.keras"
+risk_per_trade,risk_amount_usd,use_fixed_risk_amount,leverage,atr_value,lookback_candles_short,lookback_candles_long,swing_window,starting_balance,chart_image_candles,max_open_positions,model_confidence_threshold,model_path,higher_timeframe,ema_period,atr_period,atr_multiplier,tp1_rr_ratio,tp1_close_percentage,htf_confluence_tolerance_pct,lookback_candles,atr_prominence_multiplier
+0.1,0.5,True,30,14,100,200,5,10000,100,3,0.7,C:\Users\JW\Desktop\model\best_model.keras,4h,200,14,1.5,1.5,0.5,0.5,100,0.5
