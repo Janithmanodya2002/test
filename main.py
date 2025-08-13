@@ -33,6 +33,14 @@ except ImportError:
     exit()
 from tabulate import tabulate
 
+def config_to_bool(value):
+    """Converts a value from the config to a boolean."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ('true', '1', 't', 'y', 'yes')
+    return bool(value)
+
 class CustomJSONEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, (np.integer, np.floating)):
@@ -179,68 +187,102 @@ def generate_fib_chart(symbol, klines, trend, swing_high, swing_low, entry_price
     return buf
 
 
-def generate_reversal_chart(symbol, klines, signal_details):
+def generate_reversal_chart(symbol, klines, signal_details, num_candles_to_show=80):
     """
-    Generate a detailed candlestick chart for the reversal strategy.
+    Generate an enhanced, clear candlestick chart for the reversal strategy.
+    
+    This new version focuses on the most recent price action, adds a volume
+    panel, and uses clearer annotations to be more readable.
     """
+    # --- 1. Data Preparation ---
     df = pd.DataFrame(klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
     df['dt'] = pd.to_datetime(df['dt'], unit='ms')
     df.set_index('dt', inplace=True)
     df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
 
+    # --- Key Enhancement: Zoom in on the last `num_candles_to_show` candles ---
+    df = df.tail(num_candles_to_show)
+
+    # --- 2. Extract Signal Details ---
     entry_price = signal_details['entry_price']
     sl = signal_details['stop_loss']
     tp = signal_details['take_profit']
     grabbed_price = signal_details['grabbed_price']
     signal_type = signal_details['signal']
+    # Ensure signal_candle timestamp is timezone-aware to match the DataFrame index
+    signal_candle_timestamp = pd.to_datetime(signal_details['signal_candle']['timestamp'], unit='ms').tz_localize('UTC')
 
-    # Chart Styling
-    mc = mpf.make_marketcolors(up='#26A69A', down='#EF5350', wick={'up':'#26A69A', 'down':'#EF5350'}, volume='in', ohlc='i')
-    s = mpf.make_mpf_style(base_mpf_style='yahoo', marketcolors=mc, gridcolor='lightgrey', facecolor='white')
 
-    # Plot
-    fig, axlist = mpf.plot(df, type='candle', style=s,
-                          figsize=(8, 4.5),
-                          returnfig=True,
-                          volume=False)
+    # --- 3. Chart Styling ---
+    # Using a clean style with custom colors and a light background
+    mc = mpf.make_marketcolors(up='#26A69A', down='#EF5350', wick='inherit', volume='inherit', ohlc='inherit')
+    s = mpf.make_mpf_style(base_mpf_style='charles', marketcolors=mc, gridstyle='--', facecolor='#FAFAFA')
 
-    ax = axlist[0]
-    ax.set_title(f'{symbol} 15m - {signal_type.capitalize()} Reversal Signal', fontsize=16, weight='bold')
-    ax.set_ylabel('Price (USDT)', fontsize=10)
-    ax.tick_params(axis='x', labelsize=10, labelrotation=45)
-    ax.tick_params(axis='y', labelsize=10)
+    # Prepare horizontal lines to be drawn by mplfinance
+    hlines_dict = dict(hlines=[entry_price, sl, tp, grabbed_price],
+                       colors=['green', 'red', 'blue', '#FF5722'],
+                       linestyle=['-', '-', '-', '--'],
+                       linewidths=[1.5, 1.5, 1.5, 1.2])
 
-    # Liquidity Grab Level
-    ax.axhline(y=grabbed_price, color='#FF5722', linestyle='--', linewidth=1.5, label='Liquidity Level')
-    ax.text(df.index[-1], grabbed_price, f' Grabbed Level {grabbed_price:.2f}', color='#FF5722', va='center', ha='left', fontsize=9)
+    # --- 4. Plotting the Chart ---
+    fig, axlist = mpf.plot(df,
+                           type='candle',
+                           style=s,
+                           title=f'\n{symbol} 15m - {signal_type.capitalize()} Reversal Signal',
+                           ylabel='Price (USDT)',
+                           figsize=(12, 6.5),  # Larger figure size for better readability
+                           hlines=hlines_dict,
+                           returnfig=True,
+                           volume=True,  # Add a volume panel for context
+                           panel_ratios=(4, 1), # Main chart is 4x taller than volume panel
+                           figratio=(1,1),
+                           tight_layout=True
+                          )
+    
+    # --- 5. Adding Clearer Annotations ---
+    ax_main = axlist[0] # Main price chart axis
 
-    # Current Price
-    current_price = df['close'].iloc[-1]
-    ax.axhline(y=current_price, color='#000000', linestyle='-', linewidth=1)
-    ax.text(df.index[-1], current_price, f' PRICE {current_price:.2f}', color='#000000', va='center', ha='left', fontsize=9, weight='bold')
+    # Add text labels on the right side to avoid cluttering the candles
+    # We use the y-axis transform to place them consistently
+    for price, label, color in zip([entry_price, sl, tp, grabbed_price],
+                                   [f'Entry: {entry_price:.2f}', f'SL: {sl:.2f}', f'TP: {tp:.2f}', 'Liquidity Level'],
+                                   ['green', 'red', 'blue', '#FF5722']):
+        ax_main.text(1.02, price, f' {label}', transform=ax_main.get_yaxis_transform(),
+                     color=color, fontsize=10, va='center', fontweight='bold')
 
-    # Entry/SL/TP Lines
-    ax.axhline(y=entry_price, color='green', linestyle='-', linewidth=1.2)
-    ax.axhline(y=sl, color='red', linestyle='-', linewidth=1.2)
-    ax.axhline(y=tp, color='blue', linestyle='-', linewidth=1.2)
+    # Add an arrow to specifically point out the signal candle
+    try:
+        # Determine the y-coordinate for the arrow based on signal type
+        if signal_type == 'bullish':
+            y_coord = df.loc[signal_candle_timestamp, 'low']
+            arrow_y_pos = y_coord * 0.985
+            text_y_pos = y_coord * 0.97
+            va = 'top'
+        else: # bearish
+            y_coord = df.loc[signal_candle_timestamp, 'high']
+            arrow_y_pos = y_coord * 1.015
+            text_y_pos = y_coord * 1.03
+            va = 'bottom'
 
-    x_mid = df.index[0] + (df.index[-1] - df.index[0]) / 2
-    ax.text(x_mid, entry_price, f'ENTRY {entry_price:.2f}', color='green', va='bottom', ha='center', fontsize=10)
-    ax.text(x_mid, sl, f'SL {sl:.2f}', color='red', va='top', ha='center', fontsize=10)
-    ax.text(x_mid, tp, f'TP {tp:.2f}', color='blue', va='bottom', ha='center', fontsize=10)
+        ax_main.annotate('Signal',
+                         xy=(signal_candle_timestamp, arrow_y_pos),
+                         xytext=(signal_candle_timestamp, text_y_pos),
+                         arrowprops=dict(facecolor='black', shrink=0.1, width=1.5, headwidth=6),
+                         fontsize=10,
+                         fontweight='bold',
+                         ha='center',
+                         va=va)
 
-    # Legend
-    entry_patch = mpatches.Patch(color='green', label='ENTRY')
-    sl_patch = mpatches.Patch(color='red', label='SL')
-    tp_patch = mpatches.Patch(color='blue', label='TP')
-    liquidity_patch = mpatches.Patch(color='#FF5722', label='Liquidity Level')
-    ax.legend(handles=[entry_patch, sl_patch, tp_patch, liquidity_patch], loc='lower left')
+    except (KeyError, IndexError) as e:
+        print(f"Could not annotate signal candle on the chart: {e}")
 
-    # Save to buffer
+    # --- 6. Save to Buffer ---
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=100)
+    # Use a higher DPI for a sharper image
+    fig.savefig(buf, format='png', dpi=120, bbox_inches='tight')
     buf.seek(0)
-
+    
+    plt.close(fig) # Close the figure to free up memory
     return buf
 
 
@@ -421,15 +463,9 @@ def find_liquidity_grab(klines, swing_highs, swing_lows, tp_rr_ratio):
                 candle = df.iloc[i]
                 if candle['high'] > last_swing_high_price and candle['close'] < last_swing_high_price:
                     if i - swing_high_kline_index < 10:
-                        entry_price = candle['close']
-                        stop_loss = candle['high']
-                        take_profit = entry_price - abs(stop_loss - entry_price) * tp_rr_ratio
                         return {
                             'signal': 'bearish',
-                            'entry_price': entry_price,
-                            'stop_loss': stop_loss,
-                            'take_profit': take_profit,
-                            'timestamp': candle['timestamp'],
+                            'signal_candle': candle,
                             'grabbed_price': last_swing_high_price
                         }
                     break 
@@ -445,15 +481,9 @@ def find_liquidity_grab(klines, swing_highs, swing_lows, tp_rr_ratio):
                 candle = df.iloc[i]
                 if candle['low'] < last_swing_low_price and candle['close'] > last_swing_low_price:
                     if i - swing_low_kline_index < 10:
-                        entry_price = candle['close']
-                        stop_loss = candle['low']
-                        take_profit = entry_price + abs(entry_price - stop_loss) * tp_rr_ratio
                         return {
                             'signal': 'bullish',
-                            'entry_price': entry_price,
-                            'stop_loss': stop_loss,
-                            'take_profit': take_profit,
-                            'timestamp': candle['timestamp'],
+                            'signal_candle': candle,
                             'grabbed_price': last_swing_low_price
                         }
                     break
@@ -554,6 +584,30 @@ def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_pric
     except Exception as e:
         print(f"Error calculating quantity for {symbol_info['symbol']}: {e}")
         return None
+
+def get_atr_stop_loss(side, reference_price, klines, config):
+    """
+    Calculates a stop loss price using ATR for more dynamic risk management.
+    """
+    atr_period = config.get('atr_period', 14)
+    atr_multiplier = config.get('atr_multiplier', 1.5)
+    
+    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    for col in ['open', 'high', 'low', 'close']:
+        df[col] = pd.to_numeric(df[col])
+        
+    atr_series = atr(df['high'], df['low'], df['close'], length=atr_period)
+    
+    if atr_series is None or atr_series.empty or pd.isna(atr_series.iloc[-1]):
+        print(f"Warning: ATR calculation failed for {config.get('symbol', 'N/A')}. Using percentage-based SL fallback.")
+        return reference_price * 1.002 if side == 'short' else reference_price * 0.998
+        
+    latest_atr = atr_series.iloc[-1]
+    
+    if side == 'short':
+        return reference_price + (latest_atr * atr_multiplier)
+    else: # long
+        return reference_price - (latest_atr * atr_multiplier)
 
 def get_atr(klines, period=14):
     """
@@ -1270,7 +1324,10 @@ async def send_market_analysis_image(bot, image_buffer, caption, backtest_mode=F
         except Exception as e:
             print(f"Error sending market analysis image to {chat_id}: {e}")
             # Fallback to text message
-            await bot.send_message(chat_id=chat_id, text=f"Error generating chart. {caption}")
+            try:
+                await bot.send_message(chat_id=chat_id, text=f"Error generating chart. {caption}")
+            except Exception as e2:
+                print(f"Fallback text message also failed for chat_id {chat_id}: {e2}")
 
 def update_trailing_stop(klines, position_type, current_stop_loss, atr_multiplier, atr_period=14):
     """
@@ -1388,7 +1445,63 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                 symbol_info = symbols_info[symbol]
                 pos_side = 'LONG' if trade['side'] == 'long' else 'SHORT' if is_hedge_mode else None
 
-                if trade['status'] == 'pending':
+                if trade['status'] == 'pending_entry':
+                    # Check if the LIMIT entry order has been filled
+                    try:
+                        entry_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['entry_order_id']))
+                        
+                        if entry_order['status'] == 'FILLED':
+                            await send_telegram_alert(bot, f"✅ REVERSAL ENTRY FILLED ✅\nSymbol: {symbol}\nPrice: {entry_order['avgPrice']}\nNow placing SL/TP orders.", message_type='signal')
+                            
+                            # Update entry price to actual filled price
+                            trade['entry_price'] = float(entry_order['avgPrice'])
+
+                            # Place SL and TP orders
+                            sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
+                            sl_order, sl_err = await place_new_order(client, symbol_info, sl_tp_side, 'STOP_MARKET', trade['quantity'], stop_price=trade['sl'], is_closing_order=True, position_side=pos_side)
+                            if sl_err:
+                                await send_telegram_alert(bot, f"CRITICAL: Failed to place SL for {symbol} after entry. Closing position immediately.")
+                                await place_new_order(client, symbol_info, sl_tp_side, 'MARKET', trade['quantity'], is_closing_order=True, position_side=pos_side)
+                                trade['status'] = 'error'
+                                if symbol in virtual_orders: del virtual_orders[symbol]
+                                continue
+
+                            tp_order, tp_err = await place_new_order(client, symbol_info, sl_tp_side, 'TAKE_PROFIT_MARKET', trade['quantity'], stop_price=trade['tp1'], is_closing_order=True, position_side=pos_side)
+                            if tp_err:
+                                await send_telegram_alert(bot, f"⚠️ WARNING: Failed to place TP for {symbol} after entry. The trade is active but only protected by a Stop Loss. Error: {tp_err}")
+                                trade['tp_order_id'] = None
+                            else:
+                                trade['tp_order_id'] = tp_order['orderId']
+
+                            trade['sl_order_id'] = sl_order['orderId']
+                            trade['status'] = 'running'
+                            await send_telegram_alert(bot, f"🔒 Position for {symbol} is now protected with SL/TP.", message_type='signal')
+                            continue # Continue to next trade check, as this one is now running
+
+                        elif entry_order['status'] in ['CANCELED', 'EXPIRED', 'REJECTED']:
+                            await send_telegram_alert(bot, f"❌ REVERSAL ENTRY FAILED ❌\nSymbol: {symbol}\nReason: Order status is {entry_order['status']}.")
+                            trade['status'] = 'failed_entry'
+                            if symbol in virtual_orders: del virtual_orders[symbol]
+                            continue
+
+                    except BinanceAPIException as e:
+                        if e.code == -2013: # Order does not exist
+                            await send_telegram_alert(bot, f"❌ REVERSAL ENTRY FAILED ❌\nSymbol: {symbol}\nReason: Order not found. It might have been canceled or filled and removed.")
+                            trade['status'] = 'failed_entry'
+                            if symbol in virtual_orders: del virtual_orders[symbol]
+                            continue
+                        else:
+                            print(f"Error checking entry order for {symbol}: {e}")
+                    
+                    # Timeout for pending entry order (e.g., 2 minutes)
+                    if time.time() * 1000 - trade['timestamp'] > 2 * 60 * 1000:
+                        await cancel_order(client, symbol, trade['entry_order_id'])
+                        await send_telegram_alert(bot, f"⏰ REVERSAL ENTRY TIMEOUT ⏰\nSymbol: {symbol}\nReason: LIMIT order was not filled within 2 minutes and has been canceled.")
+                        trade['status'] = 'entry_timeout'
+                        if symbol in virtual_orders: del virtual_orders[symbol]
+                        continue
+
+                elif trade['status'] == 'pending':
                     if time.time() * 1000 - trade['timestamp'] > 4 * 60 * 60 * 1000:
                         await send_telegram_alert(bot, f"⚠️ TRADE INVALIDATED ⚠️\nSymbol: {symbol}\nSide: {trade['side']}\nReason: Order expired (4 hours)")
                         trade['status'] = 'rejected'
@@ -1400,59 +1513,27 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                        (trade['side'] == 'short' and current_price <= trade['entry_price']):
 
                         if live_mode:
-                            order, err = await place_new_order(client, symbol_info, 'BUY' if trade['side'] == 'long' else 'SELL', 'MARKET', trade['quantity'], position_side=pos_side)
+                            # Price has been reached, place the LIMIT order
+                            limit_price = trade['entry_price']
+                            order, err = await place_new_order(client, symbol_info, 'BUY' if trade['side'] == 'long' else 'SELL', 'LIMIT', trade['quantity'], price=limit_price, position_side=pos_side)
+
                             if err:
-                                await send_telegram_alert(bot, f"⚠️ MARKET ORDER FAILED for {symbol}: {err}")
-                                trade['status'] = 'rejected'
+                                await send_telegram_alert(bot, f"⚠️ FAILED TO PLACE ENTRY LIMIT ORDER for {symbol}: {err}")
+                                trade['status'] = 'failed_entry'
                                 if symbol in virtual_orders: del virtual_orders[symbol]
                                 continue
 
-                            entry_order_id = order['orderId']
-                            start_time = time.time()
-                            filled = False
-                            while time.time() - start_time < 10: # 10 second timeout
-                                try:
-                                    entry_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=entry_order_id))
-                                    if entry_order['status'] == 'FILLED':
-                                        order = entry_order
-                                        filled = True
-                                        break
-                                except Exception as e:
-                                    await send_telegram_alert(bot, f"Warning: Could not check entry order status for {symbol}. Error: {e}")
-                                await asyncio.sleep(0.5)
-
-                            if not filled:
-                                await send_telegram_alert(bot, f"CRITICAL: Market entry order for {symbol} was not filled in time. Cancelling trade.")
-                                await cancel_order(client, symbol, entry_order_id)
-                                trade['status'] = 'rejected'
-                                if symbol in virtual_orders: del virtual_orders[symbol]
-                                continue
-
-                            trade['entry_price'] = float(order['avgPrice'])
-                            sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
-
-                            sl_order, sl_err = await place_new_order(client, symbol_info, sl_tp_side, 'STOP_MARKET', trade['quantity'], stop_price=trade['sl'], is_closing_order=True, position_side=pos_side)
-                            if sl_err:
-                                await send_telegram_alert(bot, f"CRITICAL: Failed to place SL for {symbol}. Closing position.")
-                                await place_new_order(client, symbol_info, sl_tp_side, 'MARKET', trade['quantity'], is_closing_order=True, position_side=pos_side)
-                                trade['status'] = 'error'
-                                if symbol in virtual_orders: del virtual_orders[symbol]
-                                continue
-                            trade['sl_order_id'] = sl_order['orderId']
-
-                            step_size = next((float(f['stepSize']) for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-
-                            qty_tp1 = (trade['quantity'] * tp1_close_percentage // step_size) * step_size if step_size else 0
-
-                            if qty_tp1 > 0:
-                                tp_order, tp_err = await place_new_order(client, symbol_info, sl_tp_side, 'TAKE_PROFIT_MARKET', qty_tp1, stop_price=trade['tp1'], reduce_only=True, position_side=pos_side)
-                                if not tp_err:
-                                    trade['tp_order_id'] = tp_order['orderId']
-                                else:
-                                    await send_telegram_alert(bot, f"Warning: Failed to place TP1 for {symbol}. SL is active. Error: {tp_err}")
-                            
-                        trade['status'] = 'running'
-                        await send_telegram_alert(bot, f"✅ TRADE TRIGGERED & PROTECTED ✅\nSymbol: {symbol}\nEntry: {trade['entry_price']:.8f}\nSide: {trade['side']}\nSL: {trade['sl']:.8f}\nTP1: {trade['tp1']:.8f}", message_type='signal')
+                            # Transition to pending_entry to monitor the fill of the limit order
+                            trade['status'] = 'pending_entry'
+                            trade['entry_order_id'] = order['orderId']
+                            # Reset the timestamp to start the timeout for the limit order
+                            trade['timestamp'] = time.time() * 1000 
+                            await send_telegram_alert(bot, f"🚀 ENTRY PRICE REACHED. PLACING LIMIT ORDER for {symbol} at {limit_price:.8f}", message_type='signal')
+                        
+                        # In signal mode, just notify that the entry price was reached
+                        else: # not live_mode
+                            trade['status'] = 'triggered_signal' # A new status to indicate signal was triggered but not acted upon
+                            await send_telegram_alert(bot, f"🎯 ENTRY PRICE REACHED for {symbol} at {trade['entry_price']:.8f}", message_type='signal')
 
                 elif trade['status'] == 'running':
                     # Check for SL hit
@@ -1464,32 +1545,41 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                         if symbol in virtual_orders: del virtual_orders[symbol]
                         continue
 
-                    # Check for TP1 hit
+                    # Check for TP hit
                     if trade.get('tp_order_id'):
                         tp_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['tp_order_id']))
                         if tp_order['status'] == 'FILLED':
-                            await send_telegram_alert(bot, f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {tp_order['avgPrice']}\nClosing {tp1_close_percentage*100}% of the position.", message_type='signal')
-                            await cancel_order(client, symbol, trade['sl_order_id'])
-                            
-                            trade['status'] = 'tp1_hit'
-                            trade['sl'] = trade['entry_price'] # Move SL to entry
-                            
-                            step_size = next((float(f['stepSize']) for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-                            remaining_quantity = (trade['original_quantity'] * (1 - tp1_close_percentage) // step_size) * step_size if step_size else 0
-                            trade['quantity'] = remaining_quantity
-                            trade['tp_order_id'] = None # TP1 is done
-                            
-                            if live_mode and remaining_quantity > 0:
-                                sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
-                                new_sl_order, sl_err = await place_new_order(client, symbol_info, sl_tp_side, 'STOP_MARKET', remaining_quantity, stop_price=trade['sl'], reduce_only=True, position_side=pos_side)
-                                if sl_err:
-                                    await send_telegram_alert(bot, f"CRITICAL: Failed to place new SL at breakeven for {symbol} after TP1. Closing position.")
-                                    await place_new_order(client, symbol_info, sl_tp_side, 'MARKET', remaining_quantity, reduce_only=True, position_side=pos_side)
-                                    trade['status'] = 'error'
-                                    if symbol in virtual_orders: del virtual_orders[symbol]
-                                    continue
-                                trade['sl_order_id'] = new_sl_order['orderId']
-                            continue
+                            # Handle TP for Reversal (all-in, all-out) strategy
+                            if trade.get('strategy_type') == 'reversal':
+                                await send_telegram_alert(bot, f"🎉 TAKE PROFIT HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {tp_order['avgPrice']}", message_type='signal')
+                                await cancel_order(client, symbol, trade['sl_order_id']) # Cancel SL
+                                trade['status'] = 'tp_hit'
+                                if symbol in virtual_orders: del virtual_orders[symbol]
+                                continue
+                            # Handle partial TP for Fibonacci strategy
+                            else:
+                                await send_telegram_alert(bot, f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {tp_order['avgPrice']}\nClosing {tp1_close_percentage*100}% of the position.", message_type='signal')
+                                await cancel_order(client, symbol, trade['sl_order_id'])
+                                
+                                trade['status'] = 'tp1_hit'
+                                trade['sl'] = trade['entry_price'] # Move SL to entry
+                                
+                                step_size = next((float(f['stepSize']) for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+                                remaining_quantity = (trade['original_quantity'] * (1 - tp1_close_percentage) // step_size) * step_size if step_size else 0
+                                trade['quantity'] = remaining_quantity
+                                trade['tp_order_id'] = None # TP1 is done
+                                
+                                if live_mode and remaining_quantity > 0:
+                                    sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
+                                    new_sl_order, sl_err = await place_new_order(client, symbol_info, sl_tp_side, 'STOP_MARKET', remaining_quantity, stop_price=trade['sl'], reduce_only=True, position_side=pos_side)
+                                    if sl_err:
+                                        await send_telegram_alert(bot, f"CRITICAL: Failed to place new SL at breakeven for {symbol} after TP1. Closing position.")
+                                        await place_new_order(client, symbol_info, sl_tp_side, 'MARKET', remaining_quantity, reduce_only=True, position_side=pos_side)
+                                        trade['status'] = 'error'
+                                        if symbol in virtual_orders: del virtual_orders[symbol]
+                                        continue
+                                    trade['sl_order_id'] = new_sl_order['orderId']
+                                continue
                 
                 elif trade['status'] == 'tp1_hit':
                     # Check for SL hit
@@ -1646,7 +1736,7 @@ async def main():
         config = config_df.to_dict()
         risk_per_trade = config['risk_per_trade']
         risk_amount_usd = config['risk_amount_usd']
-        use_fixed_risk_amount = config['use_fixed_risk_amount']
+        use_fixed_risk_amount = config_to_bool(config['use_fixed_risk_amount'])
         leverage = config['leverage']
         atr_value = int(config['atr_value'])
         lookback_candles_short = int(config['lookback_candles_short'])
@@ -1889,25 +1979,42 @@ async def main():
                                 print(f"  - HTF Confluence confirmed for {symbol}")
                                 
                                 # All conditions met, execute reversal trade
-                                entry_price = reversal_signal['entry_price']
-                                sl = reversal_signal['stop_loss']
-                                tp1 = reversal_signal['take_profit']
+                                signal_candle = reversal_signal['signal_candle']
+                                entry_price = float(signal_candle['close'])
                                 trade_side = 'long' if signal_side == 'bullish' else 'short'
+
+                                # Calculate SL and TP using ATR
+                                if trade_side == 'short':
+                                    reference_price = float(signal_candle['high'])
+                                else: # long
+                                    reference_price = float(signal_candle['low'])
+                                
+                                sl = get_atr_stop_loss(trade_side, reference_price, klines_15m, config)
+                                risk_distance = abs(entry_price - sl)
+                                tp1 = entry_price - risk_distance * config.get('tp1_rr_ratio', 1.5) if trade_side == 'short' else entry_price + risk_distance * config.get('tp1_rr_ratio', 1.5)
                                 
                                 quantity = calculate_quantity(client, symbols_info[symbol], risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
                                 
                                 if quantity is not None and quantity > 0:
                                     reason = f"Reversal: {signal_side.capitalize()} Grab & {divergence_signal.capitalize()} Divergence"
                                     image_buffer = generate_reversal_chart(symbol, klines_15m, reversal_signal)
-                                    caption = f"🚀 NEW REVERSAL SIGNAL 🚀\nSymbol: {symbol}\nSide: {trade_side.capitalize()}\nReason: {reason}\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nLIMIT ORDER ONLY VALID 4 HOURS"
+                                    caption = f"🚀 NEW REVERSAL SIGNAL 🚀\nSymbol: {symbol}\nSide: {trade_side.capitalize()}\nReason: {reason}\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\n"
+                                    
+                                    # All strategies now create a 'pending' trade to be handled by the monitor.
+                                    # The monitor will place a LIMIT order when the entry price is reached.
+                                    caption = f"🚀 NEW REVERSAL SIGNAL 🚀\nSymbol: {symbol}\nSide: {trade_side.capitalize()}\nReason: {reason}\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nPENDING - Waiting for price to reach entry."
                                     await send_market_analysis_image(bot, image_buffer, caption, backtest_mode)
                                     
                                     new_trade = {
                                         'symbol': symbol, 'side': trade_side, 'entry_price': entry_price, 'sl': sl, 
-                                        'tp1': tp1, 'tp2': None, 'status': 'pending', 'quantity': quantity, 
-                                        'original_quantity': quantity, 'timestamp': klines_15m[-1][0], 
-                                        'sl_order_id': None, 'tp_order_id': None, 'reason_for_entry': reason
+                                        'tp1': tp1, 'tp2': None, 'status': 'pending',
+                                        'quantity': quantity, 'original_quantity': quantity, 
+                                        'timestamp': klines_15m[-1][0], 
+                                        'entry_order_id': None, 'sl_order_id': None, 'tp_order_id': None, 
+                                        'reason_for_entry': reason,
+                                        'strategy_type': 'reversal'
                                     }
+                                    
                                     with trades_lock:
                                         trades.append(new_trade)
                                     virtual_orders[symbol] = new_trade
@@ -1928,7 +2035,7 @@ async def main():
                         current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
 
                         if not ((trend_15m == "downtrend" and current_price < ema_value) or (trend_15m == "uptrend" and current_price > ema_value)):
-                            await send_telegram_alert(bot, f"❌ Signal Rejected by EMA ❌\nSymbol: {symbol}\nSide: {trend_15m}\nReason: Price {current_price} is not on the correct side of the {ema_period} EMA ({ema_value:.2f}).")
+                            await send_telegram_alert(bot, f"❌ Signal Rejected by EMA ❌\nStrategy: Fibonacci\nSymbol: {symbol}\nSide: {trend_15m}\nReason: Price {current_price} is not on the correct side of the {ema_period} EMA ({ema_value:.2f}).")
                             continue
                         
                         print(f"  - EMA Confirmed for {symbol}. Price: {current_price}, EMA: {ema_value:.2f}")
@@ -1938,12 +2045,16 @@ async def main():
                             last_swing_high, last_swing_low = swing_highs_15m[-1][1], swing_lows_15m[-1][1]
                             entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend_15m)
                             if current_price < entry_price: continue
-                            sl = last_swing_high * 1.001; tp1 = entry_price - (sl - entry_price) * tp1_rr_ratio
+                            
+                            # Calculate SL and TP using ATR
+                            reference_price = swing_highs_15m[-1][1]
+                            sl = get_atr_stop_loss('short', reference_price, klines_15m, config)
+                            tp1 = entry_price - (sl - entry_price) * tp1_rr_ratio
 
                             # Divergence Check
                             divergence = check_for_divergence(klines_15m)
                             if divergence == 'bullish':
-                                await send_telegram_alert(bot, f"❌ Signal Rejected by Divergence Check ❌\nSymbol: {symbol}\nSide: Short\nReason: Bullish divergence found.")
+                                await send_telegram_alert(bot, f"❌ Signal Rejected by Divergence Check ❌\nStrategy: Fibonacci\nSymbol: {symbol}\nSide: Short\nReason: Bullish divergence found.")
                                 continue
                             
                             if ml_model and ml_feature_columns:
@@ -1955,7 +2066,7 @@ async def main():
                                 if pred_prob_short is None or pred_prob_long is None: print(f"Could not generate features for {symbol}. Skipping ML check."); continue
                                 prediction_short, prediction_long = (1 if p > 0.5 else 0 for p in [pred_prob_short, pred_prob_long])
                                 if not (prediction_short and prediction_long and pred_prob_short >= model_confidence_threshold and pred_prob_long >= model_confidence_threshold):
-                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Short\nReason: Short Pred: {prediction_short} ({pred_prob_short:.2f}), Long Pred: {prediction_long} ({pred_prob_long:.2f})"); continue
+                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nStrategy: Fibonacci\nSymbol: {symbol}\nSide: Short\nReason: Short Pred: {prediction_short} ({pred_prob_short:.2f}), Long Pred: {prediction_long} ({pred_prob_long:.2f})"); continue
                                 ml_info = f"🧠 ML: Win (S:{pred_prob_short:.1%}, L:{pred_prob_long:.1%})"; pred_prob = (pred_prob_short + pred_prob_long) / 2; pred_label = 1
                             else:
                                 ml_info, pred_prob, pred_label = "🧠 ML Model not in use.", 0.0, 0
@@ -1977,12 +2088,16 @@ async def main():
                             last_swing_high, last_swing_low = swing_highs_15m[-1][1], swing_lows_15m[-1][1]
                             entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend_15m)
                             if current_price > entry_price: continue
-                            sl = last_swing_low * 0.999; tp1 = entry_price + (entry_price - sl) * tp1_rr_ratio
+                            
+                            # Calculate SL and TP using ATR
+                            reference_price = swing_lows_15m[-1][1]
+                            sl = get_atr_stop_loss('long', reference_price, klines_15m, config)
+                            tp1 = entry_price + (entry_price - sl) * tp1_rr_ratio
 
                             # Divergence Check
                             divergence = check_for_divergence(klines_15m)
                             if divergence == 'bearish':
-                                await send_telegram_alert(bot, f"❌ Signal Rejected by Divergence Check ❌\nSymbol: {symbol}\nSide: Long\nReason: Bearish divergence found.")
+                                await send_telegram_alert(bot, f"❌ Signal Rejected by Divergence Check ❌\nStrategy: Fibonacci\nSymbol: {symbol}\nSide: Long\nReason: Bearish divergence found.")
                                 continue
 
                             if ml_model and ml_feature_columns:
@@ -1994,7 +2109,7 @@ async def main():
                                 if pred_prob_short is None or pred_prob_long is None: print(f"Could not generate features for {symbol}. Skipping ML check."); continue
                                 prediction_short, prediction_long = (1 if p > 0.5 else 0 for p in [pred_prob_short, pred_prob_long])
                                 if not (prediction_short and prediction_long and pred_prob_short >= model_confidence_threshold and pred_prob_long >= model_confidence_threshold):
-                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nSymbol: {symbol}\nSide: Long\nReason: Short Pred: {prediction_short} ({pred_prob_short:.2f}), Long Pred: {prediction_long} ({pred_prob_long:.2f})"); continue
+                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nStrategy: Fibonacci\nSymbol: {symbol}\nSide: Long\nReason: Short Pred: {prediction_short} ({pred_prob_short:.2f}), Long Pred: {prediction_long} ({pred_prob_long:.2f})"); continue
                                 ml_info = f"🧠 ML: Win (S:{pred_prob_short:.1%}, L:{pred_prob_long:.1%})"; pred_prob = (pred_prob_short + pred_prob_long) / 2; pred_label = 1
                             else:
                                 ml_info, pred_prob, pred_label = "🧠 ML Model not in use.", 0.0, 0
