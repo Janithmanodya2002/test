@@ -81,6 +81,70 @@ class PositionMonitor:
         self.status = 'running'
         self.trailing_stop_activated = False
 
+    async def _get_current_pnl(self):
+        """A convenience method to get only the PNL of the position."""
+        report = await self.get_status_report()
+        pnl = report.get('pnl', 0.0)
+        # Ensure PNL is a float, handle 'N/A' case
+        return float(pnl) if isinstance(pnl, (int, float)) else 0.0
+
+    async def _update_take_profit(self, new_tp_price):
+        """Cancels the existing take-profit order and places a new one."""
+        print(f"Updating take profit for {self.symbol} to {new_tp_price}")
+        await send_telegram_alert(self.bot, f"Updating TP for {self.symbol} to {new_tp_price:.4f}", message_type='info')
+
+        # Cancel the existing TP order, if it exists
+        if self.tp_order_id:
+            canceled, err = await cancel_order(self.client, self.symbol, self.tp_order_id)
+            if not canceled:
+                await send_telegram_alert(self.bot, f"⚠️ WARNING: Could not cancel old TP for {self.symbol} while updating. Error: {err}")
+
+        # Place the new Take Profit Order
+        sl_tp_side = 'SELL' if self.side == 'long' else 'BUY'
+        pos_side = 'LONG' if self.side == 'long' else 'SHORT' if self.is_hedge_mode else None
+        
+        new_tp_order, tp_err = await place_new_order(
+            self.client, self.symbol_info, sl_tp_side, 'TAKE_PROFIT_MARKET',
+            self.quantity, stop_price=new_tp_price,
+            is_closing_order=True, position_side=pos_side
+        )
+
+        if tp_err:
+            await send_telegram_alert(self.bot, f"⚠️ WARNING: Failed to place updated TP for {self.symbol}. Trade is now only protected by SL. Error: {tp_err}")
+            self.tp_order_id = None
+            self.tp_price = None
+        else:
+            self.tp_order_id = new_tp_order['orderId']
+            self.tp_price = new_tp_price
+            await send_telegram_alert(self.bot, f"✅ TP for {self.symbol} updated to {self.tp_price:.4f}", message_type='info')
+
+    async def force_close(self):
+        """Immediately closes the position with a market order."""
+        print(f"Force closing position for {self.symbol}")
+        await send_telegram_alert(self.bot, f"‼️ Forcing market close for {self.symbol}...", message_type='info')
+
+        # 1. Cancel existing SL and TP orders
+        if self.sl_order_id:
+            await cancel_order(self.client, self.symbol, self.sl_order_id)
+        if self.tp_order_id:
+            await cancel_order(self.client, self.symbol, self.tp_order_id)
+
+        # 2. Place a market order to close the position
+        close_side = 'SELL' if self.side == 'long' else 'BUY'
+        pos_side = 'LONG' if self.side == 'long' else 'SHORT' if self.is_hedge_mode else None
+
+        close_order, err = await place_new_order(
+            self.client, self.symbol_info, close_side, 'MARKET',
+            self.quantity, is_closing_order=True, position_side=pos_side
+        )
+
+        if err:
+            await send_telegram_alert(self.bot, f"CRITICAL: Failed to force close {self.symbol}. MANUAL INTERVENTION REQUIRED. Error: {err}")
+            self.status = 'error_force_close_failed'
+        else:
+            await send_telegram_alert(self.bot, f"✅ Position for {self.symbol} force closed.", message_type='signal')
+            self.status = 'force_closed'
+
     async def _update_trailing_stop(self):
         """
         Calculates and updates the trailing stop loss if conditions are met.
@@ -271,6 +335,11 @@ class PositionMonitor:
         
         if self.symbol in virtual_orders:
             del virtual_orders[self.symbol]
+
+        # Start cooldown period for this symbol/strategy
+        if self.trade_manager:
+            strategy_name = self.trade_details.get('strategy_type')
+            self.trade_manager.start_cooldown(self.symbol, strategy_name)
         
         # Remove self from the trade manager
         if self.trade_manager:
@@ -322,9 +391,35 @@ class TradeManager:
     """
     Manages all active PositionMonitor tasks to provide a central point of control.
     """
-    def __init__(self):
+    def __init__(self, cooldown_period_hours=4):
         self.active_monitors = {}
         self._lock = asyncio.Lock()
+        self.cooldown_tracker = {}
+        self.cooldown_period_seconds = cooldown_period_hours * 3600
+
+    def start_cooldown(self, symbol, strategy_name):
+        """Starts the cooldown timer for a specific symbol and strategy."""
+        if not strategy_name:
+            print(f"Warning: Cooldown not started for {symbol} due to missing strategy name.")
+            return
+        key = (symbol, strategy_name)
+        self.cooldown_tracker[key] = time.time()
+        print(f"Cooldown started for {symbol} with strategy {strategy_name}.")
+
+    def is_on_cooldown(self, symbol, strategy_name):
+        """Checks if a symbol and strategy are currently on cooldown."""
+        if not strategy_name:
+            return False # Cannot be on cooldown if strategy is unknown
+        key = (symbol, strategy_name)
+        last_trade_time = self.cooldown_tracker.get(key)
+
+        if last_trade_time:
+            elapsed_time = time.time() - last_trade_time
+            if elapsed_time < self.cooldown_period_seconds:
+                remaining = self.cooldown_period_seconds - elapsed_time
+                print(f"Trade for {symbol} ({strategy_name}) is on cooldown. Remaining: {remaining/60:.2f} minutes.")
+                return True
+        return False
 
     async def add_monitor(self, symbol, monitor_instance):
         """Adds a new position monitor to the manager, keyed by symbol."""
@@ -347,6 +442,39 @@ class TradeManager:
         """Returns a list of all currently active monitor instances."""
         async with self._lock:
             return list(self.active_monitors.values())
+
+
+async def handle_reversal_signal_on_existing_trade(monitor, bot):
+    """
+    Manages an existing trade when a new reversal signal is detected for the same symbol.
+    """
+    symbol = monitor.symbol
+    print(f"Handling new reversal signal for existing position on {symbol}.")
+    
+    # 1. Check the current PNL of the existing trade
+    current_pnl = await monitor._get_current_pnl()
+    
+    # 2. Decide action based on PNL
+    if current_pnl > 0.1:
+        # If trade is in profit by more than 10 cents, close it
+        await send_telegram_alert(bot, f"📈 New reversal signal on {symbol}. Closing existing profitable trade (PNL: ${current_pnl:.2f}).", message_type='info')
+        await monitor.force_close()
+    else:
+        # If trade is at a small profit or loss, adjust TP to break-even + 10 cents
+        entry_price = monitor.entry_price
+        
+        # Calculate the price that is $0.1 in profit
+        # The formula is: pnl = (exit - entry) * quantity for long
+        # exit = (pnl / quantity) + entry
+        profit_per_unit = 0.1 / monitor.quantity
+        
+        if monitor.side == 'long':
+            new_tp_price = entry_price + profit_per_unit
+        else: # short
+            new_tp_price = entry_price - profit_per_unit
+            
+        await send_telegram_alert(bot, f"📉 New reversal signal on {symbol}. Adjusting TP of existing trade (PNL: ${current_pnl:.2f}) to ${new_tp_price:.4f} for a minimal profit exit.", message_type='info')
+        await monitor._update_take_profit(new_tp_price)
 
 
 async def monitor_open_positions(trade_manager, bot, interval_seconds=30):
@@ -2237,6 +2365,20 @@ async def main():
                     # --- Reversal Strategy Logic ---
                     reversal_signal = find_liquidity_grab(klines_15m, swing_highs_15m, swing_lows_15m, tp1_rr_ratio)
                     if reversal_signal:
+                        strategy_name = 'reversal'
+                        monitor = trade_manager.active_monitors.get(symbol)
+
+                        if monitor:
+                            # Position exists. Only a new reversal signal can manage an existing trade.
+                            if monitor.trade_details.get('strategy_type') != strategy_name:
+                                await handle_reversal_signal_on_existing_trade(monitor, bot)
+                            # In either case, we don't open a new trade, so we skip to the next symbol.
+                            continue
+                        
+                        # No position exists, check for cooldown before proceeding.
+                        if trade_manager.is_on_cooldown(symbol, strategy_name):
+                            continue
+
                         print(f"  - Potential liquidity grab found for {symbol}: {reversal_signal['signal']}")
                         divergence_signal = check_for_divergence(klines_15m)
                         
@@ -2296,6 +2438,16 @@ async def main():
                                     continue
 
                     # --- Fallback to Fibonacci Strategy ---
+                    strategy_name = 'fibonacci'
+                    monitor = trade_manager.active_monitors.get(symbol)
+
+                    if monitor:
+                        # Position already exists, new Fibonacci signal does not override.
+                        continue
+
+                    if trade_manager.is_on_cooldown(symbol, strategy_name):
+                        continue
+
                     if trend_15m == trend_htf and trend_15m != "undetermined":
                         print(f"  - Trend confirmed on 15m and {higher_timeframe}: {trend_15m}")
                         
@@ -2351,7 +2503,7 @@ async def main():
                             image_buffer = generate_fib_chart(symbol, klines_15m, trend_15m, last_swing_high, last_swing_low, entry_price, sl, tp1, tp1) # Pass tp1 for tp2 placeholder
                             caption = f"🚀 NEW SIGNAL (ML, EMA, Divergence, Volume) 🚀\n{ml_info}\nSymbol: {symbol}\nSide: Short\nLeverage: {leverage}x\nRisk: {risk_per_trade}%\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nLIMIT ORDER ONLY VALID 4 HOURS"
                             await send_market_analysis_image(bot, image_buffer, caption)
-                            new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': None, 'status': 'pending', 'quantity': quantity, 'original_quantity': quantity, 'timestamp': klines_15m[-1][0], 'sl_order_id': None, 'tp_order_id': None, 'ml_prediction': pred_label, 'ml_confidence': pred_prob, 'sl_to_be_updated': True}
+                            new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': None, 'status': 'pending', 'quantity': quantity, 'original_quantity': quantity, 'timestamp': klines_15m[-1][0], 'sl_order_id': None, 'tp_order_id': None, 'ml_prediction': pred_label, 'ml_confidence': pred_prob, 'sl_to_be_updated': True, 'strategy_type': 'fibonacci'}
                             with trades_lock: trades.append(new_trade)
                             virtual_orders[symbol] = new_trade
                             update_trade_report(trades)
@@ -2394,7 +2546,7 @@ async def main():
                             image_buffer = generate_fib_chart(symbol, klines_15m, trend_15m, last_swing_high, last_swing_low, entry_price, sl, tp1, tp1) # Pass tp1 for tp2 placeholder
                             caption = f"🚀 NEW SIGNAL (ML, EMA, Divergence, Volume) 🚀\n{ml_info}\nSymbol: {symbol}\nSide: Long\nLeverage: {leverage}x\nRisk: {risk_per_trade}%\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nLIMIT ORDER ONLY VALID 4 HOURS"
                             await send_market_analysis_image(bot, image_buffer, caption)
-                            new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': None, 'status': 'pending', 'quantity': quantity, 'original_quantity': quantity, 'timestamp': klines_15m[-1][0], 'sl_order_id': None, 'tp_order_id': None, 'ml_prediction': pred_label, 'ml_confidence': pred_prob, 'sl_to_be_updated': True}
+                            new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': None, 'status': 'pending', 'quantity': quantity, 'original_quantity': quantity, 'timestamp': klines_15m[-1][0], 'sl_order_id': None, 'tp_order_id': None, 'ml_prediction': pred_label, 'ml_confidence': pred_prob, 'sl_to_be_updated': True, 'strategy_type': 'fibonacci'}
                             with trades_lock: trades.append(new_trade)
                             virtual_orders[symbol] = new_trade
                             update_trade_report(trades)
