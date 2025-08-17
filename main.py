@@ -882,6 +882,133 @@ def generate_reversal_chart(symbol, klines, signal_details, num_candles_to_show=
     return buf
 
 
+def generate_fvg_chart(symbol, klines, signal_details, fvg_data, num_candles_to_show=80):
+    """
+    Generate a chart for the FVG strategy, highlighting FVG zones.
+    """
+    df = pd.DataFrame(klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    df['dt'] = pd.to_datetime(df['dt'], unit='ms')
+    df.set_index('dt', inplace=True)
+    df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+    df = df.tail(num_candles_to_show)
+
+    entry_price = signal_details['entry_price']
+    sl = signal_details['sl']
+    tp = signal_details['tp']
+    signal_type = signal_details['side']
+
+    mc = mpf.make_marketcolors(up='#26A69A', down='#EF5350', wick='inherit', volume='inherit', ohlc='inherit')
+    s = mpf.make_mpf_style(base_mpf_style='charles', marketcolors=mc, gridstyle='--', facecolor='#FAFAFA')
+
+    fig, axlist = mpf.plot(df, type='candle', style=s,
+                           title=f'\n{symbol} 15m - FVG Signal ({signal_type.capitalize()})',
+                           ylabel='Price (USDT)',
+                           figsize=(12, 6.5),
+                           returnfig=True,
+                           volume=True,
+                           panel_ratios=(4, 1),
+                           tight_layout=True)
+    
+    ax_main = axlist[0]
+
+    # Plot HTF FVG zone
+    if fvg_data.get('4h_fvg'):
+        htf_fvg = fvg_data['4h_fvg']
+        ax_main.axhspan(htf_fvg['bottom'], htf_fvg['top'], color='blue', alpha=0.1, label='4h FVG')
+        ax_main.text(df.index[1], htf_fvg['top'], ' 4h FVG', color='blue', va='bottom', alpha=0.7)
+
+    # Plot LTF FVG zone
+    if fvg_data.get('15m_fvg'):
+        ltf_fvg = fvg_data['15m_fvg']
+        ax_main.axhspan(ltf_fvg['bottom'], ltf_fvg['top'], color='purple', alpha=0.15, label='15m FVG')
+        ax_main.text(df.index[1], ltf_fvg['bottom'], ' 15m FVG', color='purple', va='top', alpha=0.7)
+
+    # Plot Entry, SL, TP
+    for price, label, color in zip([entry_price, sl, tp],
+                                   [f'Entry: {entry_price:.4f}', f'SL: {sl:.4f}', f'TP: {tp:.4f}'],
+                                   ['green', 'red', 'blue']):
+        ax_main.axhline(y=price, color=color, linestyle='--', linewidth=1.2)
+        ax_main.text(df.index[-1], price, f' {label}', color=color, va='center', ha='left', fontsize=9, weight='bold')
+
+    ax_main.legend()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=120, bbox_inches='tight')
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+def generate_rsi_divergence_chart(symbol, klines, signal_details, divergence_data, num_candles_to_show=100):
+    """
+    Generate an improved chart for the RSI Divergence strategy with better visibility.
+    """
+    df = pd.DataFrame(klines, columns=['dt', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    df['dt'] = pd.to_datetime(df['dt'], unit='ms')
+    df.set_index('dt', inplace=True)
+    df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+    
+    # Calculate RSI
+    df['rsi'] = rsi(df['close'], length=14)
+    df = df.tail(num_candles_to_show)
+
+    entry_price = signal_details['entry_price']
+    sl = signal_details['sl']
+    tp = signal_details['tp']
+    signal_type = signal_details['side']
+
+    mc = mpf.make_marketcolors(up='#26A69A', down='#EF5350', wick='inherit', volume='inherit', ohlc='inherit')
+    s = mpf.make_mpf_style(base_mpf_style='charles', marketcolors=mc, gridstyle='--', facecolor='#FAFAFA')
+
+    # --- IMPROVEMENT: Make RSI line more visible ---
+    rsi_plot = mpf.make_addplot(df['rsi'], panel=1, color='#FF00FF', ylabel='RSI', width=1.2)
+    
+    # Get divergence line data
+    price_swing_df = divergence_data['price_swings']
+    rsi_swing_df = divergence_data['rsi_swings']
+    
+    price_line_points = [(price_swing_df.index[0], price_swing_df.iloc[0]), (price_swing_df.index[1], price_swing_df.iloc[1])]
+    rsi_line_points = [(rsi_swing_df.index[0], rsi_swing_df.iloc[0]), (rsi_swing_df.index[1], rsi_swing_df.iloc[1])]
+
+    # --- IMPROVEMENT: Make divergence line more visible ---
+    fig, axlist = mpf.plot(df, type='candle', style=s,
+                           title=f'\n{symbol} 15m - RSI {signal_type.capitalize()} Divergence',
+                           ylabel='Price (USDT)',
+                           figsize=(14, 8), # Increased figure size
+                           addplot=[rsi_plot],
+                           panel_ratios=(3, 1),
+                           returnfig=True,
+                           volume=False,
+                           # Make line thicker and a different color
+                           alines=dict(alines=[price_line_points], colors=['#424242'], linewidths=[1.5]))
+
+    ax_main = axlist[0]
+    ax_rsi = axlist[2] 
+
+    # --- IMPROVEMENT: Add markers for swing points on price chart ---
+    ax_main.scatter(price_swing_df.index, price_swing_df.values, color='black', marker='o', s=50, zorder=5)
+
+    # --- IMPROVEMENT: Make RSI divergence line thicker and add markers ---
+    ax_rsi.plot([rsi_line_points[0][0], rsi_line_points[1][0]], 
+                [rsi_line_points[0][1], rsi_line_points[1][1]], color='#424242', linewidth=1.5)
+    ax_rsi.scatter(rsi_swing_df.index, rsi_swing_df.values, color='black', marker='o', s=50, zorder=5)
+    
+    # Make RSI overbought/oversold lines clearer
+    ax_rsi.axhline(70, color='red', linestyle='--', linewidth=1, alpha=0.7)
+    ax_rsi.axhline(30, color='green', linestyle='--', linewidth=1, alpha=0.7)
+    ax_rsi.set_ylim(0, 100)
+
+    # Plot Entry, SL, TP on main axis
+    for price, label, color in zip([entry_price, sl, tp],
+                                   [f'Entry: {entry_price:.4f}', f'SL: {sl:.4f}', f'TP: {tp:.4f}'],
+                                   ['green', 'red', 'blue']):
+        ax_main.axhline(y=price, color=color, linestyle='--', linewidth=1.2)
+        ax_main.text(df.index[-1], price, f' {label}', color=color, va='center', ha='left', fontsize=9, weight='bold')
+    
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=120, bbox_inches='tight')
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
 def get_binance_server_time(client):
     """
     Get the current server time from Binance.
@@ -908,66 +1035,58 @@ def get_public_ip():
 
 def find_rsi_divergence(klines, lookback=60, rsi_period=14):
     """
-    Checks for regular RSI divergence over the last `lookback` candles.
-    Returns 'BUY', 'SELL', or 'NONE'.
+    Checks for regular RSI divergence.
+    Returns (signal, divergence_data) where signal is 'BUY', 'SELL', or 'NONE'.
+    divergence_data contains the swing points for charting if a signal is found.
     """
     df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
     df['high'] = pd.to_numeric(df['high'])
     df['low'] = pd.to_numeric(df['low'])
     df['close'] = pd.to_numeric(df['close'])
 
-    # Calculate RSI
     rsi_series = rsi(df['close'], length=rsi_period)
     if rsi_series is None or rsi_series.empty or rsi_series.isnull().all():
-        return 'NONE'
+        return 'NONE', None
     
     df['rsi'] = rsi_series
     
-    # We need enough data for lookback
     if len(df) < lookback:
-        return 'NONE'
+        return 'NONE', None
         
     df_lookback = df.tail(lookback).copy()
 
-    # Calculate prominence for price peaks
     price_range = df_lookback['high'].max() - df_lookback['low'].min()
-    price_prominence = price_range * 0.05 # 5% of price range
+    price_prominence = price_range * 0.05
 
-    # Find price peaks
     price_peaks_indices, _ = find_peaks(df_lookback['high'], distance=5, prominence=price_prominence)
-
-    # Check for Bearish Divergence
     if len(price_peaks_indices) >= 2:
-        p_peak1_idx = price_peaks_indices[-2]
-        p_peak2_idx = price_peaks_indices[-1]
-        
-        p_peak1_val = df_lookback['high'].iloc[p_peak1_idx]
-        p_peak2_val = df_lookback['high'].iloc[p_peak2_idx]
-        
-        rsi_at_p_peak1 = df_lookback['rsi'].iloc[p_peak1_idx]
-        rsi_at_p_peak2 = df_lookback['rsi'].iloc[p_peak2_idx]
+        p_peak1_idx, p_peak2_idx = price_peaks_indices[-2], price_peaks_indices[-1]
+        p_peak1_val, p_peak2_val = df_lookback['high'].iloc[p_peak1_idx], df_lookback['high'].iloc[p_peak2_idx]
+        rsi_at_p_peak1, rsi_at_p_peak2 = df_lookback['rsi'].iloc[p_peak1_idx], df_lookback['rsi'].iloc[p_peak2_idx]
         
         if p_peak2_val > p_peak1_val and rsi_at_p_peak2 < rsi_at_p_peak1:
-            return 'SELL'
+            divergence_data = {
+                'price_swings': df_lookback['high'].iloc[[p_peak1_idx, p_peak2_idx]],
+                'rsi_swings': df_lookback['rsi'].iloc[[p_peak1_idx, p_peak2_idx]]
+            }
+            return 'SELL', divergence_data
             
-    # Find price troughs
     price_troughs_indices, _ = find_peaks(-df_lookback['low'], distance=5, prominence=price_prominence)
-
-    # Check for Bullish Divergence
     if len(price_troughs_indices) >= 2:
-        p_trough1_idx = price_troughs_indices[-2]
-        p_trough2_idx = price_troughs_indices[-1]
-        
-        p_trough1_val = df_lookback['low'].iloc[p_trough1_idx]
-        p_trough2_val = df_lookback['low'].iloc[p_trough2_idx]
-        
-        rsi_at_p_trough1 = df_lookback['rsi'].iloc[p_trough1_idx]
-        rsi_at_p_trough2 = df_lookback['rsi'].iloc[p_trough2_idx]
+        p_trough1_idx, p_trough2_idx = price_troughs_indices[-2], price_troughs_indices[-1]
+        p_trough1_val, p_trough2_val = df_lookback['low'].iloc[p_trough1_idx], df_lookback['low'].iloc[p_trough2_idx]
+        rsi_at_p_trough1, rsi_at_p_trough2 = df_lookback['rsi'].iloc[p_trough1_idx], df_lookback['rsi'].iloc[p_trough2_idx]
         
         if p_trough2_val < p_trough1_val and rsi_at_p_trough2 > rsi_at_p_trough1:
-            return 'BUY'
+            divergence_data = {
+                'price_swings': df_lookback['low'].iloc[[p_trough1_idx, p_trough2_idx]],
+                'rsi_swings': df_lookback['rsi'].iloc[[p_trough1_idx, p_trough2_idx]]
+            }
+            return 'BUY', divergence_data
 
-    return 'NONE'
+    return 'NONE', None
 
 def get_swing_points(klines, window=5):
     """
@@ -1132,8 +1251,9 @@ def check_htf_confluence_backtest(htf_klines, entry_price, tolerance_pct, swing_
 
 def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_price, leverage, risk_amount_usd=0, use_fixed_risk_amount=False, backtest_balance=None):
     """
-    Calculate the order quantity based on risk and leverage.
+    Calculate the order quantity and position size based on risk and leverage.
     If backtest_balance is provided, it will be used instead of fetching the live account balance.
+    Returns a tuple of (quantity, position_size).
     """
     try:
         if backtest_balance is not None:
@@ -1141,9 +1261,10 @@ def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_pric
         else:
             # Get account balance for live trading
             account_info = client.futures_account()
-            balance = float(account_info['availableBalance'])
+            # Find the USDT asset to get the available balance
+            balance = float(next((asset['availableBalance'] for asset in account_info['assets'] if asset['asset'] == 'USDT'), '0'))
 
-        # Calculate the maximum position size allowed by leverage
+        # Calculate the maximum position size allowed by leverage and balance
         max_position_size = balance * leverage
 
         # Calculate the desired position size based on risk
@@ -1152,9 +1273,10 @@ def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_pric
             risk_amount = risk_amount_usd
         else:
             risk_amount = balance * (risk_per_trade / 100)
+        
         sl_percentage = abs(entry_price - sl_price) / entry_price
         if sl_percentage == 0:
-            return 0
+            return None, None
 
         trade_position_size = risk_amount / sl_percentage
 
@@ -1164,22 +1286,29 @@ def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_pric
         # Calculate quantity
         quantity = final_position_size / entry_price
 
-        # Adjust for symbol's precision
+        # Adjust for symbol's precision (LOT_SIZE)
         step_size = None
         for f in symbol_info['filters']:
             if f['filterType'] == 'LOT_SIZE':
                 step_size = float(f['stepSize'])
                 break
+        
         if step_size is None:
             print(f"Could not find LOT_SIZE filter for {symbol_info['symbol']}")
-            return None
+            return None, None
 
         quantity = (quantity // step_size) * step_size
 
-        return quantity
+        # Recalculate final position size with the precise quantity
+        final_position_size = quantity * entry_price
+        
+        if quantity <= 0:
+            return None, None
+
+        return quantity, final_position_size
     except Exception as e:
         print(f"Error calculating quantity for {symbol_info['symbol']}: {e}")
-        return None
+        return None, None
 
 def get_atr_stop_loss(side, reference_price, klines, config):
     """
@@ -1314,9 +1443,6 @@ async def execute_fvg_strategy(client, symbol, symbol_info, config, bot, trades,
     Returns a signal dictionary if a valid setup is found, otherwise None.
     """
     strategy_name = 'fvg'
-    if trade_manager.is_on_cooldown(symbol, strategy_name):
-        return None
-
     print(f"--- Running FVG Strategy for {symbol} ---")
 
     try:
@@ -1367,6 +1493,12 @@ async def execute_fvg_strategy(client, symbol, symbol_info, config, bot, trades,
         
         risk_distance = abs(entry_price - sl_price)
         if risk_distance == 0: return None
+
+        # Enforce a minimum stop loss distance
+        min_sl_pct = config.get('min_stop_loss_pct', 0.5) / 100.0
+        if risk_distance / entry_price < min_sl_pct:
+            print(f"  - FVG signal for {symbol} aborted: Stop loss too tight ({risk_distance / entry_price:.2%}).")
+            return None
             
         tp_price = entry_price + (risk_distance * config['tp1_rr_ratio']) if trade_side == 'long' else entry_price - (risk_distance * config['tp1_rr_ratio'])
 
@@ -1375,7 +1507,11 @@ async def execute_fvg_strategy(client, symbol, symbol_info, config, bot, trades,
             'entry_price': entry_price,
             'sl': sl_price,
             'tp': tp_price,
-            'strategy': strategy_name
+            'strategy': strategy_name,
+            'chart_data': {
+                '4h_fvg': htf_fvg,
+                '15m_fvg': fvg_15m
+            }
         }
 
     except Exception as e:
@@ -1390,8 +1526,6 @@ async def execute_rsi_divergence_strategy(client, symbol, symbol_info, config, b
     It identifies a divergence and returns a trade signal dictionary if found.
     """
     strategy_name = 'rsi_divergence'
-    if trade_manager.is_on_cooldown(symbol, strategy_name):
-        return None
 
     print(f"--- Running RSI Divergence Strategy for {symbol} ---")
     
@@ -1400,7 +1534,7 @@ async def execute_rsi_divergence_strategy(client, symbol, symbol_info, config, b
         if not klines_15m or len(klines_15m) < 60:
             return None
 
-        divergence_signal = find_rsi_divergence(klines_15m, lookback=60)
+        divergence_signal, divergence_data = find_rsi_divergence(klines_15m, lookback=60)
 
         if divergence_signal == 'NONE':
             return None
@@ -1425,6 +1559,12 @@ async def execute_rsi_divergence_strategy(client, symbol, symbol_info, config, b
         risk_distance = abs(entry_price - sl_price)
         if risk_distance == 0:
             return None
+
+        # Enforce a minimum stop loss distance
+        min_sl_pct = config.get('min_stop_loss_pct', 0.5) / 100.0
+        if risk_distance / entry_price < min_sl_pct:
+            print(f"  - RSI signal for {symbol} aborted: Stop loss too tight ({risk_distance / entry_price:.2%}).")
+            return None
         
         # Use a 1.5 R:R for TP, as per the plan
         tp_rr_ratio = config.get('tp1_rr_ratio', 1.5) 
@@ -1435,7 +1575,8 @@ async def execute_rsi_divergence_strategy(client, symbol, symbol_info, config, b
             'entry_price': entry_price,
             'sl': sl_price,
             'tp': tp_price,
-            'strategy': strategy_name
+            'strategy': strategy_name,
+            'chart_data': divergence_data
         }
 
     except Exception as e:
@@ -2303,9 +2444,16 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                         continue
 
                     current_price = float((await loop.run_in_executor(None, lambda: client.get_symbol_ticker(symbol=symbol)))['price'])
-                    if (trade['side'] == 'long' and current_price >= trade['entry_price']) or \
-                       (trade['side'] == 'short' and current_price <= trade['entry_price']):
+                    entry_price = trade['entry_price']
+                    tolerance = config.get('entry_price_tolerance_pct', 0.2) / 100  # Convert from % to decimal
 
+                    trigger = False
+                    if trade['side'] == 'long' and (entry_price <= current_price <= entry_price * (1 + tolerance)):
+                        trigger = True
+                    elif trade['side'] == 'short' and (entry_price >= current_price >= entry_price * (1 - tolerance)):
+                        trigger = True
+
+                    if trigger:
                         if live_mode:
                             # Price has been reached, place the LIMIT order
                             limit_price = trade['entry_price']
@@ -2450,9 +2598,8 @@ async def execute_fibonacci_and_reversal_strategy(client, symbol, symbol_info, c
     reversal_signal = find_liquidity_grab(klines_15m, swing_highs_15m, swing_lows_15m, tp1_rr_ratio)
     if reversal_signal:
         strategy_name = 'reversal'
-        if trade_manager.is_on_cooldown(symbol, strategy_name): return None
         
-        divergence_signal = find_rsi_divergence(klines_15m)
+        divergence_signal, _ = find_rsi_divergence(klines_15m) # We only need the signal, not the chart data here
         signal_side = reversal_signal['signal']
         if (signal_side == 'bullish' and divergence_signal == 'BUY') or (signal_side == 'bearish' and divergence_signal == 'SELL'):
             is_confluent = await loop.run_in_executor(None, lambda: check_htf_confluence(client, symbol, reversal_signal['entry_price'], higher_timeframe, htf_confluence_tolerance_pct, swing_window))
@@ -2461,12 +2608,18 @@ async def execute_fibonacci_and_reversal_strategy(client, symbol, symbol_info, c
                 entry_price = float(reversal_signal['signal_candle']['close'])
                 reference_price = float(reversal_signal['signal_candle']['high']) if trade_side == 'short' else float(reversal_signal['signal_candle']['low'])
                 sl = get_atr_stop_loss(trade_side, reference_price, klines_15m, config)
+
+                # Enforce a minimum stop loss distance
+                min_sl_pct = config.get('min_stop_loss_pct', 0.5) / 100.0
+                if abs(entry_price - sl) / entry_price < min_sl_pct:
+                    print(f"  - Reversal signal for {symbol} aborted: Stop loss too tight ({abs(entry_price - sl) / entry_price:.2%}).")
+                    return None
+
                 tp = entry_price - (sl - entry_price) * tp1_rr_ratio if trade_side == 'short' else entry_price + (entry_price - sl) * tp1_rr_ratio
-                return {'side': trade_side, 'entry_price': entry_price, 'sl': sl, 'tp': tp, 'strategy': strategy_name}
+                return {'side': trade_side, 'entry_price': entry_price, 'sl': sl, 'tp': tp, 'strategy': strategy_name, 'chart_data': {'reversal_details': reversal_signal}}
 
     # --- Fallback to Fibonacci Strategy ---
     strategy_name = 'fibonacci'
-    if trade_manager.is_on_cooldown(symbol, strategy_name): return None
 
     if trend_15m == trend_htf and trend_15m != "undetermined":
         df_15m = pd.DataFrame(klines_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
@@ -2479,22 +2632,36 @@ async def execute_fibonacci_and_reversal_strategy(client, symbol, symbol_info, c
             return None
         
         if trend_15m == "downtrend" and len(swing_highs_15m) > 1 and len(swing_lows_15m) > 1:
-            if find_rsi_divergence(klines_15m) == 'BUY': return None
+            if find_rsi_divergence(klines_15m)[0] == 'BUY': return None
             last_swing_high, last_swing_low = swing_highs_15m[-1][1], swing_lows_15m[-1][1]
             entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend_15m)
             if current_price < entry_price: return None
             sl = get_atr_stop_loss('short', last_swing_high, klines_15m, config)
+
+            # Enforce a minimum stop loss distance
+            min_sl_pct = config.get('min_stop_loss_pct', 0.5) / 100.0
+            if abs(entry_price - sl) / entry_price < min_sl_pct:
+                print(f"  - Fibonacci signal for {symbol} aborted: Stop loss too tight ({abs(entry_price - sl) / entry_price:.2%}).")
+                return None
+
             tp = entry_price - (sl - entry_price) * tp1_rr_ratio
-            return {'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp': tp, 'strategy': strategy_name}
+            return {'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp': tp, 'strategy': strategy_name, 'chart_data': {'trend': trend_15m, 'swing_high': last_swing_high, 'swing_low': last_swing_low}}
 
         elif trend_15m == "uptrend" and len(swing_highs_15m) > 1 and len(swing_lows_15m) > 1:
-            if find_rsi_divergence(klines_15m) == 'SELL': return None
+            if find_rsi_divergence(klines_15m)[0] == 'SELL': return None
             last_swing_high, last_swing_low = swing_highs_15m[-1][1], swing_lows_15m[-1][1]
             entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend_15m)
             if current_price > entry_price: return None
             sl = get_atr_stop_loss('long', last_swing_low, klines_15m, config)
+
+            # Enforce a minimum stop loss distance
+            min_sl_pct = config.get('min_stop_loss_pct', 0.5) / 100.0
+            if abs(entry_price - sl) / entry_price < min_sl_pct:
+                print(f"  - Fibonacci signal for {symbol} aborted: Stop loss too tight ({abs(entry_price - sl) / entry_price:.2%}).")
+                return None
+
             tp = entry_price + (entry_price - sl) * tp1_rr_ratio
-            return {'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp': tp, 'strategy': strategy_name}
+            return {'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp': tp, 'strategy': strategy_name, 'chart_data': {'trend': trend_15m, 'swing_high': last_swing_high, 'swing_low': last_swing_low}}
             
     return None
 
@@ -2537,6 +2704,8 @@ async def main():
         max_open_positions = int(config['max_open_positions'])
         model_confidence_threshold = config.get('model_confidence_threshold', 0.7) # Use .get for safe access
         htf_confluence_tolerance_pct = float(config['htf_confluence_tolerance_pct'])
+        config['entry_price_tolerance_pct'] = float(config.get('entry_price_tolerance_pct', 0.2))
+        config['min_stop_loss_pct'] = float(config.get('min_stop_loss_pct', 0.5))
         
         # Load trailing stop parameters
         config['ts_atr_period'] = int(config.get('ts_atr_period', 14))
@@ -2747,86 +2916,109 @@ async def main():
                     # Market State Analysis
                     market_state, trend_type = get_market_state(klines_15m, config.get('market_state_window_sizes', [10, 20, 50]))
 
-                    # Market State Analysis
-                    market_state, trend_type = get_market_state(klines_15m, config.get('market_state_window_sizes', [10, 20, 50]))
+                    # --- Sequential, Prioritized Strategy Check ---
+                    signal = None
                     
-                    signals = []
-                    active_strategies = []
+                    # 1. Check FVG Strategy (runs in any market condition)
+                    print(f"  - Checking FVG Strategy for {symbol}...")
+                    signal = await execute_fvg_strategy(client, symbol, symbols_info[symbol], config, bot, trades, trades_lock, virtual_orders, trade_manager)
+                    
+                    if not signal:
+                        # 2. Check RSI Divergence Strategy (runs in any market condition)
+                        print(f"  - Checking RSI Divergence Strategy for {symbol}...")
+                        signal = await execute_rsi_divergence_strategy(client, symbol, symbols_info[symbol], config, bot, trades, trades_lock, virtual_orders, trade_manager)
 
-                    if market_state == MarketState.TRENDING:
-                        print(f"Market state for {symbol} is TRENDING ({trend_type}). Checking Trend strategies.")
-                        active_strategies = ['fibonacci_reversal', 'fvg', 'rsi_divergence']
-                        fib_signal = await execute_fibonacci_and_reversal_strategy(client, symbol, symbols_info[symbol], config, bot, trades, trades_lock, virtual_orders, trade_manager, klines_15m)
-                        if fib_signal: signals.append(fib_signal)
+                    if not signal and market_state == MarketState.TRENDING:
+                        # 3. Check Fibonacci Strategy (only if market is trending)
+                        print(f"  - Market is trending, checking Fibonacci/Reversal Strategy for {symbol}...")
+                        signal = await execute_fibonacci_and_reversal_strategy(client, symbol, symbols_info[symbol], config, bot, trades, trades_lock, virtual_orders, trade_manager, klines_15m)
+
+                    # --- Process the first valid signal found ---
+                    if signal:
+                        print(f"  - Valid signal found for {symbol} from strategy: {signal['strategy']}")
+                        entry_price = signal['entry_price']
+                        sl = signal['sl']
+                        tp = signal['tp']
+                        trade_side = signal['side']
+                        strategy_name = signal['strategy']
                         
-                        fvg_signal = await execute_fvg_strategy(client, symbol, symbols_info[symbol], config, bot, trades, trades_lock, virtual_orders, trade_manager)
-                        if fvg_signal: signals.append(fvg_signal)
-
-                        rsi_signal = await execute_rsi_divergence_strategy(client, symbol, symbols_info[symbol], config, bot, trades, trades_lock, virtual_orders, trade_manager)
-                        if rsi_signal: signals.append(rsi_signal)
-
-                    elif market_state == MarketState.RANGING:
-                        print(f"Market state for {symbol} is RANGING. Checking Range strategies.")
-                        active_strategies = ['fvg', 'rsi_divergence']
-                        fvg_signal = await execute_fvg_strategy(client, symbol, symbols_info[symbol], config, bot, trades, trades_lock, virtual_orders, trade_manager)
-                        if fvg_signal: signals.append(fvg_signal)
-
-                        rsi_signal = await execute_rsi_divergence_strategy(client, symbol, symbols_info[symbol], config, bot, trades, trades_lock, virtual_orders, trade_manager)
-                        if rsi_signal: signals.append(rsi_signal)
-                    
-                    # --- Consensus Check ---
-                    if len(signals) == len(active_strategies) and len(signals) > 0:
-                        # Check if all signals have the same 'side'
-                        first_side = signals[0]['side']
-                        if all(s['side'] == first_side for s in signals):
-                            print(f"CONSENSUS REACHED for {symbol}: {first_side}")
+                        quantity, position_size = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'], config.get('risk_amount_usd', 0), config_to_bool(config.get('use_fixed_risk_amount', False)))
+                        
+                        if quantity and quantity > 0:
+                            # --- Validation Step 1: Minimum Notional Value Check ---
+                            min_notional = 0.0
+                            for f in symbols_info[symbol]['filters']:
+                                if f['filterType'] == 'MIN_NOTIONAL':
+                                    min_notional = float(f['notional'])
+                                    break
                             
-                            # Prioritize FVG parameters as per user instructions
-                            fvg_params = next((s for s in signals if s['strategy'] == 'fvg'), None)
+                            if position_size < min_notional:
+                                print(f"  - Signal for {symbol} aborted: Position size {position_size:.2f} is below minimum notional {min_notional:.2f}.")
+                                continue
+
+                            # --- Validation Step 2: Pre-Trade Margin Check ---
+                            required_margin = position_size / leverage
+                            account_info = await loop.run_in_executor(None, client.futures_account)
+                            available_balance = float(next((asset['availableBalance'] for asset in account_info['assets'] if asset['asset'] == 'USDT'), '0'))
+
+                            if required_margin > available_balance:
+                                print(f"  - Signal for {symbol} aborted: Insufficient margin. Required: {required_margin:.2f}, Available: {available_balance:.2f}")
+                                continue
                             
-                            if fvg_params:
-                                entry_price = fvg_params['entry_price']
-                                sl = fvg_params['sl']
-                                tp = fvg_params['tp']
-                                trade_side = fvg_params['side']
-                                
-                                quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'], config.get('risk_amount_usd', 0), config_to_bool(config.get('use_fixed_risk_amount', False)))
-                                
-                                if quantity and quantity > 0:
-                                    reason = f"Consensus: {', '.join([s['strategy'] for s in signals])}"
-                                    caption = (f"🚀 NEW CONSENSUS SIGNAL 🚀\n"
-                                               f"Symbol: {symbol}\n"
-                                               f"Side: {trade_side.capitalize()}\n"
-                                               f"Reason: {reason}\n"
-                                               f"Entry: {entry_price:.5f}\n"
-                                               f"SL: {sl:.5f}\n"
-                                               f"TP: {tp:.5f}\n\n"
-                                               f"PENDING - Waiting for price to reach entry.")
+                            # --- All checks passed, create and send chart/alert ---
+                            caption = (f"🚀 NEW SIGNAL: {strategy_name.upper()} 🚀\n"
+                                       f"Symbol: {symbol}\n"
+                                       f"Side: {trade_side.capitalize()}\n"
+                                       f"Entry: {entry_price:.5f}\n"
+                                       f"SL: {sl:.5f}\n"
+                                       f"TP: {tp:.5f}\n\n"
+                                       f"PENDING - Waiting for price to reach entry.")
+                            
+                            image_buffer = None
+                            chart_data = signal.get('chart_data')
+
+                            try:
+                                if strategy_name == 'fvg':
+                                    image_buffer = generate_fvg_chart(symbol, klines_15m, signal, chart_data)
+                                elif strategy_name == 'rsi_divergence':
+                                    image_buffer = generate_rsi_divergence_chart(symbol, klines_15m, signal, chart_data)
+                                elif strategy_name == 'reversal':
+                                    # Note: The reversal_details are nested in chart_data now
+                                    image_buffer = generate_reversal_chart(symbol, klines_15m, chart_data['reversal_details'])
+                                elif strategy_name == 'fibonacci':
+                                    # Note: The fibonacci details are nested in chart_data now
+                                    image_buffer = generate_fib_chart(symbol, klines_15m, chart_data['trend'], chart_data['swing_high'], chart_data['swing_low'], entry_price, sl, tp, None)
+
+                                if image_buffer:
+                                    await send_market_analysis_image(bot, image_buffer, caption)
+                                else:
                                     await send_telegram_alert(bot, caption, message_type='signal')
+                            except Exception as e:
+                                print(f"Error generating chart for {strategy_name}: {e}")
+                                await send_telegram_alert(bot, caption, message_type='signal')
 
-                                    new_trade = {
-                                        'symbol': symbol, 'side': trade_side, 'entry_price': entry_price, 'sl': sl, 
-                                        'tp1': tp, 'tp2': None, 'status': 'pending',
-                                        'quantity': quantity, 'original_quantity': quantity, 
-                                        'timestamp': klines_15m[-1][0], 
-                                        'entry_order_id': None, 'sl_order_id': None, 'tp_order_id': None, 
-                                        'reason_for_entry': reason,
-                                        'strategy_type': 'consensus'
-                                    }
-                                    
-                                    with trades_lock:
-                                        trades.append(new_trade)
-                                    virtual_orders[symbol] = new_trade
-                                    update_trade_report(trades)
-                                    
-                                    # Start cooldown for all contributing strategies
-                                    for s in signals:
-                                        trade_manager.start_cooldown(symbol, s['strategy'])
-                                    print(f"  - Consensus trade initiated for {symbol}.")
-                            else:
-                                print(f"Consensus reached for {symbol}, but no FVG signal was found to provide parameters. No trade placed.")
+                            new_trade = {
+                                'symbol': symbol, 'side': trade_side, 'entry_price': entry_price, 'sl': sl, 
+                                'tp1': tp, 'tp2': None, 'status': 'pending',
+                                'quantity': quantity, 'original_quantity': quantity, 
+                                'timestamp': klines_15m[-1][0], 
+                                'entry_order_id': None, 'sl_order_id': None, 'tp_order_id': None, 
+                                'reason_for_entry': f"Signal from {strategy_name}",
+                                'strategy_type': strategy_name
+                            }
+                            
+                            with trades_lock:
+                                trades.append(new_trade)
+                            virtual_orders[symbol] = new_trade # This creates the lockout
+                            update_trade_report(trades)
+                            
+                            # Start cooldown for the specific strategy that triggered
+                            trade_manager.start_cooldown(symbol, strategy_name)
+                            print(f"  - Trade initiated for {symbol} based on {strategy_name}. Symbol is now on cooldown.")
                         else:
-                            print(f"Strategies returned conflicting signals for {symbol}.")
+                            print(f"  - Signal found for {symbol}, but quantity calculation failed or resulted in 0.")
+                    else:
+                        print(f"  - No valid signals found for {symbol} in this cycle.")
                 except Exception as e:
                     print(f"Error scanning {symbol}: {e}")
                     rejected_symbols[symbol] = time.time()
