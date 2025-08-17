@@ -906,10 +906,10 @@ def get_public_ip():
         print(f"Error getting public IP address: {e}")
         return None
 
-def check_for_divergence(klines, lookback=60, rsi_period=14):
+def find_rsi_divergence(klines, lookback=60, rsi_period=14):
     """
     Checks for regular RSI divergence over the last `lookback` candles.
-    Returns 'bearish', 'bullish', or 'none'.
+    Returns 'BUY', 'SELL', or 'NONE'.
     """
     df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
     df['high'] = pd.to_numeric(df['high'])
@@ -919,13 +919,13 @@ def check_for_divergence(klines, lookback=60, rsi_period=14):
     # Calculate RSI
     rsi_series = rsi(df['close'], length=rsi_period)
     if rsi_series is None or rsi_series.empty or rsi_series.isnull().all():
-        return 'none'
+        return 'NONE'
     
     df['rsi'] = rsi_series
     
     # We need enough data for lookback
     if len(df) < lookback:
-        return 'none'
+        return 'NONE'
         
     df_lookback = df.tail(lookback).copy()
 
@@ -948,7 +948,7 @@ def check_for_divergence(klines, lookback=60, rsi_period=14):
         rsi_at_p_peak2 = df_lookback['rsi'].iloc[p_peak2_idx]
         
         if p_peak2_val > p_peak1_val and rsi_at_p_peak2 < rsi_at_p_peak1:
-            return 'bearish'
+            return 'SELL'
             
     # Find price troughs
     price_troughs_indices, _ = find_peaks(-df_lookback['low'], distance=5, prominence=price_prominence)
@@ -965,9 +965,9 @@ def check_for_divergence(klines, lookback=60, rsi_period=14):
         rsi_at_p_trough2 = df_lookback['rsi'].iloc[p_trough2_idx]
         
         if p_trough2_val < p_trough1_val and rsi_at_p_trough2 > rsi_at_p_trough1:
-            return 'bullish'
+            return 'BUY'
 
-    return 'none'
+    return 'NONE'
 
 def get_swing_points(klines, window=5):
     """
@@ -1240,6 +1240,209 @@ def get_klines(client, symbol, interval='15m', limit=100, start_str=None, end_st
     except Exception as e:
         print(f"An unexpected error occurred fetching klines for {symbol}: {e}")
         return None
+
+
+def find_best_fvg(df, look_for='bullish'):
+    """
+    Finds the most recent, valid Fair Value Gap (FVG) in the provided DataFrame.
+
+    Args:
+        df (pd.DataFrame): DataFrame with candlestick data ('high', 'low', 'timestamp' columns).
+        look_for (str): 'bullish' or 'bearish' to specify which FVG to find.
+
+    Returns:
+        dict: A dictionary with 'top', 'bottom', and 'timestamp' of the FVG, or None.
+    """
+    if len(df) < 3:
+        return None
+
+    # Ensure timestamp column is present
+    if 'timestamp' not in df.columns:
+        # Try to use index if it's datetime
+        if isinstance(df.index, pd.DatetimeIndex):
+            df['timestamp'] = df.index.astype(np.int64) // 10**6
+        else:
+            print("Error: DataFrame must have a 'timestamp' column for FVG detection.")
+            return None
+
+
+    # Iterate backwards from the most recent candles
+    for i in range(len(df) - 3, -1, -1):
+        c1 = df.iloc[i]
+        c2 = df.iloc[i+1]
+        c3 = df.iloc[i+2]
+
+        fvg_found = None
+
+        if look_for == 'bullish' and c1['high'] < c3['low']:
+            fvg_top = c3['low']
+            fvg_bottom = c1['high']
+            fvg_found = {'top': fvg_top, 'bottom': fvg_bottom, 'type': 'bullish', 'timestamp': c1['timestamp']}
+
+        elif look_for == 'bearish' and c1['low'] > c3['high']:
+            fvg_top = c1['low']
+            fvg_bottom = c3['high']
+            fvg_found = {'top': fvg_top, 'bottom': fvg_bottom, 'type': 'bearish', 'timestamp': c1['timestamp']}
+
+        if fvg_found:
+            # Validate that the FVG was not filled by subsequent candles
+            is_valid = True
+            # Check candles from the one after the FVG pattern up to the present
+            for j in range(i + 3, len(df)):
+                future_candle = df.iloc[j]
+                if look_for == 'bullish':
+                    # If any future low goes into the gap, it's invalid
+                    if future_candle['low'] <= fvg_top:
+                        is_valid = False
+                        break
+                elif look_for == 'bearish':
+                    # If any future high goes into the gap, it's invalid
+                    if future_candle['high'] >= fvg_bottom:
+                        is_valid = False
+                        break
+            
+            if is_valid:
+                # Since we are iterating backwards, the first valid FVG we find is the most recent one.
+                return fvg_found
+
+    return None
+
+
+async def execute_fvg_strategy(client, symbol, symbol_info, config, bot, trades, trades_lock, virtual_orders, trade_manager):
+    """
+    Executes the Fair Value Gap (FVG) trading strategy.
+    Returns a signal dictionary if a valid setup is found, otherwise None.
+    """
+    strategy_name = 'fvg'
+    if trade_manager.is_on_cooldown(symbol, strategy_name):
+        return None
+
+    print(f"--- Running FVG Strategy for {symbol} ---")
+
+    try:
+        klines_4h_raw = get_klines(client, symbol, interval='4h', limit=100)
+        if not klines_4h_raw or len(klines_4h_raw) < 3:
+            return None
+
+        df_4h = pd.DataFrame(klines_4h_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+        for col in ['timestamp', 'open', 'high', 'low', 'close']:
+            df_4h[col] = pd.to_numeric(df_4h[col])
+
+        bullish_fvg_4h = find_best_fvg(df_4h, look_for='bullish')
+        bearish_fvg_4h = find_best_fvg(df_4h, look_for='bearish')
+
+        htf_fvg, bias = None, None
+        if bullish_fvg_4h and bearish_fvg_4h:
+            if bullish_fvg_4h['timestamp'] > bearish_fvg_4h['timestamp']:
+                htf_fvg, bias = bullish_fvg_4h, 'bullish'
+            else:
+                htf_fvg, bias = bearish_fvg_4h, 'bearish'
+        elif bullish_fvg_4h:
+            htf_fvg, bias = bullish_fvg_4h, 'bullish'
+        elif bearish_fvg_4h:
+            htf_fvg, bias = bearish_fvg_4h, 'bearish'
+        else:
+            return None
+        
+        klines_15m_raw = get_klines(client, symbol, interval='15m', limit=100)
+        if not klines_15m_raw or len(klines_15m_raw) < 3:
+            return None
+            
+        df_15m = pd.DataFrame(klines_15m_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+        for col in ['timestamp', 'open', 'high', 'low', 'close']:
+            df_15m[col] = pd.to_numeric(df_15m[col])
+        
+        current_price = df_15m['close'].iloc[-1]
+        if not (htf_fvg['bottom'] <= current_price <= htf_fvg['top']):
+            return None
+            
+        fvg_15m = find_best_fvg(df_15m, look_for=bias)
+        if not fvg_15m:
+            return None
+
+        trade_side = 'long' if bias == 'bullish' else 'short'
+        entry_price = fvg_15m['bottom'] if trade_side == 'long' else fvg_15m['top']
+        sl_reference_price = fvg_15m['top'] if trade_side == 'long' else fvg_15m['bottom']
+        sl_price = get_atr_stop_loss(trade_side, sl_reference_price, klines_15m_raw, config)
+        
+        risk_distance = abs(entry_price - sl_price)
+        if risk_distance == 0: return None
+            
+        tp_price = entry_price + (risk_distance * config['tp1_rr_ratio']) if trade_side == 'long' else entry_price - (risk_distance * config['tp1_rr_ratio'])
+
+        return {
+            'side': trade_side,
+            'entry_price': entry_price,
+            'sl': sl_price,
+            'tp': tp_price,
+            'strategy': strategy_name
+        }
+
+    except Exception as e:
+        print(f"Error in FVG strategy for {symbol}: {e}")
+    
+    return None
+
+
+async def execute_rsi_divergence_strategy(client, symbol, symbol_info, config, bot, trades, trades_lock, virtual_orders, trade_manager):
+    """
+    Executes the RSI Divergence trading strategy.
+    It identifies a divergence and returns a trade signal dictionary if found.
+    """
+    strategy_name = 'rsi_divergence'
+    if trade_manager.is_on_cooldown(symbol, strategy_name):
+        return None
+
+    print(f"--- Running RSI Divergence Strategy for {symbol} ---")
+    
+    try:
+        klines_15m = get_klines(client, symbol, interval='15m', limit=100)
+        if not klines_15m or len(klines_15m) < 60:
+            return None
+
+        divergence_signal = find_rsi_divergence(klines_15m, lookback=60)
+
+        if divergence_signal == 'NONE':
+            return None
+
+        print(f"RSI Divergence: Found a '{divergence_signal}' divergence for {symbol}.")
+        
+        swing_highs, swing_lows = get_swing_points(klines_15m, window=5)
+        
+        trade_side = 'long' if divergence_signal == 'BUY' else 'short'
+        
+        if trade_side == 'long':
+            if not swing_lows: return None
+            reference_price = swing_lows[-1][1]
+            entry_price = reference_price # Limit order at the swing low
+            sl_price = get_atr_stop_loss('long', reference_price, klines_15m, config)
+        else: # short
+            if not swing_highs: return None
+            reference_price = swing_highs[-1][1]
+            entry_price = reference_price # Limit order at the swing high
+            sl_price = get_atr_stop_loss('short', reference_price, klines_15m, config)
+
+        risk_distance = abs(entry_price - sl_price)
+        if risk_distance == 0:
+            return None
+        
+        # Use a 1.5 R:R for TP, as per the plan
+        tp_rr_ratio = config.get('tp1_rr_ratio', 1.5) 
+        tp_price = entry_price + (risk_distance * tp_rr_ratio) if trade_side == 'long' else entry_price - (risk_distance * tp_rr_ratio)
+
+        return {
+            'side': trade_side,
+            'entry_price': entry_price,
+            'sl': sl_price,
+            'tp': tp_price,
+            'strategy': strategy_name
+        }
+
+    except Exception as e:
+        print(f"Error in RSI Divergence strategy for {symbol}: {e}")
+
+    return None
+
 
 def calculate_performance_metrics(backtest_trades, starting_balance):
     """
@@ -1632,10 +1835,10 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info, loaded
             # --- Reversal Strategy Logic for Backtesting ---
             reversal_signal = find_liquidity_grab(current_klines_15m, swing_highs_15m, swing_lows_15m, config['tp1_rr_ratio'])
             if reversal_signal:
-                divergence_signal = check_for_divergence(current_klines_15m)
+                divergence_signal = find_rsi_divergence(current_klines_15m)
                 signal_side = reversal_signal['signal']
-                if (signal_side == 'bullish' and divergence_signal == 'bullish') or \
-                   (signal_side == 'bearish' and divergence_signal == 'bearish'):
+                if (signal_side == 'bullish' and divergence_signal == 'BUY') or \
+                   (signal_side == 'bearish' and divergence_signal == 'SELL'):
                     
                     is_confluent = check_htf_confluence_backtest(relevant_klines_htf, reversal_signal['entry_price'], config['htf_confluence_tolerance_pct'], config['swing_window'])
                     if is_confluent:
@@ -2223,6 +2426,79 @@ def start_order_monitor(client, application, backtest_mode, live_mode, symbols_i
     loop.run_until_complete(monitor_coro)
 
 
+async def execute_fibonacci_and_reversal_strategy(client, symbol, symbol_info, config, bot, trades, trades_lock, virtual_orders, trade_manager, klines_15m):
+    """
+    Executes the Fibonacci and Reversal trading strategies.
+    Returns a signal dictionary if a valid setup is found, otherwise None.
+    """
+    swing_window = int(config['swing_window'])
+    higher_timeframe = config['higher_timeframe']
+    tp1_rr_ratio = float(config['tp1_rr_ratio'])
+    htf_confluence_tolerance_pct = float(config['htf_confluence_tolerance_pct'])
+    ema_period = int(config['ema_period'])
+    loop = asyncio.get_running_loop()
+
+    klines_htf = get_klines(client, symbol, interval=higher_timeframe, limit=200)
+    if not klines_htf:
+        return None
+
+    swing_highs_15m, swing_lows_15m = get_swing_points(klines_15m, swing_window)
+    trend_15m = get_trend(swing_highs_15m, swing_lows_15m)
+    trend_htf = get_trend(get_swing_points(klines_htf, swing_window)[0], get_swing_points(klines_htf, swing_window)[1])
+
+    # --- Reversal Strategy Logic ---
+    reversal_signal = find_liquidity_grab(klines_15m, swing_highs_15m, swing_lows_15m, tp1_rr_ratio)
+    if reversal_signal:
+        strategy_name = 'reversal'
+        if trade_manager.is_on_cooldown(symbol, strategy_name): return None
+        
+        divergence_signal = find_rsi_divergence(klines_15m)
+        signal_side = reversal_signal['signal']
+        if (signal_side == 'bullish' and divergence_signal == 'BUY') or (signal_side == 'bearish' and divergence_signal == 'SELL'):
+            is_confluent = await loop.run_in_executor(None, lambda: check_htf_confluence(client, symbol, reversal_signal['entry_price'], higher_timeframe, htf_confluence_tolerance_pct, swing_window))
+            if is_confluent:
+                trade_side = 'long' if signal_side == 'bullish' else 'short'
+                entry_price = float(reversal_signal['signal_candle']['close'])
+                reference_price = float(reversal_signal['signal_candle']['high']) if trade_side == 'short' else float(reversal_signal['signal_candle']['low'])
+                sl = get_atr_stop_loss(trade_side, reference_price, klines_15m, config)
+                tp = entry_price - (sl - entry_price) * tp1_rr_ratio if trade_side == 'short' else entry_price + (entry_price - sl) * tp1_rr_ratio
+                return {'side': trade_side, 'entry_price': entry_price, 'sl': sl, 'tp': tp, 'strategy': strategy_name}
+
+    # --- Fallback to Fibonacci Strategy ---
+    strategy_name = 'fibonacci'
+    if trade_manager.is_on_cooldown(symbol, strategy_name): return None
+
+    if trend_15m == trend_htf and trend_15m != "undetermined":
+        df_15m = pd.DataFrame(klines_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+        df_15m['close'] = pd.to_numeric(df_15m['close'])
+        ema_series = ema(df_15m['close'], length=ema_period)
+        if ema_series is None or ema_series.empty: return None
+        
+        current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+        if not ((trend_15m == "downtrend" and current_price < ema_series.iloc[-1]) or (trend_15m == "uptrend" and current_price > ema_series.iloc[-1])):
+            return None
+        
+        if trend_15m == "downtrend" and len(swing_highs_15m) > 1 and len(swing_lows_15m) > 1:
+            if find_rsi_divergence(klines_15m) == 'BUY': return None
+            last_swing_high, last_swing_low = swing_highs_15m[-1][1], swing_lows_15m[-1][1]
+            entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend_15m)
+            if current_price < entry_price: return None
+            sl = get_atr_stop_loss('short', last_swing_high, klines_15m, config)
+            tp = entry_price - (sl - entry_price) * tp1_rr_ratio
+            return {'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp': tp, 'strategy': strategy_name}
+
+        elif trend_15m == "uptrend" and len(swing_highs_15m) > 1 and len(swing_lows_15m) > 1:
+            if find_rsi_divergence(klines_15m) == 'SELL': return None
+            last_swing_high, last_swing_low = swing_highs_15m[-1][1], swing_lows_15m[-1][1]
+            entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend_15m)
+            if current_price > entry_price: return None
+            sl = get_atr_stop_loss('long', last_swing_low, klines_15m, config)
+            tp = entry_price + (entry_price - sl) * tp1_rr_ratio
+            return {'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp': tp, 'strategy': strategy_name}
+            
+    return None
+
+
 async def main():
     """
     Main function to run the Binance trading bot.
@@ -2471,216 +2747,86 @@ async def main():
                     # Market State Analysis
                     market_state, trend_type = get_market_state(klines_15m, config.get('market_state_window_sizes', [10, 20, 50]))
 
-                    if market_state == MarketState.RANGING:
-                        print(f"Market state for {symbol} is RANGING. Skipping strategy checks.")
-                        continue
-                    elif market_state == MarketState.UNDEFINED:
-                        print(f"Market state for {symbol} is UNDEFINED. Skipping strategy checks.")
-                        continue
+                    # Market State Analysis
+                    market_state, trend_type = get_market_state(klines_15m, config.get('market_state_window_sizes', [10, 20, 50]))
                     
-                    # --- Proceed with Trend-Based Strategies ---
-                    print(f"Market state for {symbol} is TRENDING ({trend_type}). Proceeding with strategies.")
+                    signals = []
+                    active_strategies = []
 
-                    klines_htf = get_klines(client, symbol, interval=higher_timeframe, limit=200)
-                    if not klines_htf:
-                        continue
-
-                    # 15m trend
-                    swing_highs_15m, swing_lows_15m = get_swing_points(klines_15m, swing_window)
-                    trend_15m = get_trend(swing_highs_15m, swing_lows_15m)
-
-                    # Higher timeframe trend
-                    swing_highs_htf, swing_lows_htf = get_swing_points(klines_htf, swing_window)
-                    trend_htf = get_trend(swing_highs_htf, swing_lows_htf)
-
-                    # --- Reversal Strategy Logic ---
-                    reversal_signal = find_liquidity_grab(klines_15m, swing_highs_15m, swing_lows_15m, tp1_rr_ratio)
-                    if reversal_signal:
-                        strategy_name = 'reversal'
-                        monitor = trade_manager.active_monitors.get(symbol)
-
-                        if monitor:
-                            # Position exists. Only a new reversal signal can manage an existing trade.
-                            if monitor.trade_details.get('strategy_type') != strategy_name:
-                                await handle_reversal_signal_on_existing_trade(monitor, bot)
-                            # In either case, we don't open a new trade, so we skip to the next symbol.
-                            continue
+                    if market_state == MarketState.TRENDING:
+                        print(f"Market state for {symbol} is TRENDING ({trend_type}). Checking Trend strategies.")
+                        active_strategies = ['fibonacci_reversal', 'fvg', 'rsi_divergence']
+                        fib_signal = await execute_fibonacci_and_reversal_strategy(client, symbol, symbols_info[symbol], config, bot, trades, trades_lock, virtual_orders, trade_manager, klines_15m)
+                        if fib_signal: signals.append(fib_signal)
                         
-                        # No position exists, check for cooldown before proceeding.
-                        if trade_manager.is_on_cooldown(symbol, strategy_name):
-                            continue
+                        fvg_signal = await execute_fvg_strategy(client, symbol, symbols_info[symbol], config, bot, trades, trades_lock, virtual_orders, trade_manager)
+                        if fvg_signal: signals.append(fvg_signal)
 
-                        print(f"  - Potential liquidity grab found for {symbol}: {reversal_signal['signal']}")
-                        divergence_signal = check_for_divergence(klines_15m)
-                        
-                        # Check for alignment between grab and divergence
-                        signal_side = reversal_signal['signal']
-                        if (signal_side == 'bullish' and divergence_signal == 'bullish') or \
-                           (signal_side == 'bearish' and divergence_signal == 'bearish'):
-                            
-                            print(f"  - Divergence confirmed for {symbol}: {divergence_signal}")
-                            is_confluent = await loop.run_in_executor(None, lambda: check_htf_confluence(client, symbol, reversal_signal['entry_price'], higher_timeframe, htf_confluence_tolerance_pct, swing_window))
-                            
-                            if is_confluent:
-                                print(f"  - HTF Confluence confirmed for {symbol}")
-                                
-                                # All conditions met, execute reversal trade
-                                signal_candle = reversal_signal['signal_candle']
-                                entry_price = float(signal_candle['close'])
-                                trade_side = 'long' if signal_side == 'bullish' else 'short'
+                        rsi_signal = await execute_rsi_divergence_strategy(client, symbol, symbols_info[symbol], config, bot, trades, trades_lock, virtual_orders, trade_manager)
+                        if rsi_signal: signals.append(rsi_signal)
 
-                                # Calculate SL and TP using ATR
-                                if trade_side == 'short':
-                                    reference_price = float(signal_candle['high'])
-                                else: # long
-                                    reference_price = float(signal_candle['low'])
+                    elif market_state == MarketState.RANGING:
+                        print(f"Market state for {symbol} is RANGING. Checking Range strategies.")
+                        active_strategies = ['fvg', 'rsi_divergence']
+                        fvg_signal = await execute_fvg_strategy(client, symbol, symbols_info[symbol], config, bot, trades, trades_lock, virtual_orders, trade_manager)
+                        if fvg_signal: signals.append(fvg_signal)
+
+                        rsi_signal = await execute_rsi_divergence_strategy(client, symbol, symbols_info[symbol], config, bot, trades, trades_lock, virtual_orders, trade_manager)
+                        if rsi_signal: signals.append(rsi_signal)
+                    
+                    # --- Consensus Check ---
+                    if len(signals) == len(active_strategies) and len(signals) > 0:
+                        # Check if all signals have the same 'side'
+                        first_side = signals[0]['side']
+                        if all(s['side'] == first_side for s in signals):
+                            print(f"CONSENSUS REACHED for {symbol}: {first_side}")
+                            
+                            # Prioritize FVG parameters as per user instructions
+                            fvg_params = next((s for s in signals if s['strategy'] == 'fvg'), None)
+                            
+                            if fvg_params:
+                                entry_price = fvg_params['entry_price']
+                                sl = fvg_params['sl']
+                                tp = fvg_params['tp']
+                                trade_side = fvg_params['side']
                                 
-                                sl = get_atr_stop_loss(trade_side, reference_price, klines_15m, config)
-                                risk_distance = abs(entry_price - sl)
-                                tp1 = entry_price - risk_distance * config.get('tp1_rr_ratio', 1.5) if trade_side == 'short' else entry_price + risk_distance * config.get('tp1_rr_ratio', 1.5)
+                                quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'], config.get('risk_amount_usd', 0), config_to_bool(config.get('use_fixed_risk_amount', False)))
                                 
-                                quantity = calculate_quantity(client, symbols_info[symbol], risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
-                                
-                                if quantity is not None and quantity > 0:
-                                    reason = f"Reversal: {signal_side.capitalize()} Grab & {divergence_signal.capitalize()} Divergence"
-                                    image_buffer = generate_reversal_chart(symbol, klines_15m, reversal_signal)
-                                    caption = f"🚀 NEW REVERSAL SIGNAL 🚀\nSymbol: {symbol}\nSide: {trade_side.capitalize()}\nReason: {reason}\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\n"
-                                    
-                                    # All strategies now create a 'pending' trade to be handled by the monitor.
-                                    # The monitor will place a LIMIT order when the entry price is reached.
-                                    caption = f"🚀 NEW REVERSAL SIGNAL 🚀\nSymbol: {symbol}\nSide: {trade_side.capitalize()}\nReason: {reason}\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nPENDING - Waiting for price to reach entry."
-                                    await send_market_analysis_image(bot, image_buffer, caption, backtest_mode)
-                                    
+                                if quantity and quantity > 0:
+                                    reason = f"Consensus: {', '.join([s['strategy'] for s in signals])}"
+                                    caption = (f"🚀 NEW CONSENSUS SIGNAL 🚀\n"
+                                               f"Symbol: {symbol}\n"
+                                               f"Side: {trade_side.capitalize()}\n"
+                                               f"Reason: {reason}\n"
+                                               f"Entry: {entry_price:.5f}\n"
+                                               f"SL: {sl:.5f}\n"
+                                               f"TP: {tp:.5f}\n\n"
+                                               f"PENDING - Waiting for price to reach entry.")
+                                    await send_telegram_alert(bot, caption, message_type='signal')
+
                                     new_trade = {
                                         'symbol': symbol, 'side': trade_side, 'entry_price': entry_price, 'sl': sl, 
-                                        'tp1': tp1, 'tp2': None, 'status': 'pending',
+                                        'tp1': tp, 'tp2': None, 'status': 'pending',
                                         'quantity': quantity, 'original_quantity': quantity, 
                                         'timestamp': klines_15m[-1][0], 
                                         'entry_order_id': None, 'sl_order_id': None, 'tp_order_id': None, 
                                         'reason_for_entry': reason,
-                                        'strategy_type': 'reversal'
+                                        'strategy_type': 'consensus'
                                     }
                                     
                                     with trades_lock:
                                         trades.append(new_trade)
                                     virtual_orders[symbol] = new_trade
                                     update_trade_report(trades)
-                                    print(f"  - Reversal trade initiated for {symbol}.")
-                                    continue
-
-                    # --- Fallback to Fibonacci Strategy ---
-                    strategy_name = 'fibonacci'
-                    monitor = trade_manager.active_monitors.get(symbol)
-
-                    if monitor:
-                        # Position already exists, new Fibonacci signal does not override.
-                        continue
-
-                    if trade_manager.is_on_cooldown(symbol, strategy_name):
-                        continue
-
-                    if trend_15m == trend_htf and trend_15m != "undetermined":
-                        print(f"  - Trend confirmed on 15m and {higher_timeframe}: {trend_15m}")
-                        
-                        # EMA Confirmation
-                        df_15m = pd.DataFrame(klines_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-                        df_15m['close'] = pd.to_numeric(df_15m['close'])
-                        ema_series = ema(df_15m['close'], length=ema_period)
-                        if ema_series is None or ema_series.empty: continue
-                        ema_value = ema_series.iloc[-1]
-                        current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-
-                        if not ((trend_15m == "downtrend" and current_price < ema_value) or (trend_15m == "uptrend" and current_price > ema_value)):
-                            await send_telegram_alert(bot, f"❌ Signal Rejected by EMA ❌\nStrategy: Fibonacci\nSymbol: {symbol}\nSide: {trend_15m}\nReason: Price {current_price} is not on the correct side of the {ema_period} EMA ({ema_value:.2f}).")
-                            continue
-                        
-                        print(f"  - EMA Confirmed for {symbol}. Price: {current_price}, EMA: {ema_value:.2f}")
-
-                        if trend_15m == "downtrend" and len(swing_highs_15m) > 1 and len(swing_lows_15m) > 1:
-                            if time.time() * 1000 - swing_highs_15m[-1][0] > 4 * 60 * 60 * 1000: continue
-                            last_swing_high, last_swing_low = swing_highs_15m[-1][1], swing_lows_15m[-1][1]
-                            entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend_15m)
-                            if current_price < entry_price: continue
-                            
-                            # Calculate SL and TP using ATR
-                            reference_price = swing_highs_15m[-1][1]
-                            sl = get_atr_stop_loss('short', reference_price, klines_15m, config)
-                            tp1 = entry_price - (sl - entry_price) * tp1_rr_ratio
-
-                            # Divergence Check
-                            divergence = check_for_divergence(klines_15m)
-                            if divergence == 'bullish':
-                                await send_telegram_alert(bot, f"❌ Signal Rejected by Divergence Check ❌\nStrategy: Fibonacci\nSymbol: {symbol}\nSide: Short\nReason: Bullish divergence found.")
-                                continue
-                            
-                            if ml_model and ml_feature_columns:
-                                klines_short = klines_15m[-lookback_candles_short:]
-                                features_short = generate_live_features(klines_short, ml_feature_columns)
-                                pred_prob_short = float(ml_model.predict(features_short)[0][0]) if features_short is not None else None
-                                features_long = generate_live_features(klines_15m, ml_feature_columns)
-                                pred_prob_long = float(ml_model.predict(features_long)[0][0]) if features_long is not None else None
-                                if pred_prob_short is None or pred_prob_long is None: print(f"Could not generate features for {symbol}. Skipping ML check."); continue
-                                prediction_short, prediction_long = (1 if p > 0.5 else 0 for p in [pred_prob_short, pred_prob_long])
-                                if not (prediction_short and prediction_long and pred_prob_short >= model_confidence_threshold and pred_prob_long >= model_confidence_threshold):
-                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nStrategy: Fibonacci\nSymbol: {symbol}\nSide: Short\nReason: Short Pred: {prediction_short} ({pred_prob_short:.2f}), Long Pred: {prediction_long} ({pred_prob_long:.2f})"); continue
-                                ml_info = f"🧠 ML: Win (S:{pred_prob_short:.1%}, L:{pred_prob_long:.1%})"; pred_prob = (pred_prob_short + pred_prob_long) / 2; pred_label = 1
+                                    
+                                    # Start cooldown for all contributing strategies
+                                    for s in signals:
+                                        trade_manager.start_cooldown(symbol, s['strategy'])
+                                    print(f"  - Consensus trade initiated for {symbol}.")
                             else:
-                                ml_info, pred_prob, pred_label = "🧠 ML Model not in use.", 0.0, 0
-                            
-                            symbol_info = symbols_info[symbol]
-                            quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
-                            if quantity is None or quantity == 0: continue
-                            
-                            image_buffer = generate_fib_chart(symbol, klines_15m, trend_15m, last_swing_high, last_swing_low, entry_price, sl, tp1, tp1) # Pass tp1 for tp2 placeholder
-                            caption = f"🚀 NEW SIGNAL (ML, EMA, Divergence, Volume) 🚀\n{ml_info}\nSymbol: {symbol}\nSide: Short\nLeverage: {leverage}x\nRisk: {risk_per_trade}%\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nLIMIT ORDER ONLY VALID 4 HOURS"
-                            await send_market_analysis_image(bot, image_buffer, caption)
-                            new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': None, 'status': 'pending', 'quantity': quantity, 'original_quantity': quantity, 'timestamp': klines_15m[-1][0], 'sl_order_id': None, 'tp_order_id': None, 'ml_prediction': pred_label, 'ml_confidence': pred_prob, 'sl_to_be_updated': True, 'strategy_type': 'fibonacci'}
-                            with trades_lock: trades.append(new_trade)
-                            virtual_orders[symbol] = new_trade
-                            update_trade_report(trades)
-
-                        elif trend_15m == "uptrend" and len(swing_highs_15m) > 1 and len(swing_lows_15m) > 1:
-                            if time.time() * 1000 - swing_lows_15m[-1][0] > 4 * 60 * 60 * 1000: continue
-                            last_swing_high, last_swing_low = swing_highs_15m[-1][1], swing_lows_15m[-1][1]
-                            entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend_15m)
-                            if current_price > entry_price: continue
-                            
-                            # Calculate SL and TP using ATR
-                            reference_price = swing_lows_15m[-1][1]
-                            sl = get_atr_stop_loss('long', reference_price, klines_15m, config)
-                            tp1 = entry_price + (entry_price - sl) * tp1_rr_ratio
-
-                            # Divergence Check
-                            divergence = check_for_divergence(klines_15m)
-                            if divergence == 'bearish':
-                                await send_telegram_alert(bot, f"❌ Signal Rejected by Divergence Check ❌\nStrategy: Fibonacci\nSymbol: {symbol}\nSide: Long\nReason: Bearish divergence found.")
-                                continue
-
-                            if ml_model and ml_feature_columns:
-                                klines_short = klines_15m[-lookback_candles_short:]
-                                features_short = generate_live_features(klines_short, ml_feature_columns)
-                                pred_prob_short = float(ml_model.predict(features_short)[0][0]) if features_short is not None else None
-                                features_long = generate_live_features(klines_15m, ml_feature_columns)
-                                pred_prob_long = float(ml_model.predict(features_long)[0][0]) if features_long is not None else None
-                                if pred_prob_short is None or pred_prob_long is None: print(f"Could not generate features for {symbol}. Skipping ML check."); continue
-                                prediction_short, prediction_long = (1 if p > 0.5 else 0 for p in [pred_prob_short, pred_prob_long])
-                                if not (prediction_short and prediction_long and pred_prob_short >= model_confidence_threshold and pred_prob_long >= model_confidence_threshold):
-                                    await send_telegram_alert(bot, f"❌ Signal Rejected by ML Model ❌\nStrategy: Fibonacci\nSymbol: {symbol}\nSide: Long\nReason: Short Pred: {prediction_short} ({pred_prob_short:.2f}), Long Pred: {prediction_long} ({pred_prob_long:.2f})"); continue
-                                ml_info = f"🧠 ML: Win (S:{pred_prob_short:.1%}, L:{pred_prob_long:.1%})"; pred_prob = (pred_prob_short + pred_prob_long) / 2; pred_label = 1
-                            else:
-                                ml_info, pred_prob, pred_label = "🧠 ML Model not in use.", 0.0, 0
-                            
-                            symbol_info = symbols_info[symbol]
-                            quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
-                            if quantity is None or quantity == 0: continue
-                            
-                            image_buffer = generate_fib_chart(symbol, klines_15m, trend_15m, last_swing_high, last_swing_low, entry_price, sl, tp1, tp1) # Pass tp1 for tp2 placeholder
-                            caption = f"🚀 NEW SIGNAL (ML, EMA, Divergence, Volume) 🚀\n{ml_info}\nSymbol: {symbol}\nSide: Long\nLeverage: {leverage}x\nRisk: {risk_per_trade}%\nEntry: {entry_price:.8f}\nSL: {sl:.8f}\nTP1: {tp1:.8f}\n\nLIMIT ORDER ONLY VALID 4 HOURS"
-                            await send_market_analysis_image(bot, image_buffer, caption)
-                            new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': None, 'status': 'pending', 'quantity': quantity, 'original_quantity': quantity, 'timestamp': klines_15m[-1][0], 'sl_order_id': None, 'tp_order_id': None, 'ml_prediction': pred_label, 'ml_confidence': pred_prob, 'sl_to_be_updated': True, 'strategy_type': 'fibonacci'}
-                            with trades_lock: trades.append(new_trade)
-                            virtual_orders[symbol] = new_trade
-                            update_trade_report(trades)
+                                print(f"Consensus reached for {symbol}, but no FVG signal was found to provide parameters. No trade placed.")
+                        else:
+                            print(f"Strategies returned conflicting signals for {symbol}.")
                 except Exception as e:
                     print(f"Error scanning {symbol}: {e}")
                     rejected_symbols[symbol] = time.time()
