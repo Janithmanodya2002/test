@@ -32,6 +32,123 @@ except ImportError:
     print("mplfinance not found. Please install it by running: pip install mplfinance")
     exit()
 from tabulate import tabulate
+from enum import Enum
+
+class MarketState(Enum):
+    TRENDING = "TRENDING"
+    RANGING = "RANGING"
+    UNDEFINED = "UNDEFINED"
+
+def get_market_state(df, window_sizes=[10, 20, 50]):
+    """
+    Determines the market state by checking for trends and ranges across multiple window sizes.
+    First, it checks for a trend. If no trend is found, it checks for a range.
+    """
+    # Convert klines to a DataFrame
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(df, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col])
+
+    # 1. Check for a trend across all specified window sizes
+    for window in sorted(window_sizes, reverse=True): # Check larger windows first
+        trend_type, is_in_trend = is_trending(df, window)
+        if is_in_trend:
+            return MarketState.TRENDING, trend_type
+
+    # 2. If no trend is found, check for a range using the largest window size
+    # A stable range is more reliable when observed over a longer period.
+    largest_window = max(window_sizes)
+    if is_ranging(df, largest_window):
+        return MarketState.RANGING, None
+
+    # 3. If neither a trend nor a range is confirmed, the state is undefined
+    return MarketState.UNDEFINED, None
+
+def is_trending(df, window_size):
+    """
+    Checks if the market is trending (uptrend or downtrend) within a given window.
+    A trend is defined by at least 3 consecutive higher highs and higher lows (uptrend)
+    or lower lows and lower highs (downtrend).
+    """
+    if len(df) < window_size:
+        return None, False
+
+    window_df = df.tail(window_size)
+    
+    # Use existing swing point logic, but adapted for the window
+    highs = window_df['high'].to_numpy()
+    lows = window_df['low'].to_numpy()
+    
+    # Find local peaks and troughs in the window
+    swing_highs_indices, _ = find_peaks(highs, distance=3)
+    swing_lows_indices, _ = find_peaks(-lows, distance=3)
+
+    if len(swing_highs_indices) < 3 or len(swing_lows_indices) < 3:
+        return None, False
+
+    # Check for Uptrend: Higher Highs (HH) and Higher Lows (HL)
+    # Get the last 3 swing points
+    last_three_highs = highs[swing_highs_indices[-3:]]
+    last_three_lows = lows[swing_lows_indices[-3:]]
+
+    is_uptrend = (last_three_highs[2] > last_three_highs[1] > last_three_highs[0]) and \
+                 (last_three_lows[2] > last_three_lows[1] > last_three_lows[0])
+
+    if is_uptrend:
+        return 'uptrend', True
+
+    # Check for Downtrend: Lower Lows (LL) and Lower Highs (LH)
+    is_downtrend = (last_three_highs[2] < last_three_highs[1] < last_three_highs[0]) and \
+                   (last_three_lows[2] < last_three_lows[1] < last_three_lows[0])
+
+    if is_downtrend:
+        return 'downtrend', True
+
+    return None, False
+
+def is_ranging(df, window_size, tolerance=0.02):
+    """
+    Checks if the market is in a range within a given window.
+    A range is confirmed if price touches support and resistance at least 3 times each.
+    """
+    if len(df) < window_size:
+        return False
+
+    window_df = df.tail(window_size)
+    
+    highs = window_df['high']
+    lows = window_df['low']
+    
+    # Potential support and resistance zones
+    # Using quantiles to identify the upper and lower bands of the price action
+    res_level = highs.quantile(0.95) 
+    sup_level = lows.quantile(0.05)
+    
+    # The range should not be too tight or too wide
+    price_range = res_level - sup_level
+    avg_price = (res_level + sup_level) / 2
+    if price_range / avg_price < 0.01: # Range is less than 1% of avg price, too tight
+        return False
+
+    # Define tolerance zones around support and resistance
+    res_zone_upper = res_level * (1 + tolerance)
+    res_zone_lower = res_level * (1 - tolerance)
+    sup_zone_upper = sup_level * (1 + tolerance)
+    sup_zone_lower = sup_level * (1 - tolerance)
+
+    # Count touches
+    res_touches = highs[(highs >= res_zone_lower) & (highs <= res_zone_upper)].count()
+    sup_touches = lows[(lows >= sup_zone_lower) & (lows <= sup_zone_upper)].count()
+
+    # Confirm range if both levels are touched at least 3 times
+    if res_touches >= 3 and sup_touches >= 3:
+        # Optional: Add a print for debugging when a range is detected
+        # print(f"DEBUG: Range detected. Sup: {sup_level:.2f}, Res: {res_level:.2f}. Touches: S={sup_touches}, R={res_touches}")
+        return True
+
+    return False
 
 def config_to_bool(value):
     """Converts a value from the config to a boolean."""
@@ -2347,9 +2464,23 @@ async def main():
 
                     print(f"Scanning {symbol}...")
                     klines_15m = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles_long)
-                    if not klines_15m:
+                    if not klines_15m or len(klines_15m) < max(config.get('market_state_window_sizes', [10, 20, 50])):
+                        print(f"Not enough kline data for {symbol} to determine market state. Skipping.")
+                        continue
+
+                    # Market State Analysis
+                    market_state, trend_type = get_market_state(klines_15m, config.get('market_state_window_sizes', [10, 20, 50]))
+
+                    if market_state == MarketState.RANGING:
+                        print(f"Market state for {symbol} is RANGING. Skipping strategy checks.")
+                        continue
+                    elif market_state == MarketState.UNDEFINED:
+                        print(f"Market state for {symbol} is UNDEFINED. Skipping strategy checks.")
                         continue
                     
+                    # --- Proceed with Trend-Based Strategies ---
+                    print(f"Market state for {symbol} is TRENDING ({trend_type}). Proceeding with strategies.")
+
                     klines_htf = get_klines(client, symbol, interval=higher_timeframe, limit=200)
                     if not klines_htf:
                         continue
